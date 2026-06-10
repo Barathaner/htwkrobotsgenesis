@@ -1,9 +1,7 @@
 import math
-import os
 
 import genesis as gs
 import torch
-import yaml
 from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 from tensordict import TensorDict
 
@@ -13,10 +11,22 @@ def gs_rand(lower, upper, batch_shape):
     return (upper - lower) * torch.rand(size=(*batch_shape, *lower.shape), dtype=gs.tc_float, device=gs.device) + lower
 
 
+class _WandbEnvCfg:
+    """Thin wrapper: rsl-rl WandbLogWriter.store_config() requires .to_dict()."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def to_dict(self) -> dict:
+        return self._data
+
+
 class K1Env:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
         self.num_envs = num_envs
-        self.cfg = env_cfg  # rsl-rl Logger / wandb config upload
+        self.cfg = _WandbEnvCfg(env_cfg)  # rsl-rl Logger / wandb config upload
         self.env_cfg = env_cfg
         self.obs_cfg = obs_cfg
         self.reward_cfg = reward_cfg
