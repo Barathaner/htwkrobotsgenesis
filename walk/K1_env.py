@@ -4,9 +4,9 @@ import os
 import genesis as gs
 import torch
 import yaml
+from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 from tensordict import TensorDict
-from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 
 plugin = ImGuiOverlayPlugin()
 
@@ -395,11 +395,9 @@ if __name__ == "__main__":
     actions = zero
 
     print("active_rewards:", list(env.reward_functions.keys()))
-    for step_i in range(300):
+    for step_i in range(3000):
         obs, rew, done, extras = env.step(actions)
         if step_i % 20 == 0:
             print_reward_breakdown(step_i, float(rew[0]))
-        if done[0]:
-            print(f"terminated at step {step_i}")
-            break
+
     print("final z=", float(env.base_pos[0, 2]), "target=", env.reward_cfg["base_height_target"])
