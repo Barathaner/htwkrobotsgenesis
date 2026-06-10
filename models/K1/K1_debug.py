@@ -15,6 +15,11 @@ Wichtig (per Genesis-Introspektion ermittelt):
 Aufruf:
   .venv/bin/python models/K1/K1_debug.py            # mit Viewer
   HEADLESS=1 .venv/bin/python models/K1/K1_debug.py # ohne Viewer (CI/Test)
+
+Viewer-Steuerung (frei fliegen, siehe FlyCameraPlugin):
+  W / S : vor / zurueck      A / D : links / rechts
+  E / Q : hoch / runter      + / - : Geschwindigkeit
+  Maus ziehen: Blickrichtung drehen
 """
 
 import os
@@ -105,6 +110,77 @@ EFFORT = {
 }
 
 
+class FlyCameraPlugin(ViewerPlugin):
+    """Frei fliegende Kamera (WASD + QE) fuer den Genesis-Viewer.
+
+    Steuerung:
+      W / S : vor / zurueck (in Blickrichtung)
+      A / D : seitlich links / rechts (strafe)
+      E / Q : hoch / runter (Welt-Z)
+      + / - : Fluggeschwindigkeit erhoehen / verringern
+      Maus ziehen: Blickrichtung drehen (Standard-Trackball)
+
+    Bewegt die Kamera-Pose (`_n_pose`) und den Orbit-Pivot (`_target`)
+    gemeinsam, damit das Maus-Drehen weiter funktioniert.
+    """
+
+    def __init__(self, speed: float = 0.08):
+        super().__init__()
+        self.speed = speed
+        self.world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    def build(self, viewer, camera, scene):
+        super().build(viewer, camera, scene)
+        # allow_overload=False + overwrite=True uebernimmt W/A/S/D von den Default-Controls.
+        self.viewer.register_keybinds(
+            Keybind("fly_forward", Key.W, KeyAction.HOLD, callback=self._move, args=("forward",),
+                    allow_overload=False),
+            Keybind("fly_back", Key.S, KeyAction.HOLD, callback=self._move, args=("back",),
+                    allow_overload=False),
+            Keybind("fly_left", Key.A, KeyAction.HOLD, callback=self._move, args=("left",),
+                    allow_overload=False),
+            Keybind("fly_right", Key.D, KeyAction.HOLD, callback=self._move, args=("right",),
+                    allow_overload=False),
+            Keybind("fly_up", Key.E, KeyAction.HOLD, callback=self._move, args=("up",)),
+            Keybind("fly_down", Key.Q, KeyAction.HOLD, callback=self._move, args=("down",)),
+            Keybind("fly_faster", Key.EQUAL, KeyAction.PRESS, callback=self._scale_speed, args=(1.5,)),
+            Keybind("fly_slower", Key.MINUS, KeyAction.PRESS, callback=self._scale_speed, args=(1 / 1.5,)),
+            overwrite=True,
+        )
+        self.viewer.set_message_text("Fly: WASD + QE  |  +/- Speed  |  Maus = drehen")
+
+    def _scale_speed(self, factor: float):
+        self.speed = float(np.clip(self.speed * factor, 0.005, 5.0))
+        self.viewer.set_message_text(f"Fly-Speed: {self.speed:.3f} m/Frame")
+
+    def _move(self, direction: str):
+        tb = self.viewer._trackball
+        pose = np.array(tb.pose, copy=True)
+        right = pose[:3, 0]
+        forward = -pose[:3, 2]  # Kamera blickt entlang -Z
+        s = self.speed
+
+        if direction == "forward":
+            delta = forward * s
+        elif direction == "back":
+            delta = -forward * s
+        elif direction == "right":
+            delta = right * s
+        elif direction == "left":
+            delta = -right * s
+        elif direction == "up":
+            delta = self.world_up * s
+        elif direction == "down":
+            delta = -self.world_up * s
+        else:
+            return
+
+        pose[:3, 3] = pose[:3, 3] + delta
+        tb.set_camera_pose(pose)
+        # Orbit-Pivot mitziehen, damit Maus-Drehen weiter um einen Punkt vor der Kamera rotiert.
+        tb._target = np.asarray(tb._target, dtype=np.float64) + delta
+
+
 def main():
     gs.init(backend=gs.gpu)
 
@@ -122,8 +198,9 @@ def main():
     scene.add_entity(gs.morphs.Plane())
     robot = scene.add_entity(gs.morphs.URDF(file=URDF, pos=BASE_INIT_POS))
 
-    plugin = ImGuiOverlayPlugin()
-    scene.viewer.add_plugin(plugin)
+    if not HEADLESS:
+        scene.viewer.add_plugin(ImGuiOverlayPlugin())
+        scene.viewer.add_plugin(FlyCameraPlugin(speed=0.08))
     scene.build()
 
     # --- Nur ansteuerbare Gelenke (1 DOF), Basis (root_joint, 6 DOF) ausgeschlossen ---
