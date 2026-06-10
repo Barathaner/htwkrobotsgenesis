@@ -71,12 +71,12 @@ class Go2Env:
         plugin = ImGuiOverlayPlugin()
         self.scene.viewer.add_plugin(plugin)
         self.scene.viewer.add_plugin(
-    gs.vis.viewer_plugins.MouseInteractionPlugin(
-        use_force=True,  # False = set position, True = spring force
-        spring_const=1000.0,
-        color=(0.1, 0.6, 0.8, 0.6),
-    )
-)
+            gs.vis.viewer_plugins.MouseInteractionPlugin(
+                use_force=True,  # False = set position, True = spring force
+                spring_const=1000.0,
+                color=(0.1, 0.6, 0.8, 0.6),
+            )
+        )
         # add robot
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
@@ -85,7 +85,6 @@ class Go2Env:
                 quat=self.env_cfg["base_init_quat"],
             ),
         )
-
 
         # build
         self.scene.build(n_envs=num_envs)

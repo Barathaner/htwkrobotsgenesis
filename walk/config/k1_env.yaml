@@ -1,0 +1,119 @@
+# Booster K1 locomotion — full 22-DOF (legs + arms + head in action/obs)
+# Obs dim = 9 + 3 * 22 = 75 (auto from buffer shapes in K1_env.py)
+
+env_cfg:
+  num_actions: 22
+
+  # Policy action order — all actuated joints (must match default_joint_angles keys)
+  joint_names:
+    # head
+    - AAHead_yaw
+    - Head_pitch
+    # left arm
+    - ALeft_Shoulder_Pitch
+    - Left_Shoulder_Roll
+    - Left_Elbow_Pitch
+    - Left_Elbow_Yaw
+    # right arm
+    - ARight_Shoulder_Pitch
+    - Right_Shoulder_Roll
+    - Right_Elbow_Pitch
+    - Right_Elbow_Yaw
+    # left leg
+    - Left_Hip_Pitch
+    - Left_Hip_Roll
+    - Left_Hip_Yaw
+    - Left_Knee_Pitch
+    - Left_Ankle_Pitch
+    - Left_Ankle_Roll
+    # right leg
+    - Right_Hip_Pitch
+    - Right_Hip_Roll
+    - Right_Hip_Yaw
+    - Right_Knee_Pitch
+    - Right_Ankle_Pitch
+    - Right_Ankle_Roll
+
+  default_joint_angles:
+    AAHead_yaw: 0.0
+    Head_pitch: 0.0
+    ALeft_Shoulder_Pitch: 0.0
+    ARight_Shoulder_Pitch: 0.0
+    Left_Shoulder_Roll: 0.2
+    Right_Shoulder_Roll: -0.2
+    Left_Elbow_Pitch: 0.0
+    Right_Elbow_Pitch: 0.0
+    Left_Elbow_Yaw: 0.0
+    Right_Elbow_Yaw: 0.0
+    Left_Hip_Pitch: -0.30
+    Right_Hip_Pitch: -0.30
+    Left_Hip_Roll: 0.0
+    Right_Hip_Roll: 0.0
+    Left_Hip_Yaw: 0.0
+    Right_Hip_Yaw: 0.0
+    Left_Knee_Pitch: 0.60
+    Right_Knee_Pitch: 0.60
+    Left_Ankle_Pitch: -0.30
+    Right_Ankle_Pitch: -0.30
+    Left_Ankle_Roll: 0.0
+    Right_Ankle_Roll: 0.0
+
+  # Per-joint PD [kp, kd] and torque limits [Nm] — source: models/K1/K1_debug.py
+  joint_gains:
+    AAHead_yaw: {kp: 20.0, kd: 0.5, effort: 6.0}
+    Head_pitch: {kp: 20.0, kd: 0.5, effort: 6.0}
+    ALeft_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    ARight_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Shoulder_Roll: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Right_Shoulder_Roll: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Elbow_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Right_Elbow_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Elbow_Yaw: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Right_Elbow_Yaw: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Hip_Pitch: {kp: 200.0, kd: 5.0, effort: 68.0}
+    Right_Hip_Pitch: {kp: 200.0, kd: 5.0, effort: 68.0}
+    Left_Hip_Roll: {kp: 200.0, kd: 5.0, effort: 76.0}
+    Right_Hip_Roll: {kp: 200.0, kd: 5.0, effort: 76.0}
+    Left_Hip_Yaw: {kp: 150.0, kd: 4.0, effort: 38.3}
+    Right_Hip_Yaw: {kp: 150.0, kd: 4.0, effort: 38.3}
+    Left_Knee_Pitch: {kp: 250.0, kd: 6.0, effort: 112.0}
+    Right_Knee_Pitch: {kp: 250.0, kd: 6.0, effort: 112.0}
+    Left_Ankle_Pitch: {kp: 120.0, kd: 3.0, effort: 38.3}
+    Right_Ankle_Pitch: {kp: 120.0, kd: 3.0, effort: 38.3}
+    Left_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
+    Right_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
+
+  termination_if_roll_greater_than: 30
+  termination_if_pitch_greater_than: 30
+  base_init_pos: [0.0, 0.0, 0.56]
+  base_init_quat: [1.0, 0.0, 0.0, 0.0]
+  episode_length_s: 20.0
+  resampling_time_s: 4.0
+  action_scale: 0.25
+  simulate_action_latency: true
+  clip_actions: 100.0
+
+obs_cfg:
+  obs_scales:
+    lin_vel: 2.0
+    ang_vel: 0.25
+    dof_pos: 1.0
+    dof_vel: 0.05
+
+reward_cfg:
+  tracking_sigma: 0.25
+  base_height_target: 0.53
+  feet_height_target: 0.0
+  reward_scales:
+    tracking_lin_vel: 1.0
+    tracking_ang_vel: 0.2
+    lin_vel_z: -1.0
+    base_height: -50.0
+    action_rate: -0.005
+    similar_to_default: -0.1
+
+command_cfg:
+  num_commands: 3
+  lin_vel_x_range: [0.5, 0.5]
+  lin_vel_y_range: [0.0, 0.0]
+  ang_vel_range: [0.0, 0.0]
