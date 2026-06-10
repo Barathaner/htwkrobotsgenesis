@@ -4,11 +4,9 @@ import os
 import genesis as gs
 import torch
 import yaml
-from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 from tensordict import TensorDict
 
-plugin = ImGuiOverlayPlugin()
 
 def gs_rand(lower, upper, batch_shape):
     assert lower.shape == upper.shape
@@ -16,8 +14,9 @@ def gs_rand(lower, upper, batch_shape):
 
 
 class K1Env:
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=True):
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
         self.num_envs = num_envs
+        self.cfg = env_cfg  # rsl-rl Logger / wandb config upload
         self.env_cfg = env_cfg
         self.obs_cfg = obs_cfg
         self.reward_cfg = reward_cfg
@@ -51,7 +50,10 @@ class K1Env:
                 quat=env_cfg["base_init_quat"],
             )
         )
-        self.scene.viewer.add_plugin(plugin)
+        if show_viewer:
+            from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
+
+            self.scene.viewer.add_plugin(ImGuiOverlayPlugin())
         self.scene.build(n_envs=num_envs)
 
         self.num_actions = len(env_cfg["joint_names"])
@@ -359,45 +361,19 @@ class K1Env:
         return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
 
 
-if __name__ == "__main__":
-    gs.init(backend=gs.gpu, logging_level="warning")
-    config_path = os.path.join(os.path.dirname(__file__), "config", "k1_env.yaml")
-    with open(config_path, "r") as f:
-        all_cfg = yaml.safe_load(f)
-    env = K1Env(
-        1,
-        env_cfg=all_cfg["env_cfg"],
-        obs_cfg=all_cfg["obs_cfg"],
-        reward_cfg=all_cfg["reward_cfg"],
-        command_cfg=all_cfg["command_cfg"],
-    )
-    print("OK", env.robot.n_dofs, env.robot.n_links)
-    print("num_actions", env.num_actions, "obs_dim", env.obs_dim)
-
-    def print_reward_breakdown(step_i: int, rew_total: float) -> None:
-        """Print each active reward term: raw value and scaled contribution to rew_buf."""
-        parts = [f"step {step_i:3d}  rew_total={rew_total:.6f}"]
-        for name, func in env.reward_functions.items():
-            raw = float(func()[0])
-            scaled = raw * env.reward_scales[name]
-            parts.append(f"  {name}: raw={raw:.6f}  contrib={scaled:.6f}")
-        z = float(env.base_pos[0, 2])
-        vz = float(env.base_lin_vel[0, 2])
-        vx, vy = float(env.base_lin_vel[0, 0]), float(env.base_lin_vel[0, 1])
-        pose_dev = float(env._reward_similar_to_default()[0])
-        parts.append(f"  state: z={z:.4f}  vz={vz:.4f}  vx={vx:.4f}  vy={vy:.4f}  pose_dev={pose_dev:.4f}")
-        print("\n".join(parts))
-
-    # --- reward smoke test (edit actions below per reward) ---
-    # zero actions: PD holds default pose — good for base_height / similar_to_default
-    # random actions: use torch.randn(1, env.num_actions) for action_rate test
-    zero = torch.zeros(1, env.num_actions, device=gs.device)
-    actions = zero
-
-    print("active_rewards:", list(env.reward_functions.keys()))
-    for step_i in range(3000):
-        obs, rew, done, extras = env.step(actions)
-        if step_i % 20 == 0:
-            print_reward_breakdown(step_i, float(rew[0]))
-
-    print("final z=", float(env.base_pos[0, 2]), "target=", env.reward_cfg["base_height_target"])
+# if __name__ == "__main__":
+#     gs.init(backend=gs.gpu, logging_level="warning")
+#     config_path = os.path.join(os.path.dirname(__file__), "config", "k1_env.yaml")
+#     with open(config_path, "r") as f:
+#         all_cfg = yaml.safe_load(f)
+#     env = K1Env(
+#         1,
+#         env_cfg=all_cfg["env_cfg"],
+#         obs_cfg=all_cfg["obs_cfg"],
+#         reward_cfg=all_cfg["reward_cfg"],
+#         command_cfg=all_cfg["command_cfg"],
+#         show_viewer=False,
+#     )
+#     print("OK", env.robot.n_dofs, env.robot.n_links)
+#     print("num_actions", env.num_actions, "obs_dim", env.obs_dim)
+#     print("Run tests: .venv/bin/python walk/test_k1_env.py --test a")
