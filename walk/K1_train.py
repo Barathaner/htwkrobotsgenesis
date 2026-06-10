@@ -3,6 +3,9 @@
 Usage (from repo root):
   .venv/bin/python walk/K1_train.py -e k1-walking -B 2048 --max_iterations 500
   .venv/bin/wandb login   # once, before first run
+
+Checkpoints: logs/<exp>/model_<iter>.pt every save_interval (default 250)
+Videos:      logs/<exp>/videos/train_<iter>.mp4 → uploaded to wandb
 """
 
 import argparse
@@ -21,7 +24,6 @@ try:
         raise ImportError
 except (metadata.PackageNotFoundError, ImportError) as e:
     raise ImportError("Please install 'rsl-rl-lib>=5.0.0'.") from e
-from rsl_rl.runners import OnPolicyRunner
 
 WALK_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(WALK_DIR, "config", "k1_env.yaml")
@@ -39,19 +41,26 @@ def load_cfgs() -> tuple[dict, dict, dict, dict, dict]:
     )
 
 
-def build_train_cfg(train_cfg: dict, exp_name: str, wandb_project: str) -> dict:
+def build_train_cfg(train_cfg: dict, exp_name: str, wandb_project: str) -> tuple[dict, dict]:
     cfg = copy.deepcopy(train_cfg)
     cfg["run_name"] = exp_name
     cfg["logger"] = copy.deepcopy(cfg["logger"])
     cfg["logger"]["project_name"] = wandb_project
+
+    video_opts = {
+        "video_interval": cfg.pop("video_interval", 250),
+        "video_steps": cfg.pop("video_steps", 300),
+        "video_fps": cfg.pop("video_fps", 50),
+    }
     cfg.pop("wandb_project", None)
-    return cfg
+    return cfg, video_opts
 
 
 def main() -> None:
     if WALK_DIR not in sys.path:
         sys.path.insert(0, WALK_DIR)
     from K1_env import K1Env
+    from k1_train_runner import K1TrainRunner
 
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg_yaml = load_cfgs()
 
@@ -68,14 +77,14 @@ def main() -> None:
     args = parser.parse_args()
 
     log_dir = os.path.join("logs", args.exp_name)
-    train_cfg = build_train_cfg(train_cfg_yaml, args.exp_name, args.wandb_project)
+    train_cfg, video_opts = build_train_cfg(train_cfg_yaml, args.exp_name, args.wandb_project)
 
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
     with open(os.path.join(log_dir, "cfgs.pkl"), "wb") as f:
-        pickle.dump([env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg], f)
+        pickle.dump([env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg, video_opts], f)
 
     gs.init(
         backend=gs.gpu,
@@ -96,10 +105,20 @@ def main() -> None:
 
     print(
         f"K1 train: obs_dim={env.obs_dim}  num_actions={env.num_actions}  "
-        f"num_envs={args.num_envs}  wandb_project={args.wandb_project}"
+        f"num_envs={args.num_envs}  save_interval={train_cfg['save_interval']}  "
+        f"video_interval={video_opts['video_interval']}  wandb={args.wandb_project}"
     )
 
-    runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    runner = K1TrainRunner(
+        env,
+        train_cfg,
+        log_dir,
+        device=gs.device,
+        video_interval=video_opts["video_interval"],
+        video_steps=video_opts["video_steps"],
+        video_fps=video_opts["video_fps"],
+        video_env_cfgs=(env_cfg, obs_cfg, reward_cfg, command_cfg),
+    )
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 
 

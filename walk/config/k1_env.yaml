@@ -119,6 +119,13 @@ command_cfg:
   lin_vel_y_range: [0.0, 0.0]
   ang_vel_range: [0.0, 0.0]
 
+  # Camera for training rollout videos (used by K1_train_runner, 1 env only)
+  video:
+    res: [640, 480]
+    camera_pos: [3.0, -1.0, 1.5]
+    camera_lookat: [0.0, 0.0, 0.5]
+    camera_fov: 30
+
 # PPO / rsl-rl — obs_dim & num_actions come from K1Env automatically
 train_cfg:
   algorithm:
@@ -155,7 +162,10 @@ train_cfg:
     critic: [policy]
 
   num_steps_per_env: 24
-  save_interval: 100
+  save_interval: 250
+  video_interval: 250
+  video_steps: 300
+  video_fps: 50
   run_name: k1-walking
   wandb_project: k1-locomotion
 

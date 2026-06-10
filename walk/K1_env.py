@@ -24,7 +24,16 @@ class _WandbEnvCfg:
 
 
 class K1Env:
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
+    def __init__(
+        self,
+        num_envs,
+        env_cfg,
+        obs_cfg,
+        reward_cfg,
+        command_cfg,
+        show_viewer=False,
+        record_camera=False,
+    ):
         self.num_envs = num_envs
         self.cfg = _WandbEnvCfg(env_cfg)  # rsl-rl Logger / wandb config upload
         self.env_cfg = env_cfg
@@ -38,20 +47,23 @@ class K1Env:
         self.simulate_action_latency = env_cfg.get("simulate_action_latency", True)
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
 
-        self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
-            rigid_options=gs.options.RigidOptions(
+        scene_kwargs: dict = {
+            "sim_options": gs.options.SimOptions(dt=self.dt, substeps=2),
+            "rigid_options": gs.options.RigidOptions(
                 enable_self_collision=True,
                 max_collision_pairs=40,
                 tolerance=1e-5,
             ),
-            viewer_options=gs.options.ViewerOptions(
+            "viewer_options": gs.options.ViewerOptions(
                 camera_pos=(3, -1, 1.5),
                 camera_lookat=(0.0, 0.0, 0.5),
                 camera_fov=30,
             ),
-            show_viewer=show_viewer,
-        )
+            "show_viewer": show_viewer,
+        }
+        if record_camera:
+            scene_kwargs["vis_options"] = gs.options.VisOptions(rendered_envs_idx=[0])
+        self.scene = gs.Scene(**scene_kwargs)
         self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
@@ -64,6 +76,18 @@ class K1Env:
             from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 
             self.scene.viewer.add_plugin(ImGuiOverlayPlugin())
+
+        self.cam = None
+        if record_camera:
+            vcfg = env_cfg.get("video", {})
+            self.cam = self.scene.add_camera(
+                res=tuple(vcfg.get("res", [640, 480])),
+                pos=tuple(vcfg.get("camera_pos", [3.0, -1.0, 1.5])),
+                lookat=tuple(vcfg.get("camera_lookat", [0.0, 0.0, 0.5])),
+                fov=vcfg.get("camera_fov", 30),
+                GUI=False,
+            )
+
         self.scene.build(n_envs=num_envs)
 
         self.num_actions = len(env_cfg["joint_names"])
@@ -165,7 +189,7 @@ class K1Env:
         self.reset()
 
     def step(self, actions):
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
         self.robot.control_dofs_position(
@@ -175,17 +199,18 @@ class K1Env:
         self.scene.step()
 
         self.episode_length_buf += 1
-        self.base_pos = self.robot.get_pos()
-        self.base_quat = self.robot.get_quat()
+        # copy into pre-allocated buffers so reset() works outside torch.inference_mode()
+        self.base_pos.copy_(self.robot.get_pos())
+        self.base_quat.copy_(self.robot.get_quat())
         self.base_euler = quat_to_xyz(
             transform_quat_by_quat(self.inv_base_init_quat, self.base_quat), rpy=True, degrees=True
         )
         inv_base_quat = inv_quat(self.base_quat)
-        self.base_lin_vel = transform_by_quat(self.robot.get_vel(), inv_base_quat)
-        self.base_ang_vel = transform_by_quat(self.robot.get_ang(), inv_base_quat)
-        self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
-        self.dof_pos = self.robot.get_dofs_position(self.motors_dof_idx)
-        self.dof_vel = self.robot.get_dofs_velocity(self.motors_dof_idx)
+        self.base_lin_vel.copy_(transform_by_quat(self.robot.get_vel(), inv_base_quat))
+        self.base_ang_vel.copy_(transform_by_quat(self.robot.get_ang(), inv_base_quat))
+        self.projected_gravity.copy_(transform_by_quat(self.global_gravity, inv_base_quat))
+        self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
+        self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
@@ -197,11 +222,11 @@ class K1Env:
             self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0
         )
 
-        self.reset_buf = self.episode_length_buf > self.max_episode_length
-        self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
-        self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
-        self.reset_buf |= self.base_pos[:, 2] < 0.35
-        self.reset_buf |= self.scene.rigid_solver.get_error_envs_mask()
+        self.reset_buf.copy_(self.episode_length_buf > self.max_episode_length)
+        self.reset_buf.logical_or_(torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
+        self.reset_buf.logical_or_(torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
+        self.reset_buf.logical_or_(self.base_pos[:, 2] < 0.35)
+        self.reset_buf.logical_or_(self.scene.rigid_solver.get_error_envs_mask())
 
         self.extras["time_outs"] = (self.episode_length_buf > self.max_episode_length).to(dtype=gs.tc_float)
 
