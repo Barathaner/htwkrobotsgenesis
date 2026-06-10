@@ -1,0 +1,49 @@
+# --- Python & Environment ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+dist/
+build/
+*.egg-info/
+
+# --- Genesis & MuJoCo Runtime ---
+# MuJoCo generiert oft temporäre XMLs oder Cache-Files
+*.mjb
+*.log
+# Genesis kann temporäre Shader oder Mesh-Caches anlegen
+.genesis/
+
+# --- Project Specifics (Models & Assets) ---
+# Große Binärdateien oder generierte Meshes nicht einchecken
+models/flat/*.obj
+models/flat/*.stl
+models/flat/*.dae
+# Aber die Konfigurationsdateien für die Generierung behalten!
+!models/field_generator.py
+!configs/*.json
+
+# --- Training Outputs (Heavy Data) ---
+checkpoints/
+logs/
+videos/
+*.pt
+*.pth
+*.onnx
+
+# --- IDEs & System ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# --- Weights & Biases / Experiment Tracking ---
+wandb/
+
+# --- Credentials & Local Configs ---
+.env
+local_config.yaml
