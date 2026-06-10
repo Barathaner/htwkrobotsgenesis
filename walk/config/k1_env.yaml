@@ -105,12 +105,13 @@ reward_cfg:
   base_height_target: 0.53
   feet_height_target: 0.0
   reward_scales:
-    tracking_lin_vel: 1.0
-    tracking_ang_vel: 0.2
-    lin_vel_z: -1.0
+    # Step-by-step reward tuning — enable one at a time (see K1_RL_INFO.md)
     base_height: -50.0
-    action_rate: -0.005
-    similar_to_default: -0.1
+    # similar_to_default: -0.1
+    # lin_vel_z: -1.0
+    # action_rate: -0.005
+    # tracking_lin_vel: 1.0
+    # tracking_ang_vel: 0.2
 
 command_cfg:
   num_commands: 3
