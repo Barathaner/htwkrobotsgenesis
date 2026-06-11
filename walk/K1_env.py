@@ -176,6 +176,35 @@ class K1Env:
         self.foot_air_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
         self.feet_air_time_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
 
+        # foot_roll / flat_foot: Ankle_Pitch- und Knee_Pitch-Spaltenindizes in dof_pos (Reihenfolge = joint_names).
+        jn = env_cfg["joint_names"]
+        self.ankle_pitch_idx = torch.tensor(
+            [jn.index("Left_Ankle_Pitch"), jn.index("Right_Ankle_Pitch")], dtype=gs.tc_int, device=gs.device
+        )
+        self.knee_pitch_idx = torch.tensor(
+            [jn.index("Left_Knee_Pitch"), jn.index("Right_Knee_Pitch")], dtype=gs.tc_int, device=gs.device
+        )
+        self.foot_roll_window = int(self.reward_cfg["foot_roll_window_steps"])
+        # Rolling-History der Ankle_Pitch-Winkel (je Fuß, letzte N Steps) für die Zeh-Pose vor Liftoff.
+        self.ankle_pitch_hist = torch.zeros((num_envs, 2, self.foot_roll_window), dtype=gs.tc_float, device=gs.device)
+        self.foot_flat_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.foot_roll_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        self.foot_flat_penalty = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+
+        # push_robustness (Stage 3): je Env zufällig getaktet (2–5 s), Stoß als Soll-Δv [m/s].
+        self.push_enabled = bool(self.reward_cfg.get("push_enabled", False))
+        self.push_interval_min_steps = max(1, int(self.reward_cfg["push_interval_min_s"] / self.dt))
+        self.push_interval_max_steps = max(
+            self.push_interval_min_steps + 1, int(self.reward_cfg["push_interval_max_s"] / self.dt)
+        )
+        self.push_recovery_window_steps = max(1, int(self.reward_cfg["push_recovery_window_s"] / self.dt))
+        # groß initialisiert → kein Recovery-Reward vor dem ersten Push
+        self.steps_since_push = torch.full((num_envs,), 1_000_000, dtype=gs.tc_int, device=gs.device)
+        # je Env die (Episoden-)Step-Nummer des nächsten Pushes; zufällig im Intervall-Band gezogen.
+        self.next_push_step = self._sample_push_interval((num_envs,))
+        # Welt-Frame Linear-DOFs der Floating-Base (Index 0,1,2 = x,y,z); xy für Horizontal-Push.
+        self.base_xy_dof_idx = torch.tensor([0, 1], dtype=gs.tc_int, device=gs.device)
+
         self._obs_slices = {
             "base_ang_vel": self.base_ang_vel.shape[-1],
             "projected_gravity": self.projected_gravity.shape[-1],
@@ -225,6 +254,10 @@ class K1Env:
         self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
         self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
         self._update_foot_contact()
+
+        self.steps_since_push += 1
+        if self.push_enabled:
+            self._apply_push()
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
@@ -286,6 +319,12 @@ class K1Env:
             self.foot_in_contact.fill_(True)
             self.foot_air_time.zero_()
             self.feet_air_time_reward.zero_()
+            self.ankle_pitch_hist.zero_()
+            self.foot_flat_time.zero_()
+            self.foot_roll_reward.zero_()
+            self.foot_flat_penalty.zero_()
+            self.steps_since_push.fill_(1_000_000)
+            self.next_push_step.copy_(self._sample_push_interval((self.num_envs,)))
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
             torch.where(envs_idx[:, None], self.init_base_quat, self.base_quat, out=self.base_quat)
@@ -305,6 +344,13 @@ class K1Env:
             self.foot_in_contact.masked_fill_(envs_idx[:, None], True)
             self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
+            self.ankle_pitch_hist.masked_fill_(envs_idx[:, None, None], 0.0)
+            self.foot_flat_time.masked_fill_(envs_idx[:, None], 0.0)
+            self.foot_roll_reward.masked_fill_(envs_idx, 0.0)
+            self.foot_flat_penalty.masked_fill_(envs_idx, 0.0)
+            self.steps_since_push.masked_fill_(envs_idx, 1_000_000)
+            torch.where(envs_idx, self._sample_push_interval((self.num_envs,)), self.next_push_step,
+                        out=self.next_push_step)
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -351,7 +397,68 @@ class K1Env:
         self.feet_air_time_reward.copy_(landing.sum(dim=1) * active)
         self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
 
+        # --- foot_roll (Heel-to-Toe) & flat_foot über Ankle_Pitch ---
+        liftoff = (~in_contact) & self.foot_in_contact
+        ankle_pitch = self.dof_pos[:, self.ankle_pitch_idx]  # (n,2)
+        roll_active = (cmd_speed > self.reward_cfg["foot_roll_cmd_threshold"]).to(gs.tc_float)
+        sigma = self.reward_cfg["foot_roll_sigma"]
+
+        # Rolling-History fortschreiben (älteste raus, aktuellen Step rein).
+        self.ankle_pitch_hist[:, :, :-1] = self.ankle_pitch_hist[:, :, 1:].clone()
+        self.ankle_pitch_hist[:, :, -1] = ankle_pitch
+
+        # Touchdown → Ferse zuerst (heel_target); Liftoff → Zeh-Abdruck über die letzten N Stance-Steps.
+        heel_rew = torch.exp(
+            -torch.square(ankle_pitch - self.reward_cfg["ankle_heel_target"]) / sigma
+        ) * touchdown.to(gs.tc_float)
+        toe_rew = torch.exp(
+            -torch.square(self.ankle_pitch_hist - self.reward_cfg["ankle_toe_target"]) / sigma
+        ).mean(dim=2) * liftoff.to(gs.tc_float)
+        self.foot_roll_reward.copy_((heel_rew + toe_rew).sum(dim=1) * roll_active)
+
+        # flat_foot: |Ankle_Pitch| zu klein während Bodenkontakt → Plattfuß-Dauer akkumulieren.
+        flat = (ankle_pitch.abs() < self.reward_cfg["foot_flat_threshold"]) & in_contact
+        self.foot_flat_time += self.dt
+        self.foot_flat_time *= flat.to(gs.tc_float)  # nur bei flach-in-Kontakt weiterzählen, sonst 0
+        flat_excess = torch.clamp(self.foot_flat_time - self.reward_cfg["foot_flat_time"], min=0.0)
+        self.foot_flat_penalty.copy_(flat_excess.sum(dim=1) * roll_active)
+
         self.foot_in_contact.copy_(in_contact)
+
+    def _sample_push_interval(self, batch_shape):
+        """Zufälliges Push-Intervall [steps] im konfigurierten Band (je Env dekorreliert)."""
+        return torch.randint(
+            self.push_interval_min_steps,
+            self.push_interval_max_steps + 1,
+            batch_shape,
+            dtype=gs.tc_int,
+            device=gs.device,
+        )
+
+    def _apply_push(self):
+        """Stage-3 Robustheit: horizontaler Stoß auf den Rumpf als Soll-Δv [m/s] (NICHT roher Impuls).
+
+        Je Env eigener Zeitplan (next_push_step, 2–5 s zufällig → dekorrelierte Störungen statt
+        batch-synchroner Schläge). Beim Auslösen wird ein Δv in zufälliger Horizontalrichtung
+        (push_vel_min..max) auf die Welt-xy-Geschwindigkeit der Base addiert; das Δv ist so bemessen,
+        dass es aufholbar bleibt. steps_since_push wird genullt → push_recovery belohnt das
+        Zurück-auf-Kurs-Kommen im folgenden Fenster (kein Reward fürs Einfrieren, Tracking bleibt gefordert).
+        """
+        due = self.episode_length_buf >= self.next_push_step
+        envs_idx = due.nonzero(as_tuple=False).reshape(-1)
+        if envs_idx.numel() == 0:
+            return
+        n = envs_idx.numel()
+        angle = torch.rand(n, dtype=gs.tc_float, device=gs.device) * (2.0 * math.pi)
+        lo = self.reward_cfg["push_vel_min"]
+        hi = self.reward_cfg["push_vel_max"]
+        dv = torch.rand(n, dtype=gs.tc_float, device=gs.device) * (hi - lo) + lo
+        cur = self.robot.get_vel()[envs_idx]  # Welt-Frame Linear-Geschwindigkeit der Base
+        new_xy = torch.stack([cur[:, 0] + dv * torch.cos(angle), cur[:, 1] + dv * torch.sin(angle)], dim=1)
+        self.robot.set_dofs_velocity(new_xy, dofs_idx_local=self.base_xy_dof_idx, envs_idx=envs_idx)
+        self.steps_since_push[envs_idx] = 0
+        # nächsten Push für genau diese Envs neu auslosen
+        self.next_push_step[envs_idx] = self.episode_length_buf[envs_idx] + self._sample_push_interval((n,))
 
     def _update_observation(self):
         obs_parts = [
@@ -510,6 +617,124 @@ class K1Env:
         """
         excess = torch.clamp(self.foot_air_time - self.reward_cfg["feet_air_time_stuck"], min=0.0)
         return excess.sum(dim=1)
+
+    def _reward_foot_roll(self):
+        """Belohnung: sauberes Heel-to-Toe-Abrollen (kein separater Zeh/Hacken-Link → Ankle_Pitch als Proxy).
+
+        In _update_foot_contact je Fuß als Event-Reward verbucht (analog feet_air_time):
+          Touchdown → Ankle_Pitch nahe ankle_heel_target (-0.15 rad, Ferse zuerst),
+          Liftoff   → Ankle_Pitch der letzten foot_roll_window Stance-Steps nahe ankle_toe_target (+0.10 rad).
+        exp(-(Δ)²/foot_roll_sigma) je Event, über beide Füße summiert; nur wenn cmd_speed > foot_roll_cmd_threshold.
+
+        Beispiel (heel=-0.15, sigma=0.05, scale=0.5 → *dt=0.01):
+          Touchdown mit Ankle=-0.15 → exp(0)=1.0      → contrib≈+0.01 (einmalig)
+          Touchdown mit Ankle=-0.30 → exp(-0.0225/0.05)≈0.64 → +0.0064
+          Stehen (cmd≈0)            → 0
+        """
+        return self.foot_roll_reward
+
+    def _reward_flat_foot(self):
+        """Strafe: Fuß bleibt während Bodenkontakt zu lange flach (|Ankle_Pitch| < foot_flat_threshold).
+
+        foot_flat_time akkumuliert dt solange ein Fuß flach UND am Boden ist (Reset sonst), siehe
+        _update_foot_contact. Bestraft wird die Überdauer über foot_flat_time hinaus, je Fuß
+          excess = max(0, flat_time - foot_flat_time),  über beide summiert; nur cmd_speed > foot_roll_cmd_threshold.
+
+        Beispiel (thresh=0.03 rad, foot_flat_time=0.4 s, scale=-0.2 → *dt=0.004):
+          Fuß 0.30 s flach am Boden (normaler Stützfuß) → excess=0    → 0/Step
+          Fuß 0.60 s flach hängend (Schlurfen)         → excess=0.20 → -0.0008/Step (wächst weiter)
+          Stehen (cmd≈0)                                → 0
+        """
+        return self.foot_flat_penalty
+
+    def _reward_feet_slip(self):
+        """Strafe: Fuß rutscht/schlurft am Boden — Horizontalgeschwindigkeit des Fußes im Kontakt.
+
+        Echtes Anti-Schlurf-Signal (der Höhen-Proxy allein sieht Rutschen nicht): ein sauber
+        geplanter Stützfuß hat ~0 Horizontalgeschwindigkeit → keine Strafe; ein schleifender Fuß
+        wird quadratisch bestraft. Ergänzt flat_foot (das jetzt nur grob dauer-flache Füße erfasst).
+
+        Beispiel (scale=-0.2, dt=0.02):
+          Stützfuß still (v_xy≈0)        → 0           → 0/Step
+          Fuß rutscht 0.3 m/s im Kontakt → 0.09        → -0.00036/Step je Fuß
+        """
+        foot_vel_xy = self.robot.get_links_vel(self.feet_idx_local)[:, :, :2]  # (n,2,2) Welt-xy
+        slip = torch.sum(torch.square(foot_vel_xy), dim=2)  # (n,2)
+        return (slip * self.foot_in_contact.to(gs.tc_float)).sum(dim=1)
+
+    def _reward_dof_vel(self):
+        """Strafe: hohe Gelenkgeschwindigkeiten dämpfen (Energie/Vibration), ergänzt action_rate.
+
+        action_rate bestraft nur Aktions-Differenzen; dieser Term greift die tatsächlichen
+        Gelenkgeschwindigkeiten ab → unterdrückt hochfrequentes Zittern bei konstanter Aktion.
+
+        Beispiel (scale=-2e-4, dt=0.02):
+          alle 20 Gelenke ~1 rad/s → sum≈20 → -0.00008/Step
+          ruhiger Stand            → sum≈0  → 0/Step
+        """
+        return torch.sum(torch.square(self.dof_vel), dim=1)
+
+    def _reward_orientation(self):
+        """Strafe: Rumpf soll aufrecht bleiben — roll² + pitch² (dynamische Stabilität, push-resistent).
+
+        base_euler liegt in Grad vor → in Radian umrechnen, damit die Skala physikalisch sinnvoll ist.
+
+        Beispiel (scale=-2.0, dt=0.02):
+          roll=0°, pitch=0°  → 0           → 0/Step
+          roll=10°, pitch=0° → 0.0305 rad² → -0.0012/Step
+          roll=20°, pitch=10°→ 0.1523 rad² → -0.0061/Step
+        """
+        rp = torch.deg2rad(self.base_euler[:, :2])
+        return torch.sum(torch.square(rp), dim=1)
+
+    def _reward_ang_vel_xy(self):
+        """Strafe: Roll-/Pitch-Raten des Rumpfes dämpfen (kein Kippeln/Schwanken).
+
+        Summiert (ω_x² + ω_y²) der Körper-Winkelgeschwindigkeit.
+
+        Beispiel (scale=-0.05, dt=0.02):
+          ω_xy=0           → 0      → 0/Step
+          ω_x=0.5 rad/s    → 0.25   → -0.00025/Step
+        """
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+
+    def _reward_support_pose(self):
+        """Belohnung: leichte Kniebeugung [support_knee_min, support_knee_max] beim Stehen/langsamen Gehen.
+
+        Federnde Stützpose (Knie nicht durchgestreckt) → push-resistenter Stand. Nur wenn
+        cmd_speed < support_pose_cmd_speed; je Knie 1.0 wenn im Band, sonst exp-Abfall zum Bandrand.
+
+        Beispiel (band=[0.4,0.8], scale=0.2 → *dt=0.004):
+          beide Knie 0.6 rad (im Band) → 2.0 → +0.008/Step
+          beide Knie 0.2 rad (zu steif)→ exp(-(0.2)²/0.05)*2≈0.91 → +0.0018/Step
+          schnelles Gehen (cmd hoch)   → 0
+        """
+        knee = self.dof_pos[:, self.knee_pitch_idx]  # (n,2)
+        lo = self.reward_cfg["support_knee_min"]
+        hi = self.reward_cfg["support_knee_max"]
+        below = torch.clamp(lo - knee, min=0.0)
+        above = torch.clamp(knee - hi, min=0.0)
+        dist2 = torch.square(below + above)  # 0 im Band, sonst quadratischer Abstand zum nächsten Rand
+        in_band_score = torch.exp(-dist2 / self.reward_cfg["support_pose_sigma"]).sum(dim=1)
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed < self.reward_cfg["support_pose_cmd_speed"]).to(gs.tc_float)
+        return in_band_score * active
+
+    def _reward_push_recovery(self):
+        """Belohnung: nach einem Push (Stage 3) schnell wieder die kommandierte Geschwindigkeit treffen.
+
+        Nur im Fenster push_recovery_window_steps nach einem Push aktiv (sonst 0 → keine Doppelzählung
+        mit tracking_lin_vel). Belohnt die Übereinstimmung der Ist- mit der Soll-xy-Geschwindigkeit —
+        Einfrieren bei cmd≠0 ergibt großen Fehler und damit kaum Reward.
+
+        Beispiel (sigma=0.25, window=1.0 s, scale=0.5):
+          0.5 s nach Push, cmd [0.5,0], Ist [0.5,0] → exp(0)=1.0 → +0.01/Step
+          0.5 s nach Push, cmd [0.5,0], Ist [0.0,0] → exp(-0.25/0.25)≈0.37 → +0.0037/Step
+          außerhalb des Fensters                    → 0
+        """
+        in_window = (self.steps_since_push < self.push_recovery_window_steps).to(gs.tc_float)
+        vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        return torch.exp(-vel_error / self.reward_cfg["tracking_sigma"]) * in_window
 
 
 # if __name__ == "__main__":

@@ -110,6 +110,32 @@ reward_cfg:
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
   feet_air_cmd_threshold: 0.2     # [m/s] — darunter (Stehen) kein Reward
   feet_air_time_stuck: 0.5        # [s] ab hier gilt ein Fuß als "festgehalten" → no_alternation-Strafe
+  # foot_roll: Heel-to-Toe-Abrollen über Ankle_Pitch (keine separaten Zeh/Hacken-Links im URDF).
+  # Aufsetzen → Hacke (heel_target); letzte ~3 Steps vor Liftoff → Zeh (toe_target).
+  ankle_heel_target: -0.15        # [rad] Ziel-Ankle_Pitch beim Touchdown (Ferse zuerst)
+  ankle_toe_target: 0.10          # [rad] Ziel-Ankle_Pitch kurz vor Liftoff (Abdruck über Zeh)
+  foot_roll_sigma: 0.05           # [rad²] Breite der exp-Belohnung um heel/toe-target
+  foot_roll_window_steps: 3       # Anzahl Steps vor Liftoff, über die die Zeh-Pose gemittelt wird
+  foot_roll_cmd_threshold: 0.2    # [m/s] — darunter (Stehen) kein foot_roll-Reward
+  foot_flat_threshold: 0.03       # [rad] |Ankle_Pitch| darunter = Fuß flach
+  # foot_flat_time hoch (0.4 s): ein flach geplanter Stützfuß im Mid-Stance ist KORREKT und darf
+  # nicht bestraft werden; bestraft wird nur dauerhaft flach hängender Fuß (Schlurfen ohne Abrollen).
+  # Echtes Schlurfen fängt zusätzlich feet_slip (Fuß-Horizontalgeschwindigkeit im Kontakt) ab.
+  foot_flat_time: 0.4             # [s] flach-in-Kontakt-Dauer, ab der bestraft wird
+  # support_pose: leichte Kniebeugung (Federung) beim Stehen/langsamen Gehen
+  support_knee_min: 0.4           # [rad] untere Grenze gewünschter Kniebeugung
+  support_knee_max: 0.8           # [rad] obere Grenze gewünschter Kniebeugung
+  support_pose_sigma: 0.05        # [rad²] eigener Falloff am Bandrand (entkoppelt von foot_roll_sigma)
+  support_pose_cmd_speed: 0.6     # [m/s] — nur darunter (Stehen/langsam) belohnen
+  # push_robustness (Stage 3): zufälliger Horizontal-Stoß auf den Rumpf zum Robustheits-Training.
+  # WICHTIG: als Soll-Δv [m/s] parametriert, NICHT als roher Impuls [N·s] — bei ~10 kg Robotermasse
+  # wären 50–150 N·s = 5–15 m/s und damit garantiert unaufholbar (sofortiger Sturz).
+  push_enabled: false             # Stage-3-Schalter (Standard aus → bestehendes Training unverändert)
+  push_interval_min_s: 2.0        # [s] kürzester Abstand zwischen Pushes (je Env zufällig)
+  push_interval_max_s: 5.0        # [s] längster Abstand zwischen Pushes (je Env zufällig)
+  push_vel_min: 0.3               # [m/s] untere Grenze des aufgeprägten Δv
+  push_vel_max: 0.8               # [m/s] obere Grenze des aufgeprägten Δv
+  push_recovery_window_s: 1.0     # [s] Fenster nach Push, in dem Recovery-Tracking belohnt wird
   reward_scales:
     # Step-by-step reward tuning — enable one at a time (see K1_RL_INFO.md)
     base_height: -50.0
@@ -121,6 +147,16 @@ reward_cfg:
     contact_stride: -0.3
     feet_air_time: 0.5
     no_alternation: -1.0
+    # Gait-Qualität & Stabilität
+    foot_roll: 0.5
+    flat_foot: -0.2            # entschärft (war -0.5): nur grob schlurfender Flachfuß, kein Mid-Stance-Stützfuß
+    feet_slip: -0.2           # Fuß-Horizontalgeschwindigkeit im Kontakt → echtes Anti-Schlurf-/Rutsch-Signal
+    dof_vel: -2.0e-4          # leichte Energie-/Vibrationsbremse über Gelenkgeschwindigkeiten
+    orientation: -2.0         # angehoben (war -0.5): in rad zu schwach gegen ang_vel_xy → Haltung wird jetzt geformt
+    ang_vel_xy: -0.05         # gesenkt (war -0.1): nicht den natürlichen Rumpf-Schwung überdämpfen
+    support_pose: 0.2
+    # push_robustness (nur aktiv wenn push_enabled: true → sonst stets 0)
+    push_recovery: 0.5
 
 command_cfg:
   num_commands: 3
