@@ -112,6 +112,21 @@ class K1Env:
         self.robot.set_dofs_kv(kd, self.motors_dof_idx)
         self.robot.set_dofs_force_range([-e for e in effort], effort, self.motors_dof_idx)
 
+        # Kopfgelenke: nicht policy-gesteuert, aber per PD auf fester Pose gehalten (sonst schlackern sie lose).
+        # Eigene kp/kd setzen (Default wäre 0 → kraftlos) und konstantes Ziel head_target jeden Step kommandieren.
+        head_names = env_cfg["head_joint_names"]
+        self.head_dof_idx = torch.tensor(
+            [self.robot.get_joint(n).dof_start for n in head_names], dtype=gs.tc_int, device=gs.device
+        )
+        self.head_actions_dof_idx = torch.argsort(self.head_dof_idx)
+        self.robot.set_dofs_kp([joint_gains[n]["kp"] for n in head_names], self.head_dof_idx)
+        self.robot.set_dofs_kv([joint_gains[n]["kd"] for n in head_names], self.head_dof_idx)
+        head_effort = [joint_gains[n]["effort"] for n in head_names]
+        self.robot.set_dofs_force_range([-e for e in head_effort], head_effort, self.head_dof_idx)
+        self.head_target = torch.tensor(
+            [env_cfg["default_joint_angles"][n] for n in head_names], dtype=gs.tc_float, device=gs.device
+        ).expand(num_envs, -1)
+
         # start state
         self.init_base_pos = torch.tensor(self.env_cfg["base_init_pos"], dtype=gs.tc_float, device=gs.device)
         self.init_base_quat = torch.tensor(self.env_cfg["base_init_quat"], dtype=gs.tc_float, device=gs.device)
@@ -237,6 +252,11 @@ class K1Env:
         self.robot.control_dofs_position(
             target_dof_pos[:, self.actions_dof_idx],
             self.motors_dof_idx,
+        )
+        # Kopf konstant auf fester Pose halten (geradeaus, leicht nach unten) — kein Mitschlackern.
+        self.robot.control_dofs_position(
+            self.head_target[:, self.head_actions_dof_idx],
+            self.head_dof_idx,
         )
         self.scene.step()
 

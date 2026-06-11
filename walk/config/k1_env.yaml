@@ -31,7 +31,16 @@ env_cfg:
     - Right_Ankle_Pitch
     - Right_Ankle_Roll
 
+  # Kopfgelenke: NICHT von der Policy gesteuert, aber per PD auf fester Pose gehalten
+  # (sonst schlackert der Kopf lose mit). Ziel = head_fixed_angles, geradeaus + leicht nach unten.
+  head_joint_names:
+    - AAHead_yaw
+    - Head_pitch
+
   default_joint_angles:
+    # Kopf: geradeaus (yaw 0) und leicht nach unten geneigt (pitch +, Limit +0.855) → Blick auf den Ball
+    AAHead_yaw: 0.0
+    Head_pitch: 0.2
     ALeft_Shoulder_Pitch: 0.0
     ARight_Shoulder_Pitch: 0.0
     Left_Shoulder_Roll: -1.5
@@ -55,6 +64,9 @@ env_cfg:
 
   # Per-joint PD [kp, kd] and torque limits [Nm] — source: models/K1/K1_debug.py
   joint_gains:
+    # Kopf: steif genug halten, damit er trotz Rumpfbewegung ruhig in head_fixed-Pose bleibt
+    AAHead_yaw: {kp: 40.0, kd: 1.0, effort: 6.0}
+    Head_pitch: {kp: 40.0, kd: 1.0, effort: 6.0}
     ALeft_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
     ARight_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
     Left_Shoulder_Roll: {kp: 40.0, kd: 1.0, effort: 14.0}
