@@ -66,6 +66,8 @@ class K1TrainRunner(OnPolicyRunner):
             for _ in range(self.video_steps):
                 actions = policy(obs)
                 obs, _, _, _ = video_env.step(actions)
+                if video_env.cam._followed_entity is not None:
+                    video_env.cam.update_following()  # Kamera dem Roboter nachführen
                 video_env.cam.render()
 
         video_env.cam.stop_recording(save_to_filename=path, fps=self.video_fps)

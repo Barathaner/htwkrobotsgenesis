@@ -90,6 +90,15 @@ class K1Env:
 
         self.scene.build(n_envs=num_envs)
 
+        # Verfolgungskamera: hält den anfänglichen Versatz Kamera→Rumpf und schwenkt mit dem
+        # Roboter mit (lookat folgt dem Rumpf), statt starr zu stehen. update_following() muss
+        # je Frame VOR cam.render() aufgerufen werden (siehe k1_train_runner._record_video).
+        # smoothing ∈ (0,1): EMA-Glättung (höher = weicher/träger); None = exaktes Tracking.
+        if self.cam is not None:
+            vcfg = env_cfg.get("video", {})
+            if vcfg.get("follow", True):
+                self.cam.follow_entity(self.robot, smoothing=vcfg.get("follow_smoothing", 0.9))
+
         self.num_actions = len(env_cfg["joint_names"])
         self.num_commands = command_cfg["num_commands"]
         assert self.num_actions == env_cfg["num_actions"]
