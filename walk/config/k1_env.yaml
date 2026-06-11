@@ -97,6 +97,18 @@ reward_cfg:
   tracking_sigma: 0.25
   base_height_target: 0.53
   feet_height_target: 0.0
+  # Anti-Trippel (contact_stride): Fußhöhe als Kontakt-Proxy (kein Sensor).
+  # Fuß "am Boden" wenn z < foot_contact_height; Touchdown = Flanke hoch→Kontakt.
+  target_stride_length: 0.35      # L_target [m] — f_expected = cmd_speed / L
+  contact_rate_margin_hz: 0.3     # Toleranzband [Hz] bevor bestraft wird
+  contact_min_cmd_speed: 0.2      # [m/s] — darunter (Stehen) kein Penalty
+  foot_contact_height: 0.08       # [m] z-Schwelle Foot-Link-Ursprung (sitzt ~5-6 cm über Sohle;
+                                  # 0.08 erfasst Stand beider Füße zuverlässig, 0.04 verfehlt den rechten)
+  contact_window_s: 1.0           # [s] Warmup — Penalty erst ab dieser Episodenzeit (stabile Raten-Schätzung)
+  # feet_air_time: belohnt Luftphase beim Aufsetzen → Füße müssen abheben (Bodenfreiheit, kein Schlurfen)
+  feet_air_time_min: 0.12         # [s] Mindest-Luftphase, bevor gezählt wird
+  feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
+  feet_air_cmd_threshold: 0.2     # [m/s] — darunter (Stehen) kein Reward
   reward_scales:
     # Step-by-step reward tuning — enable one at a time (see K1_RL_INFO.md)
     base_height: -50.0
@@ -105,6 +117,8 @@ reward_cfg:
     action_rate: -0.005
     tracking_lin_vel: 1.0
     tracking_ang_vel: 1.0
+    contact_stride: -0.3
+    feet_air_time: 0.5
 
 command_cfg:
   num_commands: 3

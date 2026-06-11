@@ -165,6 +165,17 @@ class K1Env:
         self.actions = torch.zeros_like(self.dof_pos)
         self.last_actions = torch.zeros_like(self.dof_pos)
 
+        # Anti-Trippel (contact_stride): Fußhöhe als Kontakt-Proxy statt Sensor.
+        # foot_in_contact startet True (Roboter spawnt stehend → kein Fake-Touchdown im 1. Step).
+        # touchdown_count / Episodenzeit ergibt f_measured (Zählung seit Episodenstart, kein Fenster).
+        self.feet_idx_local = [self.robot.get_link(n).idx_local for n in ("left_foot_link", "right_foot_link")]
+        self.foot_in_contact = torch.ones((num_envs, 2), dtype=gs.tc_bool, device=gs.device)
+        self.touchdown_count = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+
+        # feet_air_time: Luftphase je Fuß [s]; Belohnung beim Aufsetzen (legged-gym-Stil).
+        self.foot_air_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.feet_air_time_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+
         self._obs_slices = {
             "base_ang_vel": self.base_ang_vel.shape[-1],
             "projected_gravity": self.projected_gravity.shape[-1],
@@ -213,6 +224,7 @@ class K1Env:
         self.projected_gravity.copy_(transform_by_quat(self.global_gravity, inv_base_quat))
         self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
         self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
+        self._update_foot_contact()
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
@@ -270,6 +282,10 @@ class K1Env:
             self.last_dof_vel.zero_()
             self.episode_length_buf.zero_()
             self.reset_buf.fill_(True)
+            self.touchdown_count.zero_()
+            self.foot_in_contact.fill_(True)
+            self.foot_air_time.zero_()
+            self.feet_air_time_reward.zero_()
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
             torch.where(envs_idx[:, None], self.init_base_quat, self.base_quat, out=self.base_quat)
@@ -285,6 +301,10 @@ class K1Env:
             self.last_dof_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.episode_length_buf.masked_fill_(envs_idx, 0)
             self.reset_buf.masked_fill_(envs_idx, True)
+            self.touchdown_count.masked_fill_(envs_idx, 0.0)
+            self.foot_in_contact.masked_fill_(envs_idx[:, None], True)
+            self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
+            self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -302,6 +322,33 @@ class K1Env:
 
         # random sample command upon reset
         self._resample_commands(envs_idx)
+
+    def _update_foot_contact(self):
+        """Fußhöhe-Proxy: Fuß am Boden wenn z < foot_contact_height; zählt Touchdowns (Flanke hoch→Kontakt).
+
+        Akkumuliert außerdem foot_air_time (dt pro Step ohne Bodenkontakt) und verbucht beim
+        Aufsetzen die Lande-Belohnung (feet_air_time) — beide nutzen denselben foot_z-Read.
+        Inference-mode-kompatibel: copy_ / in-place +=, *=, masked-fill.
+        """
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
+        in_contact = foot_z < self.reward_cfg["foot_contact_height"]
+        touchdown = in_contact & ~self.foot_in_contact
+        self.touchdown_count += touchdown.sum(dim=1).to(gs.tc_float)
+
+        # feet_air_time: erst dt für alle Füße addieren (zählt diesen Step zur Luftphase),
+        # dann beim Touchdown die Luftphase belohnen, danach Füße in Kontakt auf 0 setzen.
+        self.foot_air_time += self.dt
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
+        landing = torch.clamp(
+            self.foot_air_time - self.reward_cfg["feet_air_time_min"],
+            min=0.0,
+            max=self.reward_cfg["feet_air_time_max"],
+        ) * touchdown.to(gs.tc_float)
+        self.feet_air_time_reward.copy_(landing.sum(dim=1) * active)
+        self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
+
+        self.foot_in_contact.copy_(in_contact)
 
     def _update_observation(self):
         obs_parts = [
@@ -396,6 +443,51 @@ class K1Env:
           z=0.45 → return 0.0064  → -0.0064/Step
         """
         return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
+
+    def _reward_contact_stride(self):
+        """Strafe: Anti-Trippeln — zu hohe Schrittfrequenz für die befohlene Geschwindigkeit.
+
+        Proxy ohne Kontaktsensor: ein Fuß gilt als am Boden, wenn seine Link-Höhe
+        z < foot_contact_height liegt. Touchdown = Flanke hoch→Kontakt (in _update_foot_contact).
+        f_measured = Touchdowns (beide Füße) / Episodenzeit  [Hz, Mittel seit Episodenstart].
+        f_expected = cmd_speed / target_stride_length  (erwartete Schrittfrequenz).
+        Penalty nur wenn cmd_speed > contact_min_cmd_speed (Stehen → 0) UND
+        episode_time >= contact_window_s (Warmup: vermeidet Raten-Explosion bei kurzer Episode).
+
+        Beispiel (L=0.35, margin=0.3, scale=-0.3, dt=0.02):
+          cmd=0.6 m/s → f_expected≈1.71 Hz
+          f_measured=3.0 Hz → excess=3.0-1.71-0.3≈0.99 → return≈0.98 → contrib≈-0.0059/Step
+          f_measured=1.8 Hz → excess=1.8-1.71-0.3<0  → return 0     → 0/Step (im Toleranzband)
+          cmd=0.1 m/s (Stehen) → unter min_cmd_speed → return 0
+          episode_time<1.0 s → Warmup → return 0
+        """
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        f_expected = cmd_speed / self.reward_cfg["target_stride_length"]
+        episode_time = self.episode_length_buf.to(gs.tc_float) * self.dt
+        f_measured = self.touchdown_count / (episode_time + 1e-6)
+        excess = torch.clamp(f_measured - f_expected - self.reward_cfg["contact_rate_margin_hz"], min=0.0)
+        active = (cmd_speed > self.reward_cfg["contact_min_cmd_speed"]) & (
+            episode_time >= self.reward_cfg["contact_window_s"]
+        )
+        return torch.square(excess) * active.to(gs.tc_float)
+
+    def _reward_feet_air_time(self):
+        """Belohnung: Füße sollen genug abheben (gegen Schlurfen/Trippeln ohne Bodenfreiheit).
+
+        Legged-Gym-Stil: Belohnung NUR beim Aufsetzen (Touchdown), proportional zur
+        vorausgegangenen Luftphase. foot_air_time wird in _update_foot_contact akkumuliert
+        (dt pro Step ohne Bodenkontakt) und bei Landung in feet_air_time_reward verbucht:
+          je Fuß  clamp(air_time - feet_air_time_min, 0, feet_air_time_max),  über beide summiert.
+        Nur wenn cmd_speed > feet_air_cmd_threshold (beim Stehen kein Reward).
+        Ergänzt contact_stride (Strafe für zu schnelle Schritte) → Policy muss Fuß heben statt trippeln.
+
+        Beispiel (min=0.12, max=0.25, scale=0.5 → effektiv *dt=0.01, dt=0.02):
+          Fuß 0.30 s Luft, dann Landung → clamp(0.30-0.12,0,0.25)=0.18 → raw=0.18 → contrib≈+0.0018 (einmalig)
+          Fuß 0.10 s Luft (< min)       → clamp(-0.02,0,..)=0          → raw=0    → 0 (zu kurz, Schlurfen)
+          kein Touchdown in diesem Step → raw=0 → 0
+          cmd≈0 (Stehen)                → raw=0 → 0
+        """
+        return self.feet_air_time_reward
 
 
 # if __name__ == "__main__":
