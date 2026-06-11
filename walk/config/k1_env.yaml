@@ -1,14 +1,11 @@
-# Booster K1 locomotion — full 22-DOF (legs + arms + head in action/obs)
-# Obs dim = 9 + 3 * 22 = 75 (auto from buffer shapes in K1_env.py)
+# Booster K1 locomotion — 20-DOF (legs + arms; head not actuated)
+# Obs dim = 9 + 3 * 20 = 69 (auto from buffer shapes in K1_env.py)
 
 env_cfg:
-  num_actions: 22
+  num_actions: 20
 
   # Policy action order — all actuated joints (must match default_joint_angles keys)
   joint_names:
-    # head
-    - AAHead_yaw
-    - Head_pitch
     # left arm
     - ALeft_Shoulder_Pitch
     - Left_Shoulder_Roll
@@ -35,14 +32,12 @@ env_cfg:
     - Right_Ankle_Roll
 
   default_joint_angles:
-    AAHead_yaw: 0.0
-    Head_pitch: 0.0
     ALeft_Shoulder_Pitch: 0.0
     ARight_Shoulder_Pitch: 0.0
-    Left_Shoulder_Roll: 0.2
-    Right_Shoulder_Roll: -0.2
-    Left_Elbow_Pitch: 0.0
-    Right_Elbow_Pitch: 0.0
+    Left_Shoulder_Roll: 0.0
+    Right_Shoulder_Roll: 0.0
+    Left_Elbow_Pitch: 0.1
+    Right_Elbow_Pitch: 0.1
     Left_Elbow_Yaw: 0.0
     Right_Elbow_Yaw: 0.0
     Left_Hip_Pitch: -0.30
@@ -60,8 +55,6 @@ env_cfg:
 
   # Per-joint PD [kp, kd] and torque limits [Nm] — source: models/K1/K1_debug.py
   joint_gains:
-    AAHead_yaw: {kp: 20.0, kd: 0.5, effort: 6.0}
-    Head_pitch: {kp: 20.0, kd: 0.5, effort: 6.0}
     ALeft_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
     ARight_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
     Left_Shoulder_Roll: {kp: 40.0, kd: 1.0, effort: 14.0}
@@ -107,15 +100,15 @@ reward_cfg:
   reward_scales:
     # Step-by-step reward tuning — enable one at a time (see K1_RL_INFO.md)
     base_height: -50.0
-    similar_to_default: -0.1
+    #similar_to_default: -0.1
     lin_vel_z: -1.0
     action_rate: -0.005
     tracking_lin_vel: 1.0
-    tracking_ang_vel: 0.2
+    tracking_ang_vel: 1.0
 
 command_cfg:
   num_commands: 3
-  lin_vel_x_range: [0.5, 0.5]
+  lin_vel_x_range: [0.0, 2]
   lin_vel_y_range: [0.0, 0.0]
   ang_vel_range: [0.0, 0.0]
 

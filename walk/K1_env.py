@@ -116,8 +116,10 @@ class K1Env:
         self.init_base_pos = torch.tensor(self.env_cfg["base_init_pos"], dtype=gs.tc_float, device=gs.device)
         self.init_base_quat = torch.tensor(self.env_cfg["base_init_quat"], dtype=gs.tc_float, device=gs.device)
         self.inv_base_init_quat = inv_quat(self.init_base_quat)
+        # Full-robot initial pose: iterate all physical DOFs (URDF still has 22 joints).
+        # Joints not driven by the policy (e.g. head) default to 0.0.
         self.init_dof_pos = torch.tensor(
-            [self.env_cfg["default_joint_angles"][joint.name] for joint in self.robot.joints[1:]],
+            [self.env_cfg["default_joint_angles"].get(joint.name, 0.0) for joint in self.robot.joints[1:]],
             dtype=gs.tc_float,
             device=gs.device,
         )
