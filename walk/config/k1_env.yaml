@@ -1,5 +1,5 @@
 # Booster K1 locomotion — 20-DOF (legs + arms; head not actuated)
-# Obs dim = 9 + 3 * 20 = 69 (auto from buffer shapes in K1_env.py)
+# Obs dim = 9 + 3 * 20 + 2 (gait phase sin/cos) = 71 (auto from buffer shapes in K1_env.py)
 
 env_cfg:
   num_actions: 20
@@ -148,6 +148,14 @@ reward_cfg:
   push_vel_min: 0.3               # [m/s] untere Grenze des aufgeprägten Δv
   push_vel_max: 0.8               # [m/s] obere Grenze des aufgeprägten Δv
   push_recovery_window_s: 1.0     # [s] Fenster nach Push, in dem Recovery-Tracking belohnt wird
+  # Phase-Clock (Siekmann 2021 / Margolis "Walk These Ways" 2022): EIN periodischer Gangtakt
+  # ersetzt den Hand-Shaping-Cluster (no_alternation, contact_stride, foot_roll, flat_foot).
+  # Linkes/rechtes Bein laufen mit gait_phase_offset versetzt → erzwingt Alternation & Kadenz.
+  # sin/cos(2π·phase) gehen zusätzlich in die Observation (Policy kann den Takt timen).
+  gait_period_s: 0.7              # [s] Dauer eines vollen Schrittzyklus (beide Beine)
+  gait_stance_ratio: 0.6          # Anteil des Zyklus mit Bodenkontakt je Fuß (Duty; >0.5 → Double-Support-Überlapp)
+  gait_phase_offset: 0.5          # Phasenversatz Links/Rechts (0.5 = exakt alternierend)
+  gait_cmd_threshold: 0.2         # [m/s] darunter (Stehen) kein Gait-Penalty; Takt läuft aber weiter
   reward_scales:
     # Step-by-step reward tuning — enable one at a time (see K1_RL_INFO.md)
     base_height: -50.0
@@ -155,26 +163,48 @@ reward_cfg:
     lin_vel_z: -1.0
     action_rate: -0.005
     tracking_lin_vel: 1.0
-    tracking_ang_vel: 1.0
-    contact_stride: -0.3
+    # tracking_ang_vel gesenkt (war 1.0): yaw-Command ist konstant 0 → das war ein
+    # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
+    tracking_ang_vel: 0.25
+    # --- Gait: literatur-standard Footstep-Terme behalten ---
     feet_air_time: 0.5
-    no_alternation: -1.0
-    # Gait-Qualität & Stabilität
-    foot_roll: 0.5
-    flat_foot: -0.2            # entschärft (war -0.5): nur grob schlurfender Flachfuß, kein Mid-Stance-Stützfuß
-    feet_slip: -0.2           # Fuß-Horizontalgeschwindigkeit im Kontakt → echtes Anti-Schlurf-/Rutsch-Signal
+    feet_slip: -0.2           # Fuß-Horizontalgeschwindigkeit im Kontakt → Anti-Schlurf-/Rutsch-Signal
+    gait_phase: -0.5          # Phase-Clock: Strafe wenn Fuß-Kontakt nicht zum Takt passt (ersetzt 4 Hand-Terme)
+    # --- Standard-Regularisierer (legged-gym-Stil) ---
     dof_vel: -2.0e-4          # leichte Energie-/Vibrationsbremse über Gelenkgeschwindigkeiten
-    orientation: -2.0         # angehoben (war -0.5): in rad zu schwach gegen ang_vel_xy → Haltung wird jetzt geformt
-    ang_vel_xy: -0.05         # gesenkt (war -0.1): nicht den natürlichen Rumpf-Schwung überdämpfen
-    support_pose: 0.2
+    orientation: -2.0         # Haltung aufrecht (roll²+pitch², in rad)
+    ang_vel_xy: -0.05         # Roll/Pitch-Raten dämpfen, ohne den natürlichen Rumpf-Schwung zu überdämpfen
     # push_robustness (nur aktiv wenn push_enabled: true → sonst stets 0)
     push_recovery: 0.5
+    # --- abgeschaltet: Hand-Shaping-Cluster, ersetzt durch gait_phase (Phase-Clock) ---
+    # Wieder aktivieren erst NACHDEM ein stabiler Gang existiert, dann zum Feintuning:
+    # contact_stride: -0.3
+    # no_alternation: -1.0
+    # foot_roll: 0.5
+    # flat_foot: -0.2
+    # support_pose: 0.2
 
 command_cfg:
   num_commands: 3
-  lin_vel_x_range: [0.0, 2]
+  # Lernbarer Geschwindigkeitsbereich mit NICHT-Null-Minimum: zwingt stets Vorwärtsbewegung
+  # und hält den tracking_lin_vel-Gradienten nahe v=0 steil (exp(-v²/sigma) fällt schnell).
+  # War [0.0, 2]: bei ~1–2 m/s ist exp(-v²/0.25)≈0 → flacher Gradient → Stehen-Attraktor.
+  # 2 m/s (~4 Körperlängen/s) ist ohnehin kaum erreichbar; später schrittweise nach oben weiten.
+  lin_vel_x_range: [0.3, 0.8]     # Startbereich; obere Grenze wächst via Curriculum (s. u.)
   lin_vel_y_range: [0.0, 0.0]
   ang_vel_range: [0.0, 0.0]
+
+  # Geschwindigkeits-Curriculum: vx-Obergrenze steigt leistungsabhängig von 0.8 → lin_vel_x_max_limit.
+  # Aufstieg um 'step', sobald die geglättete mittlere Tracking-Qualität endender Episoden
+  # (0..1, auf volle Episodenlänge normiert → Stürze zählen wenig) 'threshold' übersteigt.
+  # Untere Grenze bleibt fix 0.3 (stets Vorwärts). Für Eval: enabled=false setzen.
+  curriculum:
+    enabled: true
+    lin_vel_x_max_limit: 2.0      # [m/s] Zielobergrenze, bis hierhin wird geweitet
+    step: 0.1                     # [m/s] Erweiterung der Obergrenze je Aufstieg
+    threshold: 0.7                # mittlere Tracking-Qualität (0..1) für einen Aufstieg
+    ema: 0.1                      # Glättungsfaktor der Performance-Schätzung (höher = reaktiver)
+    cooldown_s: 5.0               # [s] Mindestabstand zwischen zwei Aufstiegen (deckelt die Rate)
 
   # Camera for training rollout videos (used by K1_train_runner, 1 env only)
   video:

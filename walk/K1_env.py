@@ -168,6 +168,23 @@ class K1Env:
             )
         )
 
+        # Command-Curriculum: vx-Obergrenze wächst leistungsabhängig (legged-gym-Stil). Untere
+        # Grenze (0.3) bleibt fix → stets Vorwärtsbewegung. Aufstieg nur wenn die mittlere
+        # Tracking-Qualität endender Episoden (auf volle Länge normiert) über threshold liegt.
+        cc = self.command_cfg.get("curriculum", {})
+        self.curriculum_enabled = bool(cc.get("enabled", False))
+        self.cmd_x_max = float(self.command_cfg["lin_vel_x_range"][1])          # Start = config-Obergrenze
+        self.cmd_x_max_limit = float(cc.get("lin_vel_x_max_limit", self.cmd_x_max))
+        self.curriculum_step = float(cc.get("step", 0.1))
+        self.curriculum_threshold = float(cc.get("threshold", 0.7))
+        self.curriculum_ema = float(cc.get("ema", 0.1))
+        # Cooldown begrenzt die Aufstiegsrate unabhängig von num_envs/Reset-Häufigkeit:
+        # höchstens ein +step je cooldown_s, sonst würde die Range bei vielen Envs durchrasen.
+        self.curriculum_cooldown_steps = max(1, int(cc.get("cooldown_s", 5.0) / self.dt))
+        self.cmd_curr_perf = 0.0                                               # geglättete Tracking-Qualität
+        self.total_steps = 0                                                   # monotoner globaler Step-Zähler
+        self.last_curriculum_step = 0
+
         self.default_dof_pos = torch.tensor(
             [env_cfg["default_joint_angles"][n] for n in env_cfg["joint_names"]],
             dtype=gs.tc_float,
@@ -220,6 +237,14 @@ class K1Env:
         # Welt-Frame Linear-DOFs der Floating-Base (Index 0,1,2 = x,y,z); xy für Horizontal-Push.
         self.base_xy_dof_idx = torch.tensor([0, 1], dtype=gs.tc_int, device=gs.device)
 
+        # Phase-Clock (Siekmann/Margolis): periodischer Gangtakt φ∈[0,1), ersetzt no_alternation/
+        # contact_stride/foot_roll/flat_foot. φ läuft jeden Step weiter; sin/cos(2πφ) gehen in die Obs,
+        # damit die Policy den Takt timen kann. Je Env zufällig initialisiert → dekorrelierte Kadenzen.
+        self.gait_period_steps = max(1, int(self.reward_cfg["gait_period_s"] / self.dt))
+        self.gait_stance_ratio = float(self.reward_cfg["gait_stance_ratio"])
+        self.gait_phase_offset = float(self.reward_cfg["gait_phase_offset"])
+        self.gait_phase = torch.rand((num_envs,), dtype=gs.tc_float, device=gs.device)
+
         self._obs_slices = {
             "base_ang_vel": self.base_ang_vel.shape[-1],
             "projected_gravity": self.projected_gravity.shape[-1],
@@ -227,6 +252,7 @@ class K1Env:
             "dof_pos": self.dof_pos.shape[-1],
             "dof_vel": self.dof_vel.shape[-1],
             "actions": self.actions.shape[-1],
+            "gait_phase": 2,  # sin/cos(2πφ)
         }
         self.obs_dim = sum(self._obs_slices.values())
 
@@ -261,6 +287,9 @@ class K1Env:
         self.scene.step()
 
         self.episode_length_buf += 1
+        self.total_steps += 1  # globaler Takt fürs Curriculum-Cooldown
+        # Phase-Clock weiterdrehen: ein voller Zyklus je gait_period_steps Steps (in-place, mod 1).
+        self.gait_phase.add_(1.0 / self.gait_period_steps).remainder_(1.0)
         # copy into pre-allocated buffers so reset() works outside torch.inference_mode()
         self.base_pos.copy_(self.robot.get_pos())
         self.base_quat.copy_(self.robot.get_quat())
@@ -318,6 +347,10 @@ class K1Env:
         return self.get_observations()
 
     def _reset_idx(self, envs_idx=None):
+        # Command-Curriculum VOR dem Buffer-Reset auswerten (braucht episode_sums / episode_length).
+        if envs_idx is not None:
+            self._update_command_curriculum(envs_idx)
+
         # reset state
         self.robot.set_qpos(self.init_qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=True)
 
@@ -345,6 +378,7 @@ class K1Env:
             self.foot_flat_penalty.zero_()
             self.steps_since_push.fill_(1_000_000)
             self.next_push_step.copy_(self._sample_push_interval((self.num_envs,)))
+            self.gait_phase.uniform_(0.0, 1.0)
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
             torch.where(envs_idx[:, None], self.init_base_quat, self.base_quat, out=self.base_quat)
@@ -371,6 +405,7 @@ class K1Env:
             self.steps_since_push.masked_fill_(envs_idx, 1_000_000)
             torch.where(envs_idx, self._sample_push_interval((self.num_envs,)), self.next_push_step,
                         out=self.next_push_step)
+            torch.where(envs_idx, torch.rand_like(self.gait_phase), self.gait_phase, out=self.gait_phase)
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -385,9 +420,38 @@ class K1Env:
                 value.zero_()
             else:
                 value.masked_fill_(envs_idx, 0.0)
+        # Curriculum-Fortschritt mitloggen (aktuelle vx-Obergrenze)
+        self.extras["episode"]["curriculum_lin_vel_x_max"] = torch.tensor(
+            self.cmd_x_max, dtype=gs.tc_float, device=gs.device
+        )
 
         # random sample command upon reset
         self._resample_commands(envs_idx)
+
+    def _update_command_curriculum(self, envs_idx):
+        """Weitet die vx-Obergrenze leistungsabhängig (legged-gym-Stil, hier global + EMA-geglättet).
+
+        Misst die mittlere Tracking-Qualität der gerade endenden Episoden, normiert auf die VOLLE
+        Episodenlänge (früh gestürzte Envs tragen wenig bei → man muss eine ganze Episode gut
+        tracken). Liegt der geglättete Wert über threshold UND ist der Cooldown abgelaufen, steigt
+        cmd_x_max um step (bis limit). Der Cooldown deckelt die Rate (höchstens ein Aufstieg je
+        cooldown_s), damit die Range bei vielen Envs nicht in wenigen Steps durchrast.
+        """
+        if not self.curriculum_enabled or self.cmd_x_max >= self.cmd_x_max_limit:
+            return
+        n = int(envs_idx.sum())
+        if n == 0:
+            return
+        max_sum = self.max_episode_length * self.reward_scales["tracking_lin_vel"]  # max. Episode-Summe
+        batch_quality = (self.episode_sums["tracking_lin_vel"][envs_idx].sum() / (n * max_sum + 1e-9)).item()
+        self.cmd_curr_perf = (1.0 - self.curriculum_ema) * self.cmd_curr_perf + self.curriculum_ema * batch_quality
+        if (
+            self.cmd_curr_perf > self.curriculum_threshold
+            and self.total_steps - self.last_curriculum_step >= self.curriculum_cooldown_steps
+        ):
+            self.cmd_x_max = min(self.cmd_x_max_limit, self.cmd_x_max + self.curriculum_step)
+            self.commands_limits[1][0] = self.cmd_x_max  # obere vx-Grenze für gs_rand (in-place)
+            self.last_curriculum_step = self.total_steps
 
     def _update_foot_contact(self):
         """Fußhöhe-Proxy: Fuß am Boden wenn z < foot_contact_height; zählt Touchdowns (Flanke hoch→Kontakt).
@@ -481,6 +545,7 @@ class K1Env:
         self.next_push_step[envs_idx] = self.episode_length_buf[envs_idx] + self._sample_push_interval((n,))
 
     def _update_observation(self):
+        phase_2pi = self.gait_phase * (2.0 * math.pi)
         obs_parts = [
             self.base_ang_vel * self.obs_scales["ang_vel"],
             self.projected_gravity,
@@ -488,6 +553,7 @@ class K1Env:
             (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
             self.dof_vel * self.obs_scales["dof_vel"],
             self.actions,
+            torch.stack([torch.sin(phase_2pi), torch.cos(phase_2pi)], dim=1),  # Phase-Clock
         ]
         for i, part in enumerate(obs_parts):
             assert part.ndim == 2 and part.shape[0] == self.num_envs, f"obs part {i}: bad shape {part.shape}"
@@ -681,6 +747,31 @@ class K1Env:
         foot_vel_xy = self.robot.get_links_vel(self.feet_idx_local)[:, :, :2]  # (n,2,2) Welt-xy
         slip = torch.sum(torch.square(foot_vel_xy), dim=2)  # (n,2)
         return (slip * self.foot_in_contact.to(gs.tc_float)).sum(dim=1)
+
+    def _reward_gait_phase(self):
+        """Strafe: Fuß-Kontakt passt nicht zum Phase-Clock-Takt (Siekmann/Margolis-Stil).
+
+        Der Takt schreibt je Bein vor, wann es am Boden sein soll (Stance) und wann in der Luft
+        (Swing): linkes Bein folgt gait_phase, rechtes Bein um gait_phase_offset (0.5) versetzt
+        → erzwingt Alternation und feste Kadenz. Stance, solange Phase < gait_stance_ratio.
+        Bestraft wird je Fuß die Abweichung von Soll-Kontakt vs. Ist-Kontakt (Höhen-Proxy),
+        nur bei cmd_speed > gait_cmd_threshold (im Stand kein Takt-Zwang). Ersetzt no_alternation,
+        contact_stride, foot_roll und flat_foot durch EINEN periodischen Term. sin/cos(2πφ) liegt
+        in der Observation → die Policy kann den Takt aktiv timen.
+
+        Beispiel (offset=0.5, stance_ratio=0.6, scale=-0.5 → *dt=-0.01):
+          beide Füße passend zum Takt   → mismatch=0 → 0/Step
+          1 Fuß am Boden statt in Swing  → mismatch=1 → -0.01/Step
+          beide Füße falsch (z. B. Stehen während Swing) → mismatch=2 → -0.02/Step
+          cmd≈0 (Stehen)                 → 0
+        """
+        left_stance = self.gait_phase < self.gait_stance_ratio
+        right_stance = ((self.gait_phase + self.gait_phase_offset) % 1.0) < self.gait_stance_ratio
+        desired_contact = torch.stack([left_stance, right_stance], dim=1)  # (n,2) True = soll am Boden
+        mismatch = (desired_contact != self.foot_in_contact).to(gs.tc_float).sum(dim=1)
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
+        return mismatch * active
 
     def _reward_dof_vel(self):
         """Strafe: hohe Gelenkgeschwindigkeiten dämpfen (Energie/Vibration), ergänzt action_rate.
