@@ -32,6 +32,7 @@ ALL_REWARDS = [
     "tracking_ang_vel",
     "contact_stride",
     "feet_air_time",
+    "no_alternation",
 ]
 REWARD_SCALE_DEFAULTS = {
     "base_height": -50.0,
@@ -42,6 +43,7 @@ REWARD_SCALE_DEFAULTS = {
     "tracking_ang_vel": 0.2,
     "contact_stride": -0.3,
     "feet_air_time": 0.5,
+    "no_alternation": -1.0,
 }
 
 
@@ -221,6 +223,7 @@ def test_c(reward_name: str | None = None, steps: int = 200) -> bool:
         "tracking_ang_vel": ("zero", "cmd=0, yaw_rate≈0 → raw≈1.0"),
         "contact_stride": ("random", "Touchdowns/s vs cmd/L; raw≥0, nur bei cmd>0.2 m/s aktiv"),
         "feet_air_time": ("random", "raw>0 beim Aufsetzen nach >0.12s Luft; 0 bei cmd≈0 / Schlurfen"),
+        "no_alternation": ("random", "raw>0 wenn ein Fuß >0.5s in der Luft festhängt, sonst 0"),
     }
 
     all_ok = True
@@ -298,52 +301,67 @@ def test_d(num_envs: int = 64, steps: int = 50) -> bool:
 # Test E — feet_air_time landing reward (deterministisch)
 # ---------------------------------------------------------------------------
 def test_e() -> bool:
-    print("\n=== Test E: feet_air_time Lande-Reward ===")
-    print("Was passiert: Roboter wird stehen gelassen, bis ein Fuß Bodenkontakt hat.")
-    print("Dann tun wir so, als wäre der Fuß zuvor in der Luft gewesen (foot_in_contact=False)")
-    print("+ Luftphase, und lösen den Touchdown über _update_foot_contact() aus.")
-    print("Prüfen: Reward>0 nach >min Luft (cmd>0); 0 bei cmd=0; 0 bei zu kurzer Luftphase.\n")
+    print("\n=== Test E: feet_air_time + Alternations-Gate + no_alternation ===")
+    print("Idee: stehen lassen bis gewünschte Fußkonfiguration, dann (ohne scene.step!) den")
+    print("vorherigen Zustand auf 'in der Luft' setzen und _update_foot_contact() auslösen.")
+    print("Da keine Physik dazwischen läuft, sind die Fußpositionen identisch → deterministisch.\n")
 
-    env = make_env(num_envs=2, reward_names=["feet_air_time"])
+    env = make_env(num_envs=1, reward_names=["feet_air_time", "no_alternation"])
     min_air = env.reward_cfg["feet_air_time_min"]
     cap = env.reward_cfg["feet_air_time_max"]
     fwd = torch.tensor([0.6, 0.0, 0.0], device=gs.device)
 
-    # Einsetzen lassen, bis mindestens ein Fuß den Boden berührt (z < foot_contact_height).
-    env.reset()
-    n_in_contact = 0
-    for _ in range(60):
-        env.step(zero_actions(env))
-        n_in_contact = int(env.foot_in_contact[0].sum())
-        if n_in_contact > 0:
-            break
-    print(f"  Nach Settling: Füße in Kontakt (env0) = {n_in_contact}")
-    if n_in_contact == 0:
-        print("  FAIL: kein Fuß in Kontakt nach Settling — foot_contact_height prüfen.")
+    def settle_until(n_target: int, max_steps: int = 150) -> bool:
+        env.reset()
+        for _ in range(max_steps):
+            env.step(zero_actions(env))
+            if int(env.foot_in_contact[0].sum()) == n_target:
+                return True
         return False
 
     def land_with(cmd, air_time):
         env.commands[:] = cmd
         env.foot_in_contact[:] = False  # vorheriger Step: alle Füße galten als 'in der Luft'
         env.foot_air_time[:] = air_time
-        env._update_foot_contact()  # Touchdown für Füße, die jetzt Bodenkontakt haben
-        return float(env._reward_feet_air_time()[0])
+        env._update_foot_contact()  # liest aktuelle (unveränderte) Fußhöhen → Touchdown
+        return float(env._reward_feet_air_time()[0]), int(env.foot_in_contact[0].sum())
 
-    rew_land = land_with(fwd, 0.30)
-    expected = min(0.30 + env.dt - min_air, cap)  # pro gelandetem Fuß
-    print(f"  Landung nach 0.30s Luft (cmd=0.6): raw={rew_land:.4f}  (≈{expected:.4f} je Fuß)")
-    ok1 = rew_land > 0.0
+    ok = True
 
-    rew_stand = land_with(torch.zeros(3, device=gs.device), 0.30)
-    print(f"  Landung bei cmd=0 (Stehen):        raw={rew_stand:.4f}  (erwartet 0)")
-    ok2 = rew_stand == 0.0
+    # --- feet_air_time positiv: BEIDE Füße am Boden → Alternation erfüllt → Reward > 0 ---
+    if settle_until(2):
+        rew, n = land_with(fwd, 0.30)
+        expected = min(0.30 + env.dt - min_air, cap) * n
+        print(f"  Landung beide Füße (cmd=0.6): raw={rew:.4f} (≈{expected:.4f}), in_contact={n}")
+        ok &= rew > 0.0 and n == 2
+        rew0, _ = land_with(torch.zeros(3, device=gs.device), 0.30)
+        print(f"  Landung bei cmd=0 (Stehen):   raw={rew0:.4f} (erwartet 0)")
+        ok &= rew0 == 0.0
+        rews, _ = land_with(fwd, 0.05)
+        print(f"  Landung nach 0.05s (< min):   raw={rews:.4f} (erwartet 0)")
+        ok &= rews == 0.0
+    else:
+        print("  HINWEIS: kein Frame mit beiden Füßen in Kontakt — feet_air_time-Test übersprungen.")
 
-    rew_short = land_with(fwd, 0.05)
-    print(f"  Landung nach 0.05s Luft (< min):   raw={rew_short:.4f}  (erwartet 0)")
-    ok3 = rew_short == 0.0
+    # --- Alternations-Gate: nur EIN Fuß am Boden → Landung NICHT belohnt (kein Einbein-Hüpfen) ---
+    if settle_until(1):
+        rew, n = land_with(fwd, 0.30)
+        print(f"  Landung nur EIN Fuß (cmd=0.6): raw={rew:.4f} (erwartet 0 = Gate), in_contact={n}")
+        ok &= rew == 0.0 and n == 1
+    else:
+        print("  HINWEIS: kein Frame mit genau einem Fuß in Kontakt — Alternations-Test übersprungen.")
 
-    ok = ok1 and ok2 and ok3
-    print(f"  {'PASS' if ok else 'FAIL'}: Reward feuert nur beim Aufsetzen nach echter Luftphase bei cmd>0.")
+    # --- no_alternation: Strafe für festgehaltenen Fuß (liest nur foot_air_time, deterministisch) ---
+    stuck = env.reward_cfg["feet_air_time_stuck"]
+    env.foot_air_time[:] = 0.0
+    env.foot_air_time[0, 0] = 0.40  # normaler Schwung < stuck
+    normal = float(env._reward_no_alternation()[0])
+    env.foot_air_time[0, 0] = stuck + 0.30  # Fuß hängt 0.30 s über der Schwelle fest
+    held = float(env._reward_no_alternation()[0])
+    print(f"  no_alternation: Schwung 0.40s={normal:.3f} (erw. 0), festgehalten={held:.3f} (erw. 0.30)")
+    ok &= normal == 0.0 and abs(held - 0.30) < 1e-5
+
+    print(f"  {'PASS' if ok else 'FAIL'}: Reward nur bei Wechselschritt; festgehaltener Fuß wird bestraft.")
     return ok
 
 

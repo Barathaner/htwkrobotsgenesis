@@ -109,6 +109,7 @@ reward_cfg:
   feet_air_time_min: 0.12         # [s] Mindest-Luftphase, bevor gezählt wird
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
   feet_air_cmd_threshold: 0.2     # [m/s] — darunter (Stehen) kein Reward
+  feet_air_time_stuck: 0.5        # [s] ab hier gilt ein Fuß als "festgehalten" → no_alternation-Strafe
   reward_scales:
     # Step-by-step reward tuning — enable one at a time (see K1_RL_INFO.md)
     base_height: -50.0
@@ -119,6 +120,7 @@ reward_cfg:
     tracking_ang_vel: 1.0
     contact_stride: -0.3
     feet_air_time: 0.5
+    no_alternation: -1.0
 
 command_cfg:
   num_commands: 3

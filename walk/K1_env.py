@@ -340,11 +340,14 @@ class K1Env:
         self.foot_air_time += self.dt
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
+        # Alternations-Gate: Landung nur belohnen, wenn der ANDERE Fuß am Boden ist
+        # (echtes Wechselschreiten / Double-Support, kein Hüpfen auf einem Bein).
+        other_in_contact = in_contact[:, [1, 0]].to(gs.tc_float)
         landing = torch.clamp(
             self.foot_air_time - self.reward_cfg["feet_air_time_min"],
             min=0.0,
             max=self.reward_cfg["feet_air_time_max"],
-        ) * touchdown.to(gs.tc_float)
+        ) * touchdown.to(gs.tc_float) * other_in_contact
         self.feet_air_time_reward.copy_(landing.sum(dim=1) * active)
         self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
 
@@ -478,7 +481,8 @@ class K1Env:
         vorausgegangenen Luftphase. foot_air_time wird in _update_foot_contact akkumuliert
         (dt pro Step ohne Bodenkontakt) und bei Landung in feet_air_time_reward verbucht:
           je Fuß  clamp(air_time - feet_air_time_min, 0, feet_air_time_max),  über beide summiert.
-        Nur wenn cmd_speed > feet_air_cmd_threshold (beim Stehen kein Reward).
+        Nur wenn cmd_speed > feet_air_cmd_threshold (beim Stehen kein Reward) UND der andere Fuß
+        beim Aufsetzen am Boden ist (Alternations-Gate → kein Einbein-Hüpfen, siehe _update_foot_contact).
         Ergänzt contact_stride (Strafe für zu schnelle Schritte) → Policy muss Fuß heben statt trippeln.
 
         Beispiel (min=0.12, max=0.25, scale=0.5 → effektiv *dt=0.01, dt=0.02):
@@ -488,6 +492,24 @@ class K1Env:
           cmd≈0 (Stehen)                → raw=0 → 0
         """
         return self.feet_air_time_reward
+
+    def _reward_no_alternation(self):
+        """Strafe: ein Fuß bleibt zu lange in der Luft → kein Wechselschritt (Einbein-Hüpfen).
+
+        foot_air_time wird beim Aufsetzen auf 0 gesetzt (siehe _update_foot_contact); ein Fuß,
+        der NICHT aufsetzt, akkumuliert unbegrenzt. Bestraft wird pro Fuß
+          excess = max(0, foot_air_time - feet_air_time_stuck),  über beide Füße summiert.
+        Ein normaler Schwung (< feet_air_time_stuck) kostet nichts; ein dauerhaft oben gehaltener
+        Fuß wird Step für Step stärker bestraft → zwingt zum Aufsetzen → Alternation. Gegenstück
+        zu feet_air_time (das nur echtes Wechselschreiten belohnt).
+
+        Beispiel (feet_air_time_stuck=0.5, scale=-1.0, dt=0.02):
+          Fuß 0.40 s in der Luft (normaler Schwung) → excess=0    → 0/Step
+          Fuß 0.70 s oben                           → excess=0.20 → -0.004/Step
+          Fuß 1.50 s oben (festgehalten)            → excess=1.00 → -0.020/Step (wächst weiter)
+        """
+        excess = torch.clamp(self.foot_air_time - self.reward_cfg["feet_air_time_stuck"], min=0.0)
+        return excess.sum(dim=1)
 
 
 # if __name__ == "__main__":
