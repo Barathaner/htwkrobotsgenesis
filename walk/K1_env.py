@@ -376,10 +376,11 @@ class K1Env:
         style_w = self._current_style_weight()  # 0→1 Ramp, skaliert nur die style_terms
         self.style_weight = style_w
         for name, reward_func in self.reward_functions.items():
+            raw = reward_func()
             scale = self.reward_scales[name]
             if name in self.style_terms:
                 scale = scale * style_w
-            rew = reward_func() * scale
+            rew = raw * scale
             self.rew_buf += rew
             self.episode_sums[name] += rew
             # command_accuracy-EMA fürs Assist-Performance-Gate (raw ∈ [0,1], vor *scale).
