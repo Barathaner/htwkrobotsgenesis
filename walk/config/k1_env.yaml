@@ -108,7 +108,7 @@ env_cfg:
   # |Gesamtkraft| auf force_max [N] gedeckelt, am COM (reine Linearkraft, kein Stör-Drehmoment).
   # NICHT in der Observation. Für Eval: enabled=false.
   assist:
-    enabled: true
+    enabled: false
     force_kp: 40.0          # [N pro m/s] geschwindigkeitsproportionaler Drag entgegen der Ist-Bewegung
     force_dir: 30.0         # [N] konstanter Gegen-Zug ENTGEGEN der Kommandorichtung ("Gegenwind")
     force_max: 80.0         # [N] Deckel des xy-Kraftbetrags (Sicherheits-Obergrenze)
@@ -146,6 +146,11 @@ reward_cfg:
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
   feet_air_cmd_threshold: 0.15    # [m/s] — darunter (Stehen) kein Reward (war 0.2 → bei langsamem
                                   #     Anlauf unter Assist kein Abheb-Reward; 0.15 lässt ihn früher zählen)
+  # Air-Gate-Kopplung: stuft die feet_air_time-Belohnung je Env zusätzlich mit command_accuracy ∈
+  # [0,1]. Abheben zählt dann nur, soweit das Kommando auch getrackt wird → killt den Anreiz, auf
+  # der Stelle zu treten/trippeln (Füße heben ohne Vortrieb → command_accuracy niedrig → wenig
+  # Reward). Der binäre feet_air_cmd_threshold-Gate bleibt als Floor. false → reines cmd_speed-Gate.
+  feet_air_couple_command_accuracy: true
   # foot_roll: Heel-to-Toe-Abrollen über Ankle_Pitch (keine separaten Zeh/Hacken-Links im URDF).
   # Aufsetzen → Hacke (heel_target); letzte ~3 Steps vor Liftoff → Zeh (toe_target).
   ankle_heel_target: -0.15        # [rad] Ziel-Ankle_Pitch beim Touchdown (Ferse zuerst)
@@ -214,7 +219,7 @@ reward_cfg:
     action_rate: -0.005
     #tracking_lin_vel: 1.0
     # Heading-/Weltframe: verhindert Drift — cmd [vx,vy] = Soll in Spawn-Richtung, nicht Körperframe.
-    command_accuracy: 1.0
+    command_accuracy: 1.3
     # tracking_ang_vel gesenkt (war 1.0): yaw-Command ist konstant 0 → das war ein
     # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
     tracking_ang_vel: 0.25

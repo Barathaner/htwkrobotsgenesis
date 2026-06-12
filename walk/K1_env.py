@@ -311,6 +311,13 @@ class K1Env:
 
         self.obs_buf = torch.empty((num_envs, self.obs_dim), dtype=gs.tc_float, device=gs.device)
         self.rew_buf = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # command_accuracy ∈ [0,1] je Env, EINMAL pro Step in step() berechnet (Single Source):
+        # liest sowohl _reward_command_accuracy als auch das Air-Gate in _reward_feet_air_time.
+        self.command_accuracy = torch.ones((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # Air-Gate-Kopplung: feet_air_time-Belohnung mit command_accuracy stufen → Abheben wird nur
+        # belohnt, soweit das Kommando auch getrackt wird (kein Reward fürs Treten auf der Stelle ohne
+        # Vortrieb). Aus → reines cmd_speed-Gate (feet_air_cmd_threshold).
+        self.feet_air_couple_cmd_acc = bool(self.reward_cfg.get("feet_air_couple_command_accuracy", False))
         self.reset_buf = torch.ones((num_envs,), dtype=gs.tc_bool, device=gs.device)
         self.episode_length_buf = torch.zeros((num_envs,), dtype=gs.tc_int, device=gs.device)
         self.extras = {}
@@ -364,6 +371,13 @@ class K1Env:
 
         if self.push_enabled:
             self._apply_push()
+
+        # command_accuracy je Env [0,1] EINMAL berechnen (Single Source) — _reward_command_accuracy
+        # UND das Air-Gate in _reward_feet_air_time lesen denselben Wert, unabhängig von der
+        # Auswertungsreihenfolge der Reward-Funktionen. commands sind in diesem Step noch stabil
+        # (Resampling passiert erst nach der Reward-Schleife).
+        ca_err = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel_heading[:, :2]), dim=1)
+        self.command_accuracy.copy_(torch.exp(-ca_err / self.reward_cfg["tracking_sigma"]))
 
         self.rew_buf.zero_()
         style_w = self._current_style_weight()  # 0→1 Ramp, skaliert nur die style_terms
@@ -767,9 +781,11 @@ class K1Env:
         Beispiel (sigma=0.25, scale=1.0, dt=0.02):
           cmd [0.5, 0], Heading [0.5, 0]  → return 1.0
           cmd [0.5, 0], Roboter 90° gedreht, Körper-vx=0.5 → Heading≈[0, 0.5] → return≈0.37
+
+        Wert wird in step() vorab berechnet (self.command_accuracy) und auch vom Air-Gate
+        (_reward_feet_air_time) genutzt → eine gemeinsame Quelle, keine doppelte Berechnung.
         """
-        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel_heading[:, :2]), dim=1)
-        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+        return self.command_accuracy
 
     def _reward_tracking_ang_vel(self):
         """Belohnung: Drehgeschwindigkeit wie command [yaw] einhalten.
@@ -840,12 +856,21 @@ class K1Env:
         Nur wenn cmd_speed > feet_air_cmd_threshold (beim Stehen kein Reward) UND der andere Fuß
         beim Aufsetzen am Boden ist (Alternations-Gate → kein Einbein-Hüpfen, siehe _update_foot_contact).
 
-        Beispiel (min=0.12, max=0.25, scale=0.5 → effektiv *dt=0.01, dt=0.02):
-          Fuß 0.30 s Luft, dann Landung → clamp(0.30-0.12,0,0.25)=0.18 → raw=0.18 → contrib≈+0.0018 (einmalig)
-          Fuß 0.10 s Luft (< min)       → clamp(-0.02,0,..)=0          → raw=0    → 0 (zu kurz, Schlurfen)
-          kein Touchdown in diesem Step → raw=0 → 0
-          cmd≈0 (Stehen)                → raw=0 → 0
+        Air-Gate-Kopplung (feet_air_couple_command_accuracy): die Lande-Belohnung wird zusätzlich mit
+        command_accuracy ∈ [0,1] gestuft → Abheben zählt nur, soweit der Roboter das Kommando auch
+        trackt. Damit verschwindet der Anreiz, auf der Stelle zu treten/zu trippeln (Füße heben, aber
+        kein Vortrieb): command_accuracy ist dann niedrig → die Air-Belohnung schrumpft. Der binäre
+        cmd_speed-Gate bleibt als Floor erhalten. Der dominante command_accuracy-Reward (scale 1.0)
+        verhindert Sandbagging (schlecht tracken lohnt nie).
+
+        Beispiel (min=0.05, max=0.25, scale=3.0 → effektiv *dt=0.06, dt=0.02):
+          Landung raw=0.18, command_accuracy=1.0 (trackt) → contrib≈+0.0108 (voll)
+          Landung raw=0.18, command_accuracy=0.3 (Stelle) → contrib≈+0.0032 (gestuft)
+          kein Touchdown in diesem Step                   → raw=0 → 0
+          cmd≈0 (Stehen)                                  → raw=0 → 0
         """
+        if self.feet_air_couple_cmd_acc:
+            return self.feet_air_time_reward * self.command_accuracy
         return self.feet_air_time_reward
 
     def _reward_foot_roll(self):
