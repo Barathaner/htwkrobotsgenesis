@@ -1,5 +1,5 @@
 # Booster K1 locomotion — 20-DOF (legs + arms; head not actuated)
-# Obs dim = 9 + 3*20 + 2 (heading vx,vy) + 2 (gait phase sin/cos) = 73 (auto from buffer shapes in K1_env.py)
+# Obs dim = 9 + 3*20 + 2 (heading vx,vy) + 2 (gait phase sin/cos) + 2 (L/R foot contact) = 75 (auto in K1_env.py)
 
 env_cfg:
   num_actions: 20
@@ -139,10 +139,11 @@ reward_cfg:
   foot_contact_height: 0.08       # [m] z-Schwelle Foot-Link-Ursprung (sitzt ~5-6 cm über Sohle;
                                   # 0.08 erfasst Stand beider Füße zuverlässig, 0.04 verfehlt den rechten)
   # feet_air_time: belohnt Luftphase beim Aufsetzen → Füße müssen abheben (Bodenfreiheit, kein Schlurfen)
-  feet_air_time_min: 0.08         # [s] Mindest-Luftphase, bevor gezählt wird (war 0.12 → Landungen
-                                  #     blieben oft drunter = Reward 0 = kein Gradient; 0.08 senkt die Hürde)
+  feet_air_time_min: 0.05         # [s] Mindest-Luftphase, bevor gezählt wird (0.12→0.08→0.05: Landungen
+                                  #     blieben drunter = Reward 0 = kein Gradient; 0.05 gibt erstes Abheb-Signal)
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
-  feet_air_cmd_threshold: 0.2     # [m/s] — darunter (Stehen) kein Reward
+  feet_air_cmd_threshold: 0.15    # [m/s] — darunter (Stehen) kein Reward (war 0.2 → bei langsamem
+                                  #     Anlauf unter Assist kein Abheb-Reward; 0.15 lässt ihn früher zählen)
   # foot_roll: Heel-to-Toe-Abrollen über Ankle_Pitch (keine separaten Zeh/Hacken-Links im URDF).
   # Aufsetzen → Hacke (heel_target); letzte ~3 Steps vor Liftoff → Zeh (toe_target).
   ankle_heel_target: -0.15        # [rad] Ziel-Ankle_Pitch beim Touchdown (Ferse zuerst)
@@ -215,7 +216,9 @@ reward_cfg:
     feet_air_time: 3.0        # war 0.5/1.2 → bei Trippeln nahe 0 und viel zu schwach vs. Slip;
                               #         3.0 belohnt echtes Fuß-Abheben klar stärker als Schlurfen
     feet_slip: -0.6           # war -0.2 → Schlurfen muss teurer sein als Trippeln (Anti-Schlurf/Rutsch)
-    gait_phase: -1.0          # war -0.5 → stärkerer Takt-Zwang gegen das Dauer-Mismatch (~-0.15/s)
+    gait_phase: -0.3          # TEMPORÄR gesenkt (war -1.0): reine Takt-Strafe ohne belohntes Abheben
+                              #         (feet_air_time war tot) unterdrückte das Stepping-Risiko. Zurück auf
+                              #         -0.8/-1.0, SOBALD rew_feet_air_time > 0 (Füße heben wieder ab).
     # --- Standard-Regularisierer (legged-gym-Stil) ---
     dof_vel: -2.0e-4          # leichte Energie-/Vibrationsbremse über Gelenkgeschwindigkeiten
     orientation: -2.0         # Haltung aufrecht (roll²+pitch², in rad)
@@ -267,8 +270,8 @@ train_cfg:
     class_name: PPO
     clip_param: 0.2
     desired_kl: 0.01
-    entropy_coef: 0.004  # war 0.01 → hielt action_std bei ~1.41 fest (zappelige, unentschlossene Policy);
-                         #        niedriger lässt die Std konvergieren → committetere, ruhigere Bewegung
+    entropy_coef: 0.008  # 0.01→0.004→0.008: 0.004 ließ action_std auf ~0.27 kollabieren (festgefahren im
+                         #        Assist-Shuffle); wieder höher hält Exploration offen, ohne 1.41-Zappeln
     gamma: 0.99
     lam: 0.95
     learning_rate: 0.001
@@ -285,7 +288,8 @@ train_cfg:
     activation: elu
     distribution_cfg:
       class_name: GaussianDistribution
-      init_std: 0.8  # war 1.0 → ruhigerer Explorationsstart (zusammen mit niedrigerem entropy_coef)
+      init_std: 1.0  # zurück auf 1.0 → mehr Anfangs-Exploration, damit die Policy nicht früh in den
+                     #        Assist-Shuffle kollabiert (vgl. entropy_coef)
       std_type: scalar
 
   critic:

@@ -305,6 +305,11 @@ class K1Env:
             "dof_vel": self.dof_vel.shape[-1],
             "actions": self.actions.shape[-1],
             "gait_phase": 2,  # sin/cos(2πφ)
+            # L/R-Fußkontakt (0/1): macht die Stützsituation FÜR DIE POLICY beobachtbar. Bisher nur
+            # von den Rewards (feet_air_time, gait_phase, feet_slip) genutzt — die Policy musste
+            # Alternation/Doppelstütze aus Gelenkwinkeln raten. Mit Kontakt-State kann sie aktiv
+            # Wechselschritt timen (welches Bein trägt, wann abheben) → unterstützt zweibeinigen Gang.
+            "feet_contact": 2,
         }
         self.obs_dim = sum(self._obs_slices.values())
 
@@ -520,11 +525,13 @@ class K1Env:
     def _update_command_curriculum(self, envs_idx):
         """Weitet die vx-Obergrenze leistungsabhängig (legged-gym-Stil, hier global + EMA-geglättet).
 
-        Misst die mittlere Tracking-Qualität der gerade endenden Episoden, normiert auf die VOLLE
-        Episodenlänge (früh gestürzte Envs tragen wenig bei → man muss eine ganze Episode gut
-        tracken). Liegt der geglättete Wert über threshold UND ist der Cooldown abgelaufen, steigt
-        cmd_x_max um step (bis limit). Der Cooldown deckelt die Rate (höchstens ein Aufstieg je
-        cooldown_s), damit die Range bei vielen Envs nicht in wenigen Steps durchrast.
+        Misst die mittlere command_accuracy PRO STEP der gerade endenden Episoden — normiert auf die
+        ECHTE Episodenlänge (episode_length_buf), nicht auf max_episode_length. Sonst skaliert die
+        Qualität mit der Episodendauer: kurze Episoden (z. B. unter Assist mit ~75 statt 1000 Steps)
+        liefern selbst bei perfektem Tracking nur ~length/max_len ≈ 7 % → die Gates (Style 0.5 /
+        vx 0.8) öffnen NIE, obwohl pro Step gut getrackt wird. Mit der Echtlängen-Normierung ist
+        batch_quality ∈ [0,1] längenunabhängig die mittlere Tracking-Güte. Liegt der EMA-Wert über
+        threshold UND ist der Cooldown abgelaufen, steigt cmd_x_max um step (bis limit).
         """
         # cmd_curr_perf treibt BEIDE Curricula (vx-Weitung + Style-Ramp) → immer pflegen, solange
         # mindestens eines aktiv ist (auch wenn die vx-Range schon am Limit steht, braucht die
@@ -537,8 +544,11 @@ class K1Env:
         curriculum_key = (
             "command_accuracy" if "command_accuracy" in self.reward_scales else "tracking_lin_vel"
         )
-        max_sum = self.max_episode_length * self.reward_scales[curriculum_key]  # max. Episode-Summe
-        batch_quality = (self.episode_sums[curriculum_key][envs_idx].sum() / (n * max_sum + 1e-9)).item()
+        # je Env: Episode-Summe / (echte Länge · scale) = mittlere command_accuracy/Step ∈ [0,1],
+        # dann über die endenden Envs mitteln (längenunabhängig, s. Docstring).
+        scale = self.reward_scales[curriculum_key]
+        ep_len = self.episode_length_buf[envs_idx].clamp(min=1).to(gs.tc_float)
+        batch_quality = (self.episode_sums[curriculum_key][envs_idx] / (ep_len * scale + 1e-9)).mean().item()
         self.cmd_curr_perf = (1.0 - self.curriculum_ema) * self.cmd_curr_perf + self.curriculum_ema * batch_quality
 
         # vx-Obergrenze weiten (nur solange Command-Curriculum aktiv & nicht am Limit)
@@ -728,6 +738,8 @@ class K1Env:
             self.dof_vel * self.obs_scales["dof_vel"],
             self.actions,
             torch.stack([torch.sin(phase_2pi), torch.cos(phase_2pi)], dim=1),  # Phase-Clock
+            # L/R-Fußkontakt, zentriert auf {-0.5, +0.5} (nullnah wie die übrigen Obs-Terme).
+            self.foot_in_contact.to(gs.tc_float) - 0.5,
         ]
         for i, part in enumerate(obs_parts):
             assert part.ndim == 2 and part.shape[0] == self.num_envs, f"obs part {i}: bad shape {part.shape}"
