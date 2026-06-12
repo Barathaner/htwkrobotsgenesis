@@ -252,6 +252,28 @@ class K1Env:
         # Welt-Frame Linear-DOFs der Floating-Base (Index 0,1,2 = x,y,z); xy für Horizontal-Push.
         self.base_xy_dof_idx = torch.tensor([0, 1], dtype=gs.tc_int, device=gs.device)
 
+        # Assist-Force-Curriculum: stützende "helfende Hand" am Rumpf-COM, die zur kommandierten
+        # Geschwindigkeit zieht und über die Trainingszeit ausgeblendet wird (Gegenstück zum Push:
+        # Push stört, Assist stützt). Begründung/Mechanik: _apply_assist_force.
+        ac = env_cfg.get("assist", {})
+        self.assist_enabled = bool(ac.get("enabled", False))
+        self.assist_force_kp = float(ac.get("force_kp", 40.0))
+        self.assist_force_dir = float(ac.get("force_dir", 30.0))
+        self.assist_force_max = float(ac.get("force_max", 80.0))
+        self.assist_decay_steps = max(1, int(ac.get("decay_steps", 200_000)))
+        self.assist_scale_min = float(ac.get("scale_min", 0.0))
+        # Performance-Gate: Assist zusätzlich zum Zeit-Abbau zurückfahren, sobald command_accuracy
+        # steigt — aber nur bis perf_floor (Rest bleibt, der Zeit-Abbau blendet final aus).
+        self.assist_accuracy_target = max(1e-6, float(ac.get("accuracy_target", 0.7)))
+        self.assist_perf_floor = float(ac.get("perf_floor", 0.5))
+        self.assist_perf_alpha = float(ac.get("perf_ema", 0.01))
+        # Gate-Signal: command_accuracy (Heading-Frame, drift-bewusst), sonst tracking_lin_vel.
+        self.assist_perf_key = "command_accuracy" if "command_accuracy" in self.reward_scales else "tracking_lin_vel"
+        self.assist_perf_ema = 0.0                                 # EMA der mittleren Gate-Reward-Qualität
+        self.assist_scale = 1.0 if self.assist_enabled else 0.0   # für Logging vor dem 1. Step
+        self.assist_link_idx = [self.robot.base_link_idx]         # globaler Index des Rumpf-Links
+        self.assist_force_buf = torch.zeros((num_envs, 1, 3), dtype=gs.tc_float, device=gs.device)
+
         # Phase-Clock (Siekmann/Margolis): periodischer Gangtakt φ∈[0,1), ersetzt no_alternation/
         # contact_stride/foot_roll/flat_foot. φ läuft jeden Step weiter; sin/cos(2πφ) gehen in die Obs,
         # damit die Policy den Takt timen kann. Je Env zufällig initialisiert → dekorrelierte Kadenzen.
@@ -304,6 +326,9 @@ class K1Env:
             self.head_target[:, self.head_actions_dof_idx],
             self.head_dof_idx,
         )
+        # Assist-Force VOR scene.step() aufprägen, damit sie in die Integration dieses Steps eingeht.
+        if self.assist_enabled:
+            self._apply_assist_force()
         self.scene.step()
 
         self.episode_length_buf += 1
@@ -332,9 +357,13 @@ class K1Env:
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
-            rew = reward_func() * self.reward_scales[name]
+            raw = reward_func()
+            rew = raw * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
+            # command_accuracy-EMA fürs Assist-Performance-Gate (raw ∈ [0,1], vor *scale).
+            if self.assist_enabled and name == self.assist_perf_key:
+                self.assist_perf_ema += self.assist_perf_alpha * (raw.mean().item() - self.assist_perf_ema)
 
         self._resample_commands(
             self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0
@@ -465,6 +494,13 @@ class K1Env:
         self.extras["episode"]["curriculum_lin_vel_x_max"] = torch.tensor(
             self.cmd_x_max, dtype=gs.tc_float, device=gs.device
         )
+        # Assist-Force-Curriculum: aktuelle Stützstärke + Gate-Signal (command_accuracy-EMA) mitloggen
+        self.extras["episode"]["assist_scale"] = torch.tensor(
+            self.assist_scale, dtype=gs.tc_float, device=gs.device
+        )
+        self.extras["episode"]["assist_perf_ema"] = torch.tensor(
+            self.assist_perf_ema, dtype=gs.tc_float, device=gs.device
+        )
 
         # random sample command upon reset
         self._resample_commands(envs_idx)
@@ -587,6 +623,63 @@ class K1Env:
         self.steps_since_push[envs_idx] = 0
         # nächsten Push für genau diese Envs neu auslosen
         self.next_push_step[envs_idx] = self.episode_length_buf[envs_idx] + self._sample_push_interval((n,))
+
+    def _apply_assist_force(self):
+        """Assist-Force-Curriculum: virtuelle 'helfende Hand', die den Rumpf in/zur kommandierten
+        Bewegung zieht. Stark zu Beginn (trägt den Roboter fast mit), linear über assist_decay_steps
+        auf assist_scale_min ausgeblendet → am Ende muss der Gang allein laufen. Gegenstück zum Push
+        (_apply_push): Push STÖRT, Assist STÜTZT. Zwei Anteile (Heading-/Welt-xy):
+
+          force = scale · ( force_kp·(v_cmd − v_ist)   stabilisierender Geschwindigkeits-Zug:
+                                                        beschleunigt auf v_cmd, bremst bei Über-
+                                                        geschwindigkeit, korrigiert seitlichen Drift
+                          + force_dir·cmd_dir )         konstanter Zug IN Kommandorichtung (Einheits-
+                                                        vektor): bewusst NICHT durch v_ist gedeckelt →
+                                                        überzieht und zieht den COM über die stehenden
+                                                        Füße hinaus → Roboter 'fällt' anfangs nach vorn.
+
+        |Gesamtkraft| auf force_max [N] gedeckelt; am Rumpf-COM (ref='root_com' → reine Linearkraft,
+        KEIN Stör-Drehmoment — das Vorwärts-Kippen entsteht aus COM-Zug + stehenden Füßen, nicht aus
+        einem aufgeprägten Moment). NICHT in der Observation → die Policy erlebt nur anfangs leichtere
+        Dynamik, die über das Curriculum schwerer wird.
+
+        Heading == Welt gilt bei Identity-Spawn (base_init_quat = Einheit); base_lin_vel_heading ist
+        dann Welt-xy. Bei späterem Random-Yaw-Spawn müssten v_err und cmd_dir von Heading nach Welt
+        rotiert werden, bevor die Kraft im Weltframe angewandt wird.
+
+        Skala = time_scale · perf_factor (Zeit-Abbau × Performance-Gate):
+          time_scale  = max(scale_min, 1 − total_steps/decay_steps)
+          perf_factor = 1 − (1−perf_floor) · clamp(acc_ema/accuracy_target, 0, 1)
+        command_accuracy (EMA) hoch → perf_factor fällt auf perf_floor (nicht 0): der Roboter behält
+        perf_floor·time_scale der Kraft; erst der Zeit-Abbau blendet sie ganz aus → kein zu frühes
+        Fallenlassen eines noch nicht laufenden Gangs.
+
+        Beispiel (force_dir=30, perf_floor=0.5, accuracy_target=0.7, decay_steps=2e5):
+          total_steps=0,   acc=0.0 → time=1.0, perf=1.0  → scale=1.00 → F=(40·0.5+30)=[50,0] N (Kippen)
+          total_steps=1e5, acc=0.7 → time=0.5, perf=0.5  → scale=0.25 → F≈0.25·30=[7.5,0] N (Rest-Zug)
+          total_steps≥2e5                                → time=0     → scale=0 (Gang trägt allein)
+        """
+        time_scale = max(self.assist_scale_min, 1.0 - self.total_steps / self.assist_decay_steps)
+        acc = min(1.0, max(0.0, self.assist_perf_ema / self.assist_accuracy_target))
+        perf_factor = 1.0 - (1.0 - self.assist_perf_floor) * acc
+        self.assist_scale = time_scale * perf_factor
+        if self.assist_scale <= 0.0:
+            return
+        # (1) stabilisierender Geschwindigkeits-Fehler-Zug
+        force_xy = self.assist_force_kp * (self.commands[:, :2] - self.base_lin_vel_heading[:, :2])
+        # (2) konstanter Zug in Kommandorichtung (Einheitsvektor); inaktiv bei ~null Kommando
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1, keepdim=True)
+        cmd_dir = self.commands[:, :2] / (cmd_speed + 1e-6)
+        force_xy = force_xy + self.assist_force_dir * cmd_dir * (cmd_speed > 1e-3).to(gs.tc_float)
+        # gemeinsame Curriculum-Skalierung, dann Betrag der Gesamtkraft deckeln
+        force_xy = self.assist_scale * force_xy
+        mag = torch.norm(force_xy, dim=1, keepdim=True)
+        force_xy = force_xy * torch.clamp(self.assist_force_max / (mag + 1e-6), max=1.0)
+        self.assist_force_buf[:, 0, 0] = force_xy[:, 0]
+        self.assist_force_buf[:, 0, 1] = force_xy[:, 1]
+        self.scene.rigid_solver.apply_links_external_force(
+            self.assist_force_buf, links_idx=self.assist_link_idx, ref="root_com"
+        )
 
     def _update_observation(self):
         phase_2pi = self.gait_phase * (2.0 * math.pi)
