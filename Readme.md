@@ -40,13 +40,14 @@ What should the robot do?
 
 ## Curriculum — Rewards & Commands
 
-Drei unabhängige Curricula in `walk/config/k1_env.yaml` + `K1_env._update_command_curriculum`:
+Vier unabhängige Curricula in `walk/config/k1_env.yaml` + `K1_env`:
 
 | Curriculum | Schalter | Gate (wann es startet) | Was skaliert | wandb-Metrik |
 |---|---|---|---|---|
 | **Command** | `command_cfg.curriculum.enabled` | `cmd_curr_perf > 0.8` (EMA von `command_accuracy`) | `lin_vel_x_range` Obergrenze: 0.8 → 1.2 m/s (+0.1, Cooldown 10 s) | `curriculum_lin_vel_x_max` |
 | **Style** | `reward_cfg.style_curriculum.enabled` | `cmd_curr_perf > 0.5` (gelatcht) | Polish-Terme × `style_weight` 0→1 über 60 s Sim-Zeit | `curriculum_style_weight` |
-| **Push** | `reward_cfg.push_enabled` | manuell einschalten (Stage 4) | Stoß-Env + `push_recovery` Reward | — |
+| **Assist** | `env_cfg.assist.enabled` | `command_accuracy`-EMA + Zeit-Abbau | Stützkraft am Rumpf-COM → 0 über ~200k Steps | `assist_scale`, `assist_perf_ema` |
+| **Push** | `reward_cfg.push_enabled` | manuell (Stage 4) | zufälliger Horizontal-Stoß (Δv); Recovery über Task-Rewards | — |
 
 **Prinzip:** Erst **Task** (laufen, nicht fallen), dann **Gait** (Takt, Abheben), dann **Style** (Feintuning), zuletzt **Robustheit** (Stöße, DR).
 
@@ -66,16 +67,13 @@ Drei unabhängige Curricula in `walk/config/k1_env.yaml` + `K1_env._update_comma
 | `action_rate` | −0.005 | **Survival** | immer 100 % | immer | Glatte Aktionen |
 | `dof_vel` | −2e−4 | **Survival** | immer 100 % | immer | Leichte Energiebremse |
 | Termination | — | **Survival** | hard reset | roll/pitch > 30° oder z < 0.35 m | Nicht umfallen |
-| `feet_air_time` | +1.2 | **Gait** | immer 100 % | cmd_speed > 0.2 m/s | Fuß hebt ab, Wechselschritt |
-| `feet_slip` | −0.2 | **Gait** | immer 100 % | Fuß in Kontakt | Kein Schlurfen/Rutschen |
-| `gait_phase` | −0.5 | **Gait** | immer 100 % | cmd_speed > 0.2 m/s | Fuß-Kontakt passt zum Phasen-Takt |
+| `feet_air_time` | +3.0 | **Gait** | immer 100 % | cmd_speed > 0.2 m/s | Fuß hebt ab, Wechselschritt |
+| `feet_slip` | −0.6 | **Gait** | immer 100 % | Fuß in Kontakt | Kein Schlurfen/Rutschen |
+| `gait_phase` | −1.0 | **Gait** | immer 100 % | cmd_speed > 0.2 m/s | Fuß-Kontakt passt zum Phasen-Takt |
 | `foot_roll` | +0.5 | **Style** | × `style_weight` 0→1 | Gate + cmd > 0.2 | Heel-Strike / Toe-Off (Ankle-Pitch) |
 | `flat_foot` | −0.2 | **Style** | × `style_weight` 0→1 | Gate + Kontakt > 0.4 s flach | Kein dauerhaft flacher Schlurf-Fuß |
 | `support_pose` | +0.2 | **Style** | × `style_weight` 0→1 | Gate + cmd < 0.6 m/s | Knie leicht gebeugt (Federung) |
-| `similar_to_default` | −0.1 | **Style** | × `style_weight` 0→1 | Gate | Nahe Default-Pose, ruhige Haltung |
-| `push_recovery` | +0.5 | **Robustness** | 100 % wenn Push an | `push_enabled: true` | Nach Stoß wieder Command treffen |
-| `contact_stride` | −0.3 | — | aus | — | Ersetzt durch `gait_phase` |
-| `no_alternation` | −1.0 | — | aus | — | Ersetzt durch `gait_phase` |
+| `similar_to_default` | −0.03 | **Style** | × `style_weight` 0→1 | Gate | Nahe Default-Pose, ruhige Haltung |
 
 **Style-Terme** (`style_curriculum.terms`): `foot_roll`, `flat_foot`, `support_pose`, `similar_to_default`
 
@@ -101,7 +99,7 @@ Drei unabhängige Curricula in `walk/config/k1_env.yaml` + `K1_env._update_comma
 | **1** | Vorwärts laufen | Task + Gait, Command-Curriculum an | `command_accuracy` ↑, Video ok |
 | **2** | Gang-Stil | `style_curriculum.enabled: true` | `style_weight → 1`, Heel/Toe sichtbar |
 | **3** | Mehr Commands | `lin_vel_y`, `ang_vel`, ggf. negatives vx | alle Richtungen, Fall rate ≈ 0 |
-| **4** | Robustheit | `push_enabled: true`, Reibung DR | Recovery nach Stoß, kein Kollaps |
+| **4** | Robustheit | `push_enabled: true`, Reibung DR | Stoß überlebt, Tracking bleibt stabil |
 
 ---
 
@@ -115,7 +113,7 @@ Drei unabhängige Curricula in `walk/config/k1_env.yaml` + `K1_env._update_comma
 | Smooth | `action_rate`, `dof_vel` | ✅ |
 | Echter Gang | `feet_air_time`, `gait_phase`, `feet_slip` | ✅ |
 | Heel-to-Toe | `foot_roll`, `flat_foot` (Style-Ramp) | ✅ gerampt |
-| Stöße | `push_recovery` + `push_enabled` | ⏸ vorbereitet, aus |
+| Stöße | `push_enabled` (Env-Stoß, Task-Rewards für Recovery) | ⏸ vorbereitet, aus |
 | Kunstrasen / Terrain | — | ❌ noch offen |
 
 e.g. „Walk forward at commanded speed, stay upright, don’t hop, don’t fall.“

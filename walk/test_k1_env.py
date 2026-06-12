@@ -31,9 +31,7 @@ ALL_REWARDS = [
     "tracking_lin_vel",
     "command_accuracy",
     "tracking_ang_vel",
-    "contact_stride",
     "feet_air_time",
-    "no_alternation",
 ]
 REWARD_SCALE_DEFAULTS = {
     "base_height": -50.0,
@@ -43,9 +41,7 @@ REWARD_SCALE_DEFAULTS = {
     "tracking_lin_vel": 1.0,
     "command_accuracy": 1.0,
     "tracking_ang_vel": 0.2,
-    "contact_stride": -0.3,
     "feet_air_time": 0.5,
-    "no_alternation": -1.0,
 }
 
 
@@ -224,9 +220,7 @@ def test_c(reward_name: str | None = None, steps: int = 200) -> bool:
         "tracking_lin_vel": ("zero", "cmd=[0.5,0], vx≈0 → raw≈exp(-0.25)≈0.37; vx=0.5 → raw≈1.0"),
         "command_accuracy": ("zero", "cmd=[0.5,0], Heading-vx≈0 → raw≈0.37; Heading-vx=0.5 → raw≈1.0"),
         "tracking_ang_vel": ("zero", "cmd=0, yaw_rate≈0 → raw≈1.0"),
-        "contact_stride": ("random", "Touchdowns/s vs cmd/L; raw≥0, nur bei cmd>0.2 m/s aktiv"),
         "feet_air_time": ("random", "raw>0 beim Aufsetzen nach >0.12s Luft; 0 bei cmd≈0 / Schlurfen"),
-        "no_alternation": ("random", "raw>0 wenn ein Fuß >0.5s in der Luft festhängt, sonst 0"),
     }
 
     all_ok = True
@@ -304,12 +298,12 @@ def test_d(num_envs: int = 64, steps: int = 50) -> bool:
 # Test E — feet_air_time landing reward (deterministisch)
 # ---------------------------------------------------------------------------
 def test_e() -> bool:
-    print("\n=== Test E: feet_air_time + Alternations-Gate + no_alternation ===")
+    print("\n=== Test E: feet_air_time + Alternations-Gate ===")
     print("Idee: stehen lassen bis gewünschte Fußkonfiguration, dann (ohne scene.step!) den")
     print("vorherigen Zustand auf 'in der Luft' setzen und _update_foot_contact() auslösen.")
     print("Da keine Physik dazwischen läuft, sind die Fußpositionen identisch → deterministisch.\n")
 
-    env = make_env(num_envs=1, reward_names=["feet_air_time", "no_alternation"])
+    env = make_env(num_envs=1, reward_names=["feet_air_time"])
     min_air = env.reward_cfg["feet_air_time_min"]
     cap = env.reward_cfg["feet_air_time_max"]
     fwd = torch.tensor([0.6, 0.0, 0.0], device=gs.device)
@@ -354,17 +348,7 @@ def test_e() -> bool:
     else:
         print("  HINWEIS: kein Frame mit genau einem Fuß in Kontakt — Alternations-Test übersprungen.")
 
-    # --- no_alternation: Strafe für festgehaltenen Fuß (liest nur foot_air_time, deterministisch) ---
-    stuck = env.reward_cfg["feet_air_time_stuck"]
-    env.foot_air_time[:] = 0.0
-    env.foot_air_time[0, 0] = 0.40  # normaler Schwung < stuck
-    normal = float(env._reward_no_alternation()[0])
-    env.foot_air_time[0, 0] = stuck + 0.30  # Fuß hängt 0.30 s über der Schwelle fest
-    held = float(env._reward_no_alternation()[0])
-    print(f"  no_alternation: Schwung 0.40s={normal:.3f} (erw. 0), festgehalten={held:.3f} (erw. 0.30)")
-    ok &= normal == 0.0 and abs(held - 0.30) < 1e-5
-
-    print(f"  {'PASS' if ok else 'FAIL'}: Reward nur bei Wechselschritt; festgehaltener Fuß wird bestraft.")
+    print(f"  {'PASS' if ok else 'FAIL'}: Reward nur bei Wechselschritt.")
     return ok
 
 

@@ -229,12 +229,9 @@ class K1Env:
         self.actions = torch.zeros_like(self.dof_pos)
         self.last_actions = torch.zeros_like(self.dof_pos)
 
-        # Anti-Trippel (contact_stride): Fußhöhe als Kontakt-Proxy statt Sensor.
-        # foot_in_contact startet True (Roboter spawnt stehend → kein Fake-Touchdown im 1. Step).
-        # touchdown_count / Episodenzeit ergibt f_measured (Zählung seit Episodenstart, kein Fenster).
+        # Fuß-Kontakt-Proxy (Höhe): foot_in_contact startet True (Spawn stehend → kein Fake-Touchdown).
         self.feet_idx_local = [self.robot.get_link(n).idx_local for n in ("left_foot_link", "right_foot_link")]
         self.foot_in_contact = torch.ones((num_envs, 2), dtype=gs.tc_bool, device=gs.device)
-        self.touchdown_count = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
 
         # feet_air_time: Luftphase je Fuß [s]; Belohnung beim Aufsetzen (legged-gym-Stil).
         self.foot_air_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
@@ -261,10 +258,7 @@ class K1Env:
         self.push_interval_max_steps = max(
             self.push_interval_min_steps + 1, int(self.reward_cfg["push_interval_max_s"] / self.dt)
         )
-        self.push_recovery_window_steps = max(1, int(self.reward_cfg["push_recovery_window_s"] / self.dt))
-        # groß initialisiert → kein Recovery-Reward vor dem ersten Push
-        self.steps_since_push = torch.full((num_envs,), 1_000_000, dtype=gs.tc_int, device=gs.device)
-        # je Env die (Episoden-)Step-Nummer des nächsten Pushes; zufällig im Intervall-Band gezogen.
+        # je Env Episoden-Step des nächsten Pushes (zufällig 2–5 s, dekorreliert)
         self.next_push_step = self._sample_push_interval((num_envs,))
         # Welt-Frame Linear-DOFs der Floating-Base (Index 0,1,2 = x,y,z); xy für Horizontal-Push.
         self.base_xy_dof_idx = torch.tensor([0, 1], dtype=gs.tc_int, device=gs.device)
@@ -291,9 +285,8 @@ class K1Env:
         self.assist_link_idx = [self.robot.base_link_idx]         # globaler Index des Rumpf-Links
         self.assist_force_buf = torch.zeros((num_envs, 1, 3), dtype=gs.tc_float, device=gs.device)
 
-        # Phase-Clock (Siekmann/Margolis): periodischer Gangtakt φ∈[0,1), ersetzt no_alternation/
-        # contact_stride/foot_roll/flat_foot. φ läuft jeden Step weiter; sin/cos(2πφ) gehen in die Obs,
-        # damit die Policy den Takt timen kann. Je Env zufällig initialisiert → dekorrelierte Kadenzen.
+        # Phase-Clock (Siekmann/Margolis): periodischer Gangtakt φ∈[0,1). φ läuft jeden Step weiter;
+        # sin/cos(2πφ) gehen in die Obs, damit die Policy den Takt timen kann.
         self.gait_period_steps = max(1, int(self.reward_cfg["gait_period_s"] / self.dt))
         self.gait_stance_ratio = float(self.reward_cfg["gait_stance_ratio"])
         self.gait_phase_offset = float(self.reward_cfg["gait_phase_offset"])
@@ -368,7 +361,6 @@ class K1Env:
         self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
         self._update_foot_contact()
 
-        self.steps_since_push += 1
         if self.push_enabled:
             self._apply_push()
 
@@ -458,7 +450,6 @@ class K1Env:
             self.last_dof_vel.zero_()
             self.episode_length_buf.zero_()
             self.reset_buf.fill_(True)
-            self.touchdown_count.zero_()
             self.foot_in_contact.fill_(True)
             self.foot_air_time.zero_()
             self.feet_air_time_reward.zero_()
@@ -466,7 +457,6 @@ class K1Env:
             self.foot_flat_time.zero_()
             self.foot_roll_reward.zero_()
             self.foot_flat_penalty.zero_()
-            self.steps_since_push.fill_(1_000_000)
             self.next_push_step.copy_(self._sample_push_interval((self.num_envs,)))
             self.gait_phase.uniform_(0.0, 1.0)
         else:
@@ -486,7 +476,6 @@ class K1Env:
             self.last_dof_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.episode_length_buf.masked_fill_(envs_idx, 0)
             self.reset_buf.masked_fill_(envs_idx, True)
-            self.touchdown_count.masked_fill_(envs_idx, 0.0)
             self.foot_in_contact.masked_fill_(envs_idx[:, None], True)
             self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
@@ -494,7 +483,6 @@ class K1Env:
             self.foot_flat_time.masked_fill_(envs_idx[:, None], 0.0)
             self.foot_roll_reward.masked_fill_(envs_idx, 0.0)
             self.foot_flat_penalty.masked_fill_(envs_idx, 0.0)
-            self.steps_since_push.masked_fill_(envs_idx, 1_000_000)
             torch.where(envs_idx, self._sample_push_interval((self.num_envs,)), self.next_push_step,
                         out=self.next_push_step)
             torch.where(envs_idx, torch.rand_like(self.gait_phase), self.gait_phase, out=self.gait_phase)
@@ -591,7 +579,6 @@ class K1Env:
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
         in_contact = foot_z < self.reward_cfg["foot_contact_height"]
         touchdown = in_contact & ~self.foot_in_contact
-        self.touchdown_count += touchdown.sum(dim=1).to(gs.tc_float)
 
         # feet_air_time: erst dt für alle Füße addieren (zählt diesen Step zur Luftphase),
         # dann beim Touchdown die Luftphase belohnen, danach Füße in Kontakt auf 0 setzen.
@@ -653,8 +640,7 @@ class K1Env:
         Je Env eigener Zeitplan (next_push_step, 2–5 s zufällig → dekorrelierte Störungen statt
         batch-synchroner Schläge). Beim Auslösen wird ein Δv in zufälliger Horizontalrichtung
         (push_vel_min..max) auf die Welt-xy-Geschwindigkeit der Base addiert; das Δv ist so bemessen,
-        dass es aufholbar bleibt. steps_since_push wird genullt → push_recovery belohnt das
-        Zurück-auf-Kurs-Kommen im folgenden Fenster (kein Reward fürs Einfrieren, Tracking bleibt gefordert).
+        dass es aufholbar bleibt.
         """
         due = self.episode_length_buf >= self.next_push_step
         envs_idx = due.nonzero(as_tuple=False).reshape(-1)
@@ -668,7 +654,6 @@ class K1Env:
         cur = self.robot.get_vel()[envs_idx]  # Welt-Frame Linear-Geschwindigkeit der Base
         new_xy = torch.stack([cur[:, 0] + dv * torch.cos(angle), cur[:, 1] + dv * torch.sin(angle)], dim=1)
         self.robot.set_dofs_velocity(new_xy, dofs_idx_local=self.base_xy_dof_idx, envs_idx=envs_idx)
-        self.steps_since_push[envs_idx] = 0
         # nächsten Push für genau diese Envs neu auslosen
         self.next_push_step[envs_idx] = self.episode_length_buf[envs_idx] + self._sample_push_interval((n,))
 
@@ -843,33 +828,6 @@ class K1Env:
         """
         return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
 
-    def _reward_contact_stride(self):
-        """Strafe: Anti-Trippeln — zu hohe Schrittfrequenz für die befohlene Geschwindigkeit.
-
-        Proxy ohne Kontaktsensor: ein Fuß gilt als am Boden, wenn seine Link-Höhe
-        z < foot_contact_height liegt. Touchdown = Flanke hoch→Kontakt (in _update_foot_contact).
-        f_measured = Touchdowns (beide Füße) / Episodenzeit  [Hz, Mittel seit Episodenstart].
-        f_expected = cmd_speed / target_stride_length  (erwartete Schrittfrequenz).
-        Penalty nur wenn cmd_speed > contact_min_cmd_speed (Stehen → 0) UND
-        episode_time >= contact_window_s (Warmup: vermeidet Raten-Explosion bei kurzer Episode).
-
-        Beispiel (L=0.35, margin=0.3, scale=-0.3, dt=0.02):
-          cmd=0.6 m/s → f_expected≈1.71 Hz
-          f_measured=3.0 Hz → excess=3.0-1.71-0.3≈0.99 → return≈0.98 → contrib≈-0.0059/Step
-          f_measured=1.8 Hz → excess=1.8-1.71-0.3<0  → return 0     → 0/Step (im Toleranzband)
-          cmd=0.1 m/s (Stehen) → unter min_cmd_speed → return 0
-          episode_time<1.0 s → Warmup → return 0
-        """
-        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
-        f_expected = cmd_speed / self.reward_cfg["target_stride_length"]
-        episode_time = self.episode_length_buf.to(gs.tc_float) * self.dt
-        f_measured = self.touchdown_count / (episode_time + 1e-6)
-        excess = torch.clamp(f_measured - f_expected - self.reward_cfg["contact_rate_margin_hz"], min=0.0)
-        active = (cmd_speed > self.reward_cfg["contact_min_cmd_speed"]) & (
-            episode_time >= self.reward_cfg["contact_window_s"]
-        )
-        return torch.square(excess) * active.to(gs.tc_float)
-
     def _reward_feet_air_time(self):
         """Belohnung: Füße sollen genug abheben (gegen Schlurfen/Trippeln ohne Bodenfreiheit).
 
@@ -879,7 +837,6 @@ class K1Env:
           je Fuß  clamp(air_time - feet_air_time_min, 0, feet_air_time_max),  über beide summiert.
         Nur wenn cmd_speed > feet_air_cmd_threshold (beim Stehen kein Reward) UND der andere Fuß
         beim Aufsetzen am Boden ist (Alternations-Gate → kein Einbein-Hüpfen, siehe _update_foot_contact).
-        Ergänzt contact_stride (Strafe für zu schnelle Schritte) → Policy muss Fuß heben statt trippeln.
 
         Beispiel (min=0.12, max=0.25, scale=0.5 → effektiv *dt=0.01, dt=0.02):
           Fuß 0.30 s Luft, dann Landung → clamp(0.30-0.12,0,0.25)=0.18 → raw=0.18 → contrib≈+0.0018 (einmalig)
@@ -888,24 +845,6 @@ class K1Env:
           cmd≈0 (Stehen)                → raw=0 → 0
         """
         return self.feet_air_time_reward
-
-    def _reward_no_alternation(self):
-        """Strafe: ein Fuß bleibt zu lange in der Luft → kein Wechselschritt (Einbein-Hüpfen).
-
-        foot_air_time wird beim Aufsetzen auf 0 gesetzt (siehe _update_foot_contact); ein Fuß,
-        der NICHT aufsetzt, akkumuliert unbegrenzt. Bestraft wird pro Fuß
-          excess = max(0, foot_air_time - feet_air_time_stuck),  über beide Füße summiert.
-        Ein normaler Schwung (< feet_air_time_stuck) kostet nichts; ein dauerhaft oben gehaltener
-        Fuß wird Step für Step stärker bestraft → zwingt zum Aufsetzen → Alternation. Gegenstück
-        zu feet_air_time (das nur echtes Wechselschreiten belohnt).
-
-        Beispiel (feet_air_time_stuck=0.5, scale=-1.0, dt=0.02):
-          Fuß 0.40 s in der Luft (normaler Schwung) → excess=0    → 0/Step
-          Fuß 0.70 s oben                           → excess=0.20 → -0.004/Step
-          Fuß 1.50 s oben (festgehalten)            → excess=1.00 → -0.020/Step (wächst weiter)
-        """
-        excess = torch.clamp(self.foot_air_time - self.reward_cfg["feet_air_time_stuck"], min=0.0)
-        return excess.sum(dim=1)
 
     def _reward_foot_roll(self):
         """Belohnung: sauberes Heel-to-Toe-Abrollen (kein separater Zeh/Hacken-Link → Ankle_Pitch als Proxy).
@@ -958,8 +897,7 @@ class K1Env:
         (Swing): linkes Bein folgt gait_phase, rechtes Bein um gait_phase_offset (0.5) versetzt
         → erzwingt Alternation und feste Kadenz. Stance, solange Phase < gait_stance_ratio.
         Bestraft wird je Fuß die Abweichung von Soll-Kontakt vs. Ist-Kontakt (Höhen-Proxy),
-        nur bei cmd_speed > gait_cmd_threshold (im Stand kein Takt-Zwang). Ersetzt no_alternation,
-        contact_stride, foot_roll und flat_foot durch EINEN periodischen Term. sin/cos(2πφ) liegt
+        nur bei cmd_speed > gait_cmd_threshold (im Stand kein Takt-Zwang). sin/cos(2πφ) liegt
         in der Observation → die Policy kann den Takt aktiv timen.
 
         Beispiel (offset=0.5, stance_ratio=0.6, scale=-0.5 → *dt=-0.01):
@@ -1033,22 +971,6 @@ class K1Env:
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed < self.reward_cfg["support_pose_cmd_speed"]).to(gs.tc_float)
         return in_band_score * active
-
-    def _reward_push_recovery(self):
-        """Belohnung: nach einem Push (Stage 3) schnell wieder die kommandierte Geschwindigkeit treffen.
-
-        Nur im Fenster push_recovery_window_steps nach einem Push aktiv (sonst 0 → keine Doppelzählung
-        mit tracking_lin_vel). Belohnt die Übereinstimmung der Ist- mit der Soll-xy-Geschwindigkeit —
-        Einfrieren bei cmd≠0 ergibt großen Fehler und damit kaum Reward.
-
-        Beispiel (sigma=0.25, window=1.0 s, scale=0.5):
-          0.5 s nach Push, cmd [0.5,0], Ist [0.5,0] → exp(0)=1.0 → +0.01/Step
-          0.5 s nach Push, cmd [0.5,0], Ist [0.0,0] → exp(-0.25/0.25)≈0.37 → +0.0037/Step
-          außerhalb des Fensters                    → 0
-        """
-        in_window = (self.steps_since_push < self.push_recovery_window_steps).to(gs.tc_float)
-        vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        return torch.exp(-vel_error / self.reward_cfg["tracking_sigma"]) * in_window
 
 
 # if __name__ == "__main__":
