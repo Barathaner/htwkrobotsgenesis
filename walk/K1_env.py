@@ -200,6 +200,23 @@ class K1Env:
         self.total_steps = 0                                                   # monotoner globaler Step-Zähler
         self.last_curriculum_step = 0
 
+        # Reward-Curriculum (Style-Ramp): erst LAUFEN, dann STIL. Polish-Terme (Knie beugen,
+        # Heel-to-Toe-Abrollen, Stützpose …) werden erst hochgefahren, NACHDEM Laufen steht. Gate
+        # = cmd_curr_perf (dieselbe Tracking-Qualität 0..1 wie das Command-Curriculum, s.
+        # _update_command_curriculum). Überschreitet sie style_threshold, öffnet das Gate (gelatcht)
+        # und style_weight läuft über style_ramp_s Sim-Sekunden linear 0→1. style_weight skaliert in
+        # step() die Scales der style_terms; alle übrigen (Task-/Survival-)Terme bleiben stets voll.
+        sc = self.reward_cfg.get("style_curriculum", {})
+        self.style_enabled = bool(sc.get("enabled", False))
+        self.style_threshold = float(sc.get("threshold", 0.5))
+        self.style_ramp_steps = max(1, int(float(sc.get("ramp_s", 60.0)) / self.dt))
+        self.style_terms = set(sc.get("terms", []))
+        self.style_start_step = -1                 # total_steps bei Gate-Öffnung (-1 = noch zu)
+        self.style_weight = 0.0 if self.style_enabled else 1.0  # aus → konstant 1 (Verhalten wie ohne Ramp)
+        if self.style_enabled:
+            unknown = self.style_terms - set(self.reward_scales)
+            assert not unknown, f"style_curriculum.terms nicht in reward_scales aktiv: {sorted(unknown)}"
+
         self.default_dof_pos = torch.tensor(
             [env_cfg["default_joint_angles"][n] for n in env_cfg["joint_names"]],
             dtype=gs.tc_float,
@@ -331,8 +348,13 @@ class K1Env:
             self._apply_push()
 
         self.rew_buf.zero_()
+        style_w = self._current_style_weight()  # 0→1 Ramp, skaliert nur die style_terms
+        self.style_weight = style_w
         for name, reward_func in self.reward_functions.items():
-            rew = reward_func() * self.reward_scales[name]
+            scale = self.reward_scales[name]
+            if name in self.style_terms:
+                scale = scale * style_w
+            rew = reward_func() * scale
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
@@ -461,9 +483,12 @@ class K1Env:
                 value.zero_()
             else:
                 value.masked_fill_(envs_idx, 0.0)
-        # Curriculum-Fortschritt mitloggen (aktuelle vx-Obergrenze)
+        # Curriculum-Fortschritt mitloggen (vx-Obergrenze + Style-Ramp-Gewicht)
         self.extras["episode"]["curriculum_lin_vel_x_max"] = torch.tensor(
             self.cmd_x_max, dtype=gs.tc_float, device=gs.device
+        )
+        self.extras["episode"]["curriculum_style_weight"] = torch.tensor(
+            self.style_weight, dtype=gs.tc_float, device=gs.device
         )
 
         # random sample command upon reset
@@ -478,7 +503,10 @@ class K1Env:
         cmd_x_max um step (bis limit). Der Cooldown deckelt die Rate (höchstens ein Aufstieg je
         cooldown_s), damit die Range bei vielen Envs nicht in wenigen Steps durchrast.
         """
-        if not self.curriculum_enabled or self.cmd_x_max >= self.cmd_x_max_limit:
+        # cmd_curr_perf treibt BEIDE Curricula (vx-Weitung + Style-Ramp) → immer pflegen, solange
+        # mindestens eines aktiv ist (auch wenn die vx-Range schon am Limit steht, braucht die
+        # Style-Ramp das Signal weiter).
+        if not (self.curriculum_enabled or self.style_enabled):
             return
         n = int(envs_idx.sum())
         if n == 0:
@@ -489,13 +517,34 @@ class K1Env:
         max_sum = self.max_episode_length * self.reward_scales[curriculum_key]  # max. Episode-Summe
         batch_quality = (self.episode_sums[curriculum_key][envs_idx].sum() / (n * max_sum + 1e-9)).item()
         self.cmd_curr_perf = (1.0 - self.curriculum_ema) * self.cmd_curr_perf + self.curriculum_ema * batch_quality
+
+        # vx-Obergrenze weiten (nur solange Command-Curriculum aktiv & nicht am Limit)
         if (
-            self.cmd_curr_perf > self.curriculum_threshold
+            self.curriculum_enabled
+            and self.cmd_x_max < self.cmd_x_max_limit
+            and self.cmd_curr_perf > self.curriculum_threshold
             and self.total_steps - self.last_curriculum_step >= self.curriculum_cooldown_steps
         ):
             self.cmd_x_max = min(self.cmd_x_max_limit, self.cmd_x_max + self.curriculum_step)
             self.commands_limits[1][0] = self.cmd_x_max  # obere vx-Grenze für gs_rand (in-place)
             self.last_curriculum_step = self.total_steps
+
+        # Style-Gate öffnen (einmalig gelatcht), sobald Laufen/Tracking gut genug ist
+        if self.style_enabled and self.style_start_step < 0 and self.cmd_curr_perf > self.style_threshold:
+            self.style_start_step = self.total_steps
+
+    def _current_style_weight(self):
+        """Aktuelles Style-Gewicht ∈ [0,1] (monoton, gelatcht) — Faktor für die style_terms in step().
+
+        Gate zu (cmd_curr_perf nie über style_threshold) → 0: keine Style-Terme, reines Laufenlernen.
+        Ab Gate-Öffnung lineare Rampe über style_ramp_steps Sim-Steps auf 1 (sanfter Übergang, kein
+        harter Sprung, der einen funktionierenden Gang zurück Richtung Stehen zerrt). Style aus → 1.
+        """
+        if not self.style_enabled:
+            return 1.0
+        if self.style_start_step < 0:
+            return 0.0
+        return min(1.0, max(0.0, (self.total_steps - self.style_start_step) / self.style_ramp_steps))
 
     def _update_foot_contact(self):
         """Fußhöhe-Proxy: Fuß am Boden wenn z < foot_contact_height; zählt Touchdowns (Flanke hoch→Kontakt).

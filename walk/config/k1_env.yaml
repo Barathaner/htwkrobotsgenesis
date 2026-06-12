@@ -158,10 +158,27 @@ reward_cfg:
   # (kein Drehimpuls → kein emergenter Armschwung). 0.9 s rückt Richtung Eigenfrequenz → längere,
   # entspanntere Schritte; bewusst nicht ganz 1.4 s, sonst werden Schritte bei hohem Curriculum-vx
   # unrealistisch lang (Stride ≈ vx·period/2).
-  gait_period_s: 0.9              # [s] Dauer eines vollen Schrittzyklus (beide Beine)
+  gait_period_s: 1.1              # [s] Dauer eines vollen Schrittzyklus (war 0.9 → erzwang kurze, hastige
+                                  #     Schritte/Trippeln; 1.1 näher an der Bein-Eigenfrequenz → längere Swingphase)
   gait_stance_ratio: 0.6          # Anteil des Zyklus mit Bodenkontakt je Fuß (Duty; >0.5 → Double-Support-Überlapp)
   gait_phase_offset: 0.5          # Phasenversatz Links/Rechts (0.5 = exakt alternierend)
   gait_cmd_threshold: 0.2         # [m/s] darunter (Stehen) kein Gait-Penalty; Takt läuft aber weiter
+
+  # Reward-Curriculum (Style-Ramp): "erst laufen, dann Stil". Die unter 'terms' gelisteten Polish-
+  # Terme werden erst hochgefahren, sobald die Tracking-Qualität cmd_curr_perf (0..1, gemessen über
+  # command_accuracy je Episode) 'threshold' übersteigt — dann öffnet ein gelatchtes Gate und
+  # style_weight läuft über 'ramp_s' Sim-Sekunden linear 0→1 (skaliert NUR die terms; Task-/
+  # Survival-Terme bleiben stets voll). Logik: K1_env._current_style_weight / _update_command_curriculum.
+  # enabled=false → alle Terme dauerhaft voll (kein Ramp). Fortschritt: episode/curriculum_style_weight.
+  style_curriculum:
+    enabled: true
+    threshold: 0.5      # cmd_curr_perf (0..1), ab der das Gate öffnet und die Style-Terme hochrampen
+    ramp_s: 60.0        # [s] Sim-Zeit für den linearen Anstieg style_weight 0→1 nach Gate-Öffnung
+    terms:              # müssen in reward_scales AKTIV sein (sonst Assertion in K1_env.__init__)
+      - foot_roll
+      - flat_foot
+      - support_pose
+      - similar_to_default
   reward_scales:
     # Step-by-step reward tuning — enable one at a time (see K1_RL_INFO.md)
     base_height: -50.0
@@ -175,7 +192,8 @@ reward_cfg:
     # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
     tracking_ang_vel: 0.25
     # --- Gait: literatur-standard Footstep-Terme behalten ---
-    feet_air_time: 0.5
+    feet_air_time: 1.2        # war 0.5 → bei Trippeln nahe 0; höher belohnt echtes Fuß-Abheben
+                              #         (Bodenfreiheit) deutlich stärker als Schlurfen
     feet_slip: -0.2           # Fuß-Horizontalgeschwindigkeit im Kontakt → Anti-Schlurf-/Rutsch-Signal
     gait_phase: -0.5          # Phase-Clock: Strafe wenn Fuß-Kontakt nicht zum Takt passt (ersetzt 4 Hand-Terme)
     # --- Standard-Regularisierer (legged-gym-Stil) ---
@@ -184,13 +202,16 @@ reward_cfg:
     ang_vel_xy: -0.05         # Roll/Pitch-Raten dämpfen, ohne den natürlichen Rumpf-Schwung zu überdämpfen
     # push_robustness (nur aktiv wenn push_enabled: true → sonst stets 0)
     push_recovery: 0.5
-    # --- abgeschaltet: Hand-Shaping-Cluster, ersetzt durch gait_phase (Phase-Clock) ---
-    # Wieder aktivieren erst NACHDEM ein stabiler Gang existiert, dann zum Feintuning:
+    # --- Style/Polish-Terme: aktiv, aber via style_curriculum gerampt (greifen erst NACH dem
+    #     Laufenlernen, s. reward_cfg.style_curriculum + K1_env._current_style_weight). Genau das
+    #     "erst Gang, dann Feintuning", nur automatisch statt manuell wieder einkommentieren. ---
+    foot_roll: 0.5            # Heel-to-Toe-Abrollen (Ankle_Pitch-Proxy)
+    flat_foot: -0.2          # Strafe für dauerhaft flach hängenden Fuß (ergänzt foot_roll)
+    support_pose: 0.2        # leichte Kniebeugung beim Stehen/langsam (Federung, bend knees)
+    similar_to_default: -0.1 # Gelenke nahe Default-Pose (saubere, ruhige Haltung)
+    # --- weiterhin abgeschaltet: durch gait_phase (Phase-Clock) abgedeckt ---
     # contact_stride: -0.3
     # no_alternation: -1.0
-    # foot_roll: 0.5
-    # flat_foot: -0.2
-    # support_pose: 0.2
 
 command_cfg:
   num_commands: 3
@@ -208,11 +229,14 @@ command_cfg:
   # Untere Grenze bleibt fix 0.3 (stets Vorwärts). Für Eval: enabled=false setzen.
   curriculum:
     enabled: true
-    lin_vel_x_max_limit: 2.0      # [m/s] Zielobergrenze, bis hierhin wird geweitet
+    lin_vel_x_max_limit: 1.2      # [m/s] Zielobergrenze (war 2.0 = ~3.6 Körperlängen/s → unrealistisch,
+                                  #        zwang frantisches Trippeln; 1.2 ist real haltbar)
     step: 0.1                     # [m/s] Erweiterung der Obergrenze je Aufstieg
-    threshold: 0.7                # mittlere Tracking-Qualität (0..1) für einen Aufstieg
+    threshold: 0.8                # mittlere Tracking-Qualität (0..1) für einen Aufstieg (war 0.7 →
+                                  #        ratchte zu leicht hoch; 0.8 verlangt sauberes Tracking vor +vx)
     ema: 0.1                      # Glättungsfaktor der Performance-Schätzung (höher = reaktiver)
-    cooldown_s: 5.0               # [s] Mindestabstand zwischen zwei Aufstiegen (deckelt die Rate)
+    cooldown_s: 10.0              # [s] Mindestabstand zwischen zwei Aufstiegen (war 5.0 → halbe Rate,
+                                  #        gibt dem Gang Zeit, sich je vx-Stufe zu festigen)
 
   # Camera for training rollout videos (used by K1_train_runner, 1 env only)
   video:
@@ -227,7 +251,8 @@ train_cfg:
     class_name: PPO
     clip_param: 0.2
     desired_kl: 0.01
-    entropy_coef: 0.01
+    entropy_coef: 0.004  # war 0.01 → hielt action_std bei ~1.41 fest (zappelige, unentschlossene Policy);
+                         #        niedriger lässt die Std konvergieren → committetere, ruhigere Bewegung
     gamma: 0.99
     lam: 0.95
     learning_rate: 0.001
@@ -244,7 +269,7 @@ train_cfg:
     activation: elu
     distribution_cfg:
       class_name: GaussianDistribution
-      init_std: 1.0
+      init_std: 0.8  # war 1.0 → ruhigerer Explorationsstart (zusammen mit niedrigerem entropy_coef)
       std_type: scalar
 
   critic:
