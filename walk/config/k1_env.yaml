@@ -163,6 +163,8 @@ reward_cfg:
     lin_vel_z: -1.0
     action_rate: -0.005
     tracking_lin_vel: 1.0
+    # Heading-/Weltframe: verhindert Drift — cmd [vx,vy] = Soll in Spawn-Richtung, nicht Körperframe.
+    command_accuracy: 1.0
     # tracking_ang_vel gesenkt (war 1.0): yaw-Command ist konstant 0 → das war ein
     # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
     tracking_ang_vel: 0.25

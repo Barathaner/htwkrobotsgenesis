@@ -2,7 +2,7 @@ import math
 
 import genesis as gs
 import torch
-from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
+from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat, xyz_to_quat
 from tensordict import TensorDict
 
 
@@ -156,6 +156,12 @@ class K1Env:
         self.base_quat = torch.empty((num_envs, 4), dtype=gs.tc_float, device=gs.device)
         self.base_euler = torch.empty((num_envs, 3), dtype=gs.tc_float, device=gs.device)
         self.base_lin_vel = torch.empty((self.num_envs, 3), dtype=gs.tc_float, device=gs.device)
+        # Lineare Geschwindigkeit im Heading-Frame (Welt-xy relativ zur Spawn-Yaw je Episode).
+        self.base_lin_vel_heading = torch.empty((self.num_envs, 3), dtype=gs.tc_float, device=gs.device)
+        spawn_yaw = quat_to_xyz(self.init_base_quat.unsqueeze(0), rpy=True)[0, 2]
+        spawn_rpy = torch.zeros(1, 3, dtype=gs.tc_float, device=gs.device)
+        spawn_rpy[0, 2] = spawn_yaw
+        self.inv_heading_quat = inv_quat(xyz_to_quat(spawn_rpy)).expand(num_envs, -1).clone()
 
         self.projected_gravity = torch.empty_like(self.base_ang_vel)
         self.commands = torch.empty((num_envs, self.num_commands), dtype=gs.tc_float, device=gs.device)
@@ -306,7 +312,9 @@ class K1Env:
             transform_quat_by_quat(self.inv_base_init_quat, self.base_quat), rpy=True, degrees=True
         )
         inv_base_quat = inv_quat(self.base_quat)
-        self.base_lin_vel.copy_(transform_by_quat(self.robot.get_vel(), inv_base_quat))
+        world_lin_vel = self.robot.get_vel()
+        self.base_lin_vel.copy_(transform_by_quat(world_lin_vel, inv_base_quat))
+        self.base_lin_vel_heading.copy_(transform_by_quat(world_lin_vel, self.inv_heading_quat))
         self.base_ang_vel.copy_(transform_by_quat(self.robot.get_ang(), inv_base_quat))
         self.projected_gravity.copy_(transform_by_quat(self.global_gravity, inv_base_quat))
         self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
@@ -343,6 +351,21 @@ class K1Env:
 
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
+    def _set_heading_reference(self, envs_idx=None):
+        """Spawn-Yaw je Episode fixieren → Heading-Frame für command_accuracy (Welt-xy ohne Drift).
+
+        Aktuell identisches init_base_quat für alle Envs; bei Random-Yaw-Spawn später base_quat nach Reset lesen.
+        """
+        quat = self.init_base_quat.unsqueeze(0)
+        yaw = quat_to_xyz(quat, rpy=True)[0, 2]
+        spawn_rpy = torch.zeros(1, 3, dtype=gs.tc_float, device=gs.device)
+        spawn_rpy[0, 2] = yaw
+        inv_h = inv_quat(xyz_to_quat(spawn_rpy))
+        if envs_idx is None:
+            self.inv_heading_quat.copy_(inv_h.expand(self.num_envs, -1))
+        else:
+            self.inv_heading_quat.index_copy_(0, envs_idx.nonzero(as_tuple=True)[0], inv_h.expand(envs_idx.sum(), -1))
+
     def _resample_commands(self, envs_idx):
         commands = gs_rand(*self.commands_limits, (self.num_envs,))
         if envs_idx is None:
@@ -370,7 +393,9 @@ class K1Env:
             self.projected_gravity[:] = self.init_projected_gravity
             self.dof_pos[:] = self.default_dof_pos
             self.base_lin_vel.zero_()
+            self.base_lin_vel_heading.zero_()
             self.base_ang_vel.zero_()
+            self._set_heading_reference()
             self.dof_vel.zero_()
             self.actions.zero_()
             self.last_actions.zero_()
@@ -396,7 +421,9 @@ class K1Env:
             )
             torch.where(envs_idx[:, None], self.default_dof_pos, self.dof_pos, out=self.dof_pos)
             self.base_lin_vel.masked_fill_(envs_idx[:, None], 0.0)
+            self.base_lin_vel_heading.masked_fill_(envs_idx[:, None], 0.0)
             self.base_ang_vel.masked_fill_(envs_idx[:, None], 0.0)
+            self._set_heading_reference(envs_idx)
             self.dof_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.actions.masked_fill_(envs_idx[:, None], 0.0)
             self.last_actions.masked_fill_(envs_idx[:, None], 0.0)
@@ -451,8 +478,11 @@ class K1Env:
         n = int(envs_idx.sum())
         if n == 0:
             return
-        max_sum = self.max_episode_length * self.reward_scales["tracking_lin_vel"]  # max. Episode-Summe
-        batch_quality = (self.episode_sums["tracking_lin_vel"][envs_idx].sum() / (n * max_sum + 1e-9)).item()
+        curriculum_key = (
+            "command_accuracy" if "command_accuracy" in self.reward_scales else "tracking_lin_vel"
+        )
+        max_sum = self.max_episode_length * self.reward_scales[curriculum_key]  # max. Episode-Summe
+        batch_quality = (self.episode_sums[curriculum_key][envs_idx].sum() / (n * max_sum + 1e-9)).item()
         self.cmd_curr_perf = (1.0 - self.curriculum_ema) * self.cmd_curr_perf + self.curriculum_ema * batch_quality
         if (
             self.cmd_curr_perf > self.curriculum_threshold
@@ -588,6 +618,20 @@ class K1Env:
           command [0.5, 0.0], Ist [0.0, 0.0]  → fehler=0.25   → return≈0.37  → +0.007/Step
         """
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+
+    def _reward_command_accuracy(self):
+        """Belohnung: Geschwindigkeit im Heading-/Weltframe wie command [vx, vy] (ohne Yaw-Drift).
+
+        Misst Ist-Geschwindigkeit im Spawn-Heading-Frame (Welt-xy relativ zur Start-Yaw), nicht im
+        Körperframe. Bei cmd [0.5, 0] soll der Roboter 0.5 m/s in Spawn-Vorwärtsrichtung laufen —
+        auch wenn er sich unbeabsichtigt dreht (dann wäre Körper-vx ok, Heading-vx aber falsch).
+
+        Beispiel (sigma=0.25, scale=1.0, dt=0.02):
+          cmd [0.5, 0], Heading [0.5, 0]  → return 1.0
+          cmd [0.5, 0], Roboter 90° gedreht, Körper-vx=0.5 → Heading≈[0, 0.5] → return≈0.37
+        """
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel_heading[:, :2]), dim=1)
         return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
 
     def _reward_tracking_ang_vel(self):
