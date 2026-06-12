@@ -1,5 +1,5 @@
 # Booster K1 locomotion — 20-DOF (legs + arms; head not actuated)
-# Obs dim = 9 + 3 * 20 + 2 (gait phase sin/cos) = 71 (auto from buffer shapes in K1_env.py)
+# Obs dim = 9 + 3*20 + 2 (heading vx,vy) + 2 (gait phase sin/cos) = 73 (auto from buffer shapes in K1_env.py)
 
 env_cfg:
   num_actions: 20
@@ -152,7 +152,13 @@ reward_cfg:
   # ersetzt den Hand-Shaping-Cluster (no_alternation, contact_stride, foot_roll, flat_foot).
   # Linkes/rechtes Bein laufen mit gait_phase_offset versetzt → erzwingt Alternation & Kadenz.
   # sin/cos(2π·phase) gehen zusätzlich in die Observation (Policy kann den Takt timen).
-  gait_period_s: 0.7              # [s] Dauer eines vollen Schrittzyklus (beide Beine)
+  # 0.9 statt 0.7: ein 0.5 m-Bein hat als Pendel eine Eigen-Halbschwingung von ~π·√(L/g)≈0.7 s
+  # → natürlicher Vollzyklus ~1.4 s. Bei 0.7 s erzwang der Takt eine 0.28 s-Swingphase (~2× zu
+  # schnell) → die Policy kämpft gegen die Beindynamik und nimmt nur kurze, steife Trippelschritte
+  # (kein Drehimpuls → kein emergenter Armschwung). 0.9 s rückt Richtung Eigenfrequenz → längere,
+  # entspanntere Schritte; bewusst nicht ganz 1.4 s, sonst werden Schritte bei hohem Curriculum-vx
+  # unrealistisch lang (Stride ≈ vx·period/2).
+  gait_period_s: 0.9              # [s] Dauer eines vollen Schrittzyklus (beide Beine)
   gait_stance_ratio: 0.6          # Anteil des Zyklus mit Bodenkontakt je Fuß (Duty; >0.5 → Double-Support-Überlapp)
   gait_phase_offset: 0.5          # Phasenversatz Links/Rechts (0.5 = exakt alternierend)
   gait_cmd_threshold: 0.2         # [m/s] darunter (Stehen) kein Gait-Penalty; Takt läuft aber weiter

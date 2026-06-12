@@ -264,6 +264,11 @@ class K1Env:
             "base_ang_vel": self.base_ang_vel.shape[-1],
             "projected_gravity": self.projected_gravity.shape[-1],
             "commands": self.commands.shape[-1],
+            # Heading-Frame xy-Geschwindigkeit (Welt-vx,vy relativ zur Spawn-Yaw): macht den
+            # Drift FÜR DIE POLICY BEOBACHTBAR. projected_gravity kodiert nur roll/pitch und ist
+            # yaw-invariant → ohne diesen Term kann die Policy ihre Heading-Abweichung gar nicht
+            # sehen, command_accuracy wäre ein nicht lernbarer (nicht-Markovscher) Reward.
+            "base_lin_vel_heading": 2,
             "dof_pos": self.dof_pos.shape[-1],
             "dof_vel": self.dof_vel.shape[-1],
             "actions": self.actions.shape[-1],
@@ -589,6 +594,10 @@ class K1Env:
             self.base_ang_vel * self.obs_scales["ang_vel"],
             self.projected_gravity,
             self.commands * self.commands_scale,
+            # Heading-Frame xy-Geschwindigkeit (gleiche Skala wie commands) → Policy sieht ihre
+            # Ist-Geschwindigkeit in Spawn-Richtung und kann Drift aktiv ausregeln (schließt den
+            # Regelkreis für command_accuracy, der sonst keinen beobachtbaren Fehler hätte).
+            self.base_lin_vel_heading[:, :2] * self.obs_scales["lin_vel"],
             (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
             self.dof_vel * self.obs_scales["dof_vel"],
             self.actions,
