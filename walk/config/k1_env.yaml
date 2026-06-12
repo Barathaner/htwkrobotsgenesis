@@ -118,7 +118,8 @@ reward_cfg:
                                   # 0.08 erfasst Stand beider Füße zuverlässig, 0.04 verfehlt den rechten)
   contact_window_s: 1.0           # [s] Warmup — Penalty erst ab dieser Episodenzeit (stabile Raten-Schätzung)
   # feet_air_time: belohnt Luftphase beim Aufsetzen → Füße müssen abheben (Bodenfreiheit, kein Schlurfen)
-  feet_air_time_min: 0.12         # [s] Mindest-Luftphase, bevor gezählt wird
+  feet_air_time_min: 0.08         # [s] Mindest-Luftphase, bevor gezählt wird (war 0.12 → Landungen
+                                  #     blieben oft drunter = Reward 0 = kein Gradient; 0.08 senkt die Hürde)
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
   feet_air_cmd_threshold: 0.2     # [m/s] — darunter (Stehen) kein Reward
   feet_air_time_stuck: 0.5        # [s] ab hier gilt ein Fuß als "festgehalten" → no_alternation-Strafe
@@ -192,10 +193,10 @@ reward_cfg:
     # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
     tracking_ang_vel: 0.25
     # --- Gait: literatur-standard Footstep-Terme behalten ---
-    feet_air_time: 1.2        # war 0.5 → bei Trippeln nahe 0; höher belohnt echtes Fuß-Abheben
-                              #         (Bodenfreiheit) deutlich stärker als Schlurfen
-    feet_slip: -0.2           # Fuß-Horizontalgeschwindigkeit im Kontakt → Anti-Schlurf-/Rutsch-Signal
-    gait_phase: -0.5          # Phase-Clock: Strafe wenn Fuß-Kontakt nicht zum Takt passt (ersetzt 4 Hand-Terme)
+    feet_air_time: 3.0        # war 0.5/1.2 → bei Trippeln nahe 0 und viel zu schwach vs. Slip;
+                              #         3.0 belohnt echtes Fuß-Abheben klar stärker als Schlurfen
+    feet_slip: -0.6           # war -0.2 → Schlurfen muss teurer sein als Trippeln (Anti-Schlurf/Rutsch)
+    gait_phase: -1.0          # war -0.5 → stärkerer Takt-Zwang gegen das Dauer-Mismatch (~-0.15/s)
     # --- Standard-Regularisierer (legged-gym-Stil) ---
     dof_vel: -2.0e-4          # leichte Energie-/Vibrationsbremse über Gelenkgeschwindigkeiten
     orientation: -2.0         # Haltung aufrecht (roll²+pitch², in rad)
@@ -208,7 +209,8 @@ reward_cfg:
     foot_roll: 0.5            # Heel-to-Toe-Abrollen (Ankle_Pitch-Proxy)
     flat_foot: -0.2          # Strafe für dauerhaft flach hängenden Fuß (ergänzt foot_roll)
     support_pose: 0.2        # leichte Kniebeugung beim Stehen/langsam (Federung, bend knees)
-    similar_to_default: -0.1 # Gelenke nahe Default-Pose (saubere, ruhige Haltung)
+    similar_to_default: -0.03 # war -0.1 (~-0.34/s, größter Penalty!) → begünstigte stehende Default-
+                              #          Pose mit hektischen Füßen statt echtem Gang; abgeschwächt
     # --- weiterhin abgeschaltet: durch gait_phase (Phase-Clock) abgedeckt ---
     # contact_stride: -0.3
     # no_alternation: -1.0
