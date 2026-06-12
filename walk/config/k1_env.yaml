@@ -98,6 +98,32 @@ env_cfg:
   simulate_action_latency: true
   clip_actions: 100.0
 
+  # Assist-Force-Curriculum: virtuelle "helfende Hand" am Rumpf-COM (Welt-xy). Stark zu Beginn,
+  # linear über decay_steps auf scale_min ausgeblendet → danach muss der Gang allein laufen.
+  # Gegenstück zum Push (reward_cfg.push_*): Push STÖRT, Assist STÜTZT. Zwei Anteile:
+  #   force = scale · ( force_kp·(v_cmd − v_ist)   [stabilisierender Geschwindigkeits-Zug]
+  #                    + force_dir·cmd_dir )        [konstanter Zug IN Kommandorichtung]
+  # Der Richtungs-Anteil ist bewusst NICHT durch die Ist-Geschwindigkeit gedeckelt → bei hoher
+  # Skala überzieht er, zieht den COM über die stehenden Füße hinaus → der Roboter "fällt" anfangs
+  # nach vorn in die Bewegung. |Gesamtkraft| auf force_max [N] gedeckelt, am COM (reine Linearkraft,
+  # kein Stör-Drehmoment). NICHT in der Observation. Für Eval: enabled=false.
+  assist:
+    enabled: true
+    force_kp: 40.0          # [N pro m/s Geschwindigkeitsfehler] stabilisierender Zug auf v_cmd
+    force_dir: 30.0         # [N] konstanter Zug in Kommandorichtung (überzieht → Vorwärts-"Fallen")
+    force_max: 80.0         # [N] Deckel des xy-Kraftbetrags (Sicherheits-Obergrenze)
+    # Effektive Skala = time_scale · perf_factor (beide in [.., 1]):
+    #   time_scale  = max(scale_min, 1 − total_steps/decay_steps)   → reiner Zeit-Abbau
+    #   perf_factor = 1 − (1−perf_floor)·clamp(acc_ema/accuracy_target, 0, 1)  → Performance-Gate
+    # Steigt command_accuracy auf accuracy_target, fällt perf_factor auf perf_floor (NICHT 0) →
+    # der Roboter behält perf_floor·time_scale der Kraft; der Zeit-Abbau bleibt der finale Umschlag,
+    # der sie ganz ausblendet. So wird ein noch nicht laufender Roboter nicht zu früh fallengelassen.
+    decay_steps: 200000     # [env-steps] schnellerer Zeit-Abbau (war 500000; ≈ decay_steps/num_steps_per_env Iterationen)
+    scale_min: 0.0          # Rest-Assist nach dem Zeit-Abbau (0 = vollständig entfernt)
+    accuracy_target: 0.7    # command_accuracy-EMA, ab der das Gate voll greift
+    perf_floor: 0.5         # Rest-Anteil des Gates bei erreichtem Ziel (×time_scale) → nie 0 vor Zeitablauf
+    perf_ema: 0.01          # Glättung der command_accuracy-EMA (pro Step)
+
 obs_cfg:
   obs_scales:
     lin_vel: 2.0
