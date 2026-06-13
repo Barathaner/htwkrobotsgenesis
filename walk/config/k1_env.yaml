@@ -1,28 +1,22 @@
-# Booster K1 locomotion — 16-DOF (12 legs + 4 arms: shoulder pitch + elbow pitch je Seite).
-# Bewusst reduziert von 20: Shoulder_Roll, Elbow_Yaw und der Kopf sind für Vorwärts-Laufen
-# unnötige Freiheitsgrade, die den Suchraum aufblähen — sie werden wie der Kopf per PD auf
-# fester Default-Pose gehalten (fixed_joint_names), nicht von der Policy gesteuert.
-# Obs dim = 9 + 3*16 + 2 (heading vx,vy) + 2 (gait phase sin/cos) + 2 (L/R foot contact) = 63 (auto in K1_env.py)
+# Booster K1 locomotion — 16-DOF (12 legs + 4 arms).
+# Unbenutzte DOFs (Shoulder_Roll, Elbow_Yaw, Kopf) per PD fix gehalten (fixed_joint_names).
+# Obs dim = 9 + 3*16 + 2 + 2 + 2 = 63 (auto in K1_env.py).
 
 env_cfg:
   num_actions: 16
 
-  # Policy action order — die 16 policy-gesteuerten Gelenke (müssen default_joint_angles-Keys sein)
+  # Policy-gesteuerte Gelenke (Reihenfolge = Action-Order)
   joint_names:
-    # left arm (nur Schulter-Pitch + Ellbogen-Pitch → Armschwung)
     - ALeft_Shoulder_Pitch
     - Left_Elbow_Pitch
-    # right arm
     - ARight_Shoulder_Pitch
     - Right_Elbow_Pitch
-    # left leg
     - Left_Hip_Pitch
     - Left_Hip_Roll
     - Left_Hip_Yaw
     - Left_Knee_Pitch
     - Left_Ankle_Pitch
     - Left_Ankle_Roll
-    # right leg
     - Right_Hip_Pitch
     - Right_Hip_Roll
     - Right_Hip_Yaw
@@ -30,9 +24,7 @@ env_cfg:
     - Right_Ankle_Pitch
     - Right_Ankle_Roll
 
-  # Fixierte Gelenke: NICHT von der Policy gesteuert, aber per PD auf fester Default-Pose gehalten
-  # (sonst schlackern sie lose mit). Ziel = default_joint_angles. Enthält den Kopf plus die fürs
-  # Laufen unnötigen Arm-DOFs (Shoulder_Roll, Elbow_Yaw) → kleinerer Aktionsraum.
+  # Per PD auf Default-Pose fixiert (nicht von der Policy gesteuert)
   fixed_joint_names:
     - AAHead_yaw
     - Head_pitch
@@ -42,7 +34,6 @@ env_cfg:
     - Right_Elbow_Yaw
 
   default_joint_angles:
-    # Kopf: geradeaus (yaw 0) und leicht nach unten geneigt (pitch +, Limit +0.855) → Blick auf den Ball
     AAHead_yaw: 0.0
     Head_pitch: 0.2
     ALeft_Shoulder_Pitch: 0.0
@@ -66,9 +57,8 @@ env_cfg:
     Left_Ankle_Roll: 0.0
     Right_Ankle_Roll: 0.0
 
-  # Per-joint PD [kp, kd] and torque limits [Nm] — source: models/K1/K1_debug.py
+  # Per-joint PD [kp, kd] + Drehmoment-Limit [Nm] (Quelle: models/K1/K1_debug.py)
   joint_gains:
-    # Kopf: steif genug halten, damit er trotz Rumpfbewegung ruhig in head_fixed-Pose bleibt
     AAHead_yaw: {kp: 40.0, kd: 1.0, effort: 6.0}
     Head_pitch: {kp: 40.0, kd: 1.0, effort: 6.0}
     ALeft_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
@@ -102,33 +92,20 @@ env_cfg:
   simulate_action_latency: true
   clip_actions: 100.0
 
-  # Widerstands-Curriculum: virtueller Zug am Rumpf-COM (Welt-xy), der ENTGEGEN der kommandierten
-  # Bewegung wirkt — der Roboter muss sich dagegen lehnen und aktiv anlaufen, um Fortschritt zu
-  # machen (Resistance-Training). Magnitude folgt einer GLOCKENKURVE: klein (start_scale) zu Beginn
-  # → Maximum bei peak_steps → wieder kleiner → über decay_steps auf scale_min ausgeblendet.
-  # Gegenstück zum Push (reward_cfg.push_*): Push STÖRT impulsiv, dieser Widerstand BREMST gerichtet.
-  #   force = scale · ( −force_kp·v_ist            [Drag entgegen der Ist-Bewegung]
-  #                    − force_dir·cmd_dir )        [konstanter Gegen-Zug ENTGEGEN der Kommandorichtung]
-  # |Gesamtkraft| auf force_max [N] gedeckelt, am COM (reine Linearkraft, kein Stör-Drehmoment).
-  # NICHT in der Observation. Für Eval: enabled=false.
+  # Widerstands-Curriculum: gerichteter Zug am Rumpf-COM entgegen dem Kommando (Glockenkurve über
+  # peak_steps/decay_steps, plus Performance-Gate). Nicht in der Obs. Eval: enabled=false.
   assist:
     enabled: false
-    force_kp: 40.0          # [N pro m/s] geschwindigkeitsproportionaler Drag entgegen der Ist-Bewegung
-    force_dir: 30.0         # [N] konstanter Gegen-Zug ENTGEGEN der Kommandorichtung ("Gegenwind")
-    force_max: 80.0         # [N] Deckel des xy-Kraftbetrags (Sicherheits-Obergrenze)
-    # Effektive Skala = time_scale · perf_factor (beide in [.., 1]). time_scale ist eine GLOCKENKURVE:
-    #   total_steps ≤ peak_steps:  start_scale → 1.0   (Anstieg: kleine Anfangskraft, steigend)
-    #   total_steps > peak_steps:  1.0 → scale_min     (Abfall bis ausgeblendet bei decay_steps)
-    #   perf_factor = 1 − (1−perf_floor)·clamp(acc_ema/accuracy_target, 0, 1)  → Performance-Gate
-    # Läuft der Roboter gut (command_accuracy ↑), fällt perf_factor auf perf_floor (NICHT 0) → der
-    # Widerstand wird etwas entlastet; ganz weg ist er erst nach dem Zeit-Abbau bei decay_steps.
-    start_scale: 0.2        # kleine Anfangskraft als Anteil des Maximums (Glocken-Start)
-    peak_steps: 50000       # [env-steps] Step, an dem der Widerstand sein Maximum (time_scale=1.0) erreicht
-    decay_steps: 200000     # [env-steps] Step, an dem der Widerstand vollständig auf scale_min ausgeblendet ist
-    scale_min: 0.0          # Rest-Widerstand nach dem Abbau (0 = vollständig entfernt)
-    accuracy_target: 0.7    # command_accuracy-EMA, ab der das Gate voll greift
-    perf_floor: 0.5         # Rest-Anteil des Gates bei erreichtem Ziel (×time_scale) → nie 0 vor Zeitablauf
-    perf_ema: 0.01          # Glättung der command_accuracy-EMA (pro Step)
+    force_kp: 40.0          # [N/(m/s)] Drag entgegen der Ist-Bewegung
+    force_dir: 30.0         # [N] konstanter Gegen-Zug entgegen der Kommandorichtung
+    force_max: 80.0         # [N] Deckel des xy-Kraftbetrags
+    start_scale: 0.2        # Anfangsanteil des Maximums
+    peak_steps: 50000       # Step des Kraft-Maximums
+    decay_steps: 200000     # Step der vollständigen Ausblendung
+    scale_min: 0.0          # Rest-Widerstand nach Abbau
+    accuracy_target: 0.7    # Perf-EMA, ab der das Gate voll greift
+    perf_floor: 0.5         # Rest-Gate bei erreichtem Ziel
+    perf_ema: 0.01          # Glättung der Perf-EMA
 
 obs_cfg:
   obs_scales:
@@ -138,124 +115,105 @@ obs_cfg:
     dof_vel: 0.05
 
 reward_cfg:
-  tracking_sigma: 0.25
-  base_height_target: 0.53
+  tracking_sigma: 0.25            # exp(-err/sigma) Breite (tracking_lin_vel/ang_vel)
+  base_height_target: 0.53        # [m]
   feet_height_target: 0.0
-  # Fuß-Kontakt-Proxy (Höhe): Fuß "am Boden" wenn z < foot_contact_height; Touchdown = Flanke hoch→Kontakt.
-  foot_contact_height: 0.08       # [m] z-Schwelle Foot-Link-Ursprung (sitzt ~5-6 cm über Sohle;
-                                  # 0.08 erfasst Stand beider Füße zuverlässig, 0.04 verfehlt den rechten)
-  # feet_air_time: belohnt Luftphase beim Aufsetzen → Füße müssen abheben (Bodenfreiheit, kein Schlurfen)
-  feet_air_time_min: 0.05         # [s] Mindest-Luftphase, bevor gezählt wird (0.12→0.08→0.05: Landungen
-                                  #     blieben drunter = Reward 0 = kein Gradient; 0.05 gibt erstes Abheb-Signal)
+
+  # contact (Höhen-Proxy)
+  foot_contact_height: 0.08       # [m] Fuß-Link-z darunter = Bodenkontakt
+
+  # feet_air_time
+  feet_air_time_min: 0.05         # [s] Mindest-Luftphase vor Zählung
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
-  feet_air_cmd_threshold: 0.15    # [m/s] — darunter (Stehen) kein Reward (war 0.2 → bei langsamem
-                                  #     Anlauf unter Assist kein Abheb-Reward; 0.15 lässt ihn früher zählen)
-  # foot_roll: Heel-to-Toe-Abrollen über Ankle_Pitch (keine separaten Zeh/Hacken-Links im URDF).
-  # Aufsetzen → Hacke (heel_target); letzte ~3 Steps vor Liftoff → Zeh (toe_target).
-  ankle_heel_target: -0.15        # [rad] Ziel-Ankle_Pitch beim Touchdown (Ferse zuerst)
-  ankle_toe_target: 0.10          # [rad] Ziel-Ankle_Pitch kurz vor Liftoff (Abdruck über Zeh)
-  foot_roll_sigma: 0.05           # [rad²] Breite der exp-Belohnung um heel/toe-target
-  foot_roll_window_steps: 3       # Anzahl Steps vor Liftoff, über die die Zeh-Pose gemittelt wird
-  foot_roll_cmd_threshold: 0.2    # [m/s] — darunter (Stehen) kein foot_roll-Reward
-  foot_flat_threshold: 0.03       # [rad] |Ankle_Pitch| darunter = Fuß flach
-  # foot_flat_time hoch (0.4 s): ein flach geplanter Stützfuß im Mid-Stance ist KORREKT und darf
-  # nicht bestraft werden; bestraft wird nur dauerhaft flach hängender Fuß (Schlurfen ohne Abrollen).
-  # Echtes Schlurfen fängt zusätzlich feet_slip (Fuß-Horizontalgeschwindigkeit im Kontakt) ab.
-  foot_flat_time: 0.4             # [s] flach-in-Kontakt-Dauer, ab der bestraft wird
-  # support_pose: leichte Kniebeugung (Federung) beim Stehen/langsamen Gehen
-  support_knee_min: 0.4           # [rad] untere Grenze gewünschter Kniebeugung
-  support_knee_max: 0.8           # [rad] obere Grenze gewünschter Kniebeugung
-  support_pose_sigma: 0.05        # [rad²] eigener Falloff am Bandrand (entkoppelt von foot_roll_sigma)
-  support_pose_cmd_speed: 0.6     # [m/s] — nur darunter (Stehen/langsam) belohnen
-  # --- SPRINT-Stil Fuß-Terme (close_feet / feet_air_height / feet_ground_parallel / feet_guidance) ---
-  # Kontakt = Höhen-Proxy (foot_in_contact), nicht echte Kontaktkraft (s. _update_foot_contact).
-  close_feet_d_min: 0.15          # [m] seitlicher Mindestabstand der Füße (Basis-Frame y); darunter Strafe
-  feet_air_height_target: 0.12    # [m] Soll-z des Schwungfuß-LINKS (Origin sitzt ~5-6 cm über der Sohle!)
-  feet_air_height_sigma: 0.03     # [m] Breite der Gauß-Höhenbelohnung im Flug
-  feet_guidance_t_target: 0.16    # [s] Mindest-Flugzeit (Paper: D_swing/f_cmd = 0.4/2.5); darunter Strafe
-  # push_robustness (Stage 3): zufälliger Horizontal-Stoß auf den Rumpf zum Robustheits-Training.
-  # WICHTIG: als Soll-Δv [m/s] parametriert, NICHT als roher Impuls [N·s] — bei ~10 kg Robotermasse
-  # wären 50–150 N·s = 5–15 m/s und damit garantiert unaufholbar (sofortiger Sturz).
-  push_enabled: false             # Stage-3-Schalter (Standard aus → bestehendes Training unverändert)
-  push_interval_min_s: 2.0        # [s] kürzester Abstand zwischen Pushes (je Env zufällig)
-  push_interval_max_s: 5.0        # [s] längster Abstand zwischen Pushes (je Env zufällig)
-  push_vel_min: 0.3               # [m/s] untere Grenze des aufgeprägten Δv
-  push_vel_max: 0.8               # [m/s] obere Grenze des aufgeprägten Δv
-  # Phase-Clock (Siekmann 2021 / Margolis "Walk These Ways" 2022): periodischer Gangtakt
-  # ergänzt foot_roll/flat_foot (Style) und ersetzt frühere Hand-Shaping-Terme.
-  # Linkes/rechtes Bein laufen mit gait_phase_offset versetzt → erzwingt Alternation & Kadenz.
-  # sin/cos(2π·phase) gehen zusätzlich in die Observation (Policy kann den Takt timen).
-  # 0.9 statt 0.7: ein 0.5 m-Bein hat als Pendel eine Eigen-Halbschwingung von ~π·√(L/g)≈0.7 s
-  # → natürlicher Vollzyklus ~1.4 s. Bei 0.7 s erzwang der Takt eine 0.28 s-Swingphase (~2× zu
-  # schnell) → die Policy kämpft gegen die Beindynamik und nimmt nur kurze, steife Trippelschritte
-  # (kein Drehimpuls → kein emergenter Armschwung). 0.9 s rückt Richtung Eigenfrequenz → längere,
-  # entspanntere Schritte; bewusst nicht ganz 1.4 s, sonst werden Schritte bei hohem Curriculum-vx
-  # unrealistisch lang (Stride ≈ vx·period/2).
-  gait_period_s: 1.1              # [s] Dauer eines vollen Schrittzyklus (war 0.9 → erzwang kurze, hastige
-                                  #     Schritte/Trippeln; 1.1 näher an der Bein-Eigenfrequenz → längere Swingphase)
-  gait_stance_ratio: 0.6          # Anteil des Zyklus mit Bodenkontakt je Fuß (Duty; >0.5 → Double-Support-Überlapp)
-  gait_phase_offset: 0.5          # Phasenversatz Links/Rechts (0.5 = exakt alternierend)
-  gait_cmd_threshold: 0.2         # [m/s] darunter (Stehen) kein Gait-Penalty; Takt läuft aber weiter
+  feet_air_cmd_threshold: 0.15    # [m/s] darunter kein Reward
+
+  # foot_roll (Heel-to-Toe via Ankle_Pitch)
+  ankle_heel_target: -0.15        # [rad] beim Touchdown
+  ankle_toe_target: 0.10          # [rad] vor Liftoff
+  foot_roll_sigma: 0.05
+  foot_roll_window_steps: 3
+  foot_roll_cmd_threshold: 0.2    # [m/s] darunter kein Reward
+
+  # flat_foot
+  foot_flat_threshold: 0.03       # [rad] |Ankle_Pitch| darunter = flach
+  foot_flat_time: 0.4             # [s] flach-in-Kontakt-Dauer ab Strafe
+
+  # support_pose (Kniebeugung)
+  support_knee_min: 0.4           # [rad]
+  support_knee_max: 0.8           # [rad]
+  support_pose_sigma: 0.05
+  support_pose_cmd_speed: 0.6     # [m/s] nur darunter belohnen
+
+  # SPRINT-Stil Fuß-Terme
+  close_feet_d_min: 0.15          # [m] seitl. Mindestabstand (Basis-Frame)
+  feet_air_height_target: 0.12    # [m] Soll-z Schwungfuß-Link (~5-6 cm über Sohle)
+  feet_air_height_sigma: 0.03
+  feet_guidance_t_target: 0.16    # [s] Mindest-Flugzeit
+
+  # push (Robustheit; Soll-Δv [m/s])
+  push_enabled: false
+  push_interval_min_s: 2.0
+  push_interval_max_s: 5.0
+  push_vel_min: 0.3
+  push_vel_max: 0.8
+
+  # gait phase-clock
+  gait_period_s: 1.1              # [s] voller Schrittzyklus
+  gait_stance_ratio: 0.6          # Stance-Anteil je Fuß
+  gait_phase_offset: 0.5          # L/R-Versatz (0.5 = alternierend)
+  gait_cmd_threshold: 0.2         # [m/s] darunter kein Penalty
 
   reward_scales:
-    # Step-by-step reward tuning — Scales in reward_scales unten
+    # task
+    tracking_lin_vel: 1.0
+    tracking_ang_vel: 0.25
     base_height: -50.0
-    #similar_to_default: -0.1
     #lin_vel_z: -0.5
     #action_rate: -0.005
-    # Körperframe-Geschwindigkeitstracking: cmd [vx,vy] vs. Ist-vx,vy (exp(-Fehler/sigma)).
-    tracking_lin_vel: 1.0
-    # tracking_ang_vel gesenkt (war 1.0): yaw-Command ist konstant 0 → das war ein
-    # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
-    tracking_ang_vel: 0.25
-    # --- Gait: literatur-standard Footstep-Terme behalten ---
-    feet_air_time: 5.0        # war 0.5/1.2 → bei Trippeln nahe 0 und viel zu schwach vs. Slip;
-                              #         3.0 belohnt echtes Fuß-Abheben klar stärker als Schlurfen
-    feet_slip: -0.6           # war -0.2 → Schlurfen muss teurer sein als Trippeln (Anti-Schlurf/Rutsch)
-    gait_phase: -0.8          # TEMPORÄR gesenkt (war -1.0): reine Takt-Strafe ohne belohntes Abheben
-                              #         (feet_air_time war tot) unterdrückte das Stepping-Risiko. Zurück auf
-                              #         -0.8/-1.0, SOBALD rew_feet_air_time > 0 (Füße heben wieder ab).
-    # --- SPRINT-Stil Fuß-Design (Genesis Fuß-Pose/-Geschwindigkeit; Params s. reward_cfg oben) ---
-    close_feet: -100.0        # Kollisionsschutz: seitlicher Fuß-Abstand < d_min wird hart bestraft
-    feet_air_height: 5.0      # Schwungfuß auf saubere Soll-Flughöhe (Gauß) → definierte Bodenfreiheit
-    feet_ground_parallel: 1.0 # Stützfuß flach aufsetzen (Fuß-Normale senkrecht) → volle Traktion
-    feet_guidance: -15.0      # geschwindigkeitsabh. Mindest-Flugzeit: zu kurze Airtime im Flug bestraft
-    # --- Standard-Regularisierer (legged-gym-Stil) ---
-    dof_vel: -2.0e-4          # leichte Energie-/Vibrationsbremse über Gelenkgeschwindigkeiten
-    #orientation: -2.0         # Haltung aufrecht (roll²+pitch², in rad)
-    ang_vel_xy: -0.05         # Roll/Pitch-Raten dämpfen, ohne den natürlichen Rumpf-Schwung zu überdämpfen
-    # --- Style/Polish-Terme: durchgehend voll aktiv (kein Style-Curriculum mehr) ---
-    foot_roll: 1.5           # Heel-to-Toe-Abrollen (Ankle_Pitch-Proxy); Event-Reward (~1.5*dt pro Touchdown/Liftoff)
-    #flat_foot: -0.6          # Strafe für dauerhaft flach hängenden Fuß (ergänzt foot_roll)
-    #support_pose: 0.6        # leichte Kniebeugung beim Stehen/langsam (Federung, bend knees)
-    #similar_to_default: -0.03 # war -0.1 (~-0.34/s, größter Penalty!) → begünstigte stehende Default-
-                              #          Pose mit hektischen Füßen statt echtem Gang; abgeschwächt
+
+    # gait
+    feet_air_time: 5.0
+    feet_slip: -0.6
+    gait_phase: -0.8
+
+    # SPRINT-Stil Fuß-Design
+    close_feet: -100.0
+    feet_air_height: 5.0
+    feet_ground_parallel: 1.0
+    feet_guidance: -15.0
+
+    # foot style
+    foot_roll: 1.5
+    #flat_foot: -0.6
+    #support_pose: 0.6
+
+    # regularizer
+    dof_vel: -2.0e-4
+    ang_vel_xy: -0.05
+    #orientation: -2.0
+    #similar_to_default: -0.03
 
 command_cfg:
   num_commands: 3
-  # Lernbarer Geschwindigkeitsbereich mit NICHT-Null-Minimum: zwingt stets Vorwärtsbewegung
-  # und hält den tracking_lin_vel-Gradienten nahe v=0 steil (exp(-v²/sigma) fällt schnell).
-  # War [0.0, 2]: bei ~1–2 m/s ist exp(-v²/0.25)≈0 → flacher Gradient → Stehen-Attraktor.
-  # 2 m/s (~4 Körperlängen/s) ist ohnehin kaum erreichbar; später schrittweise nach oben weiten.
-  lin_vel_x_range: [0.3, 0.8]     # fixer vx-Sollbereich (Nicht-Null-Minimum erzwingt stets Vorwärts)
+  # Nicht-Null-Minimum erzwingt stets Vorwärtsbewegung (steiler Gradient nahe v=0)
+  lin_vel_x_range: [0.3, 0.8]
   lin_vel_y_range: [0.0, 0.0]
   ang_vel_range: [0.0, 0.0]
 
-  # Camera for training rollout videos (used by K1_train_runner, 1 env only)
+  # Kamera für Trainings-Rollout-Videos (K1_train_runner, 1 Env)
   video:
     res: [640, 480]
     camera_pos: [3.0, -1.0, 1.5]
     camera_lookat: [0.0, 0.0, 0.5]
     camera_fov: 30
 
-# PPO / rsl-rl — obs_dim & num_actions come from K1Env automatically
+# PPO / rsl-rl — obs_dim & num_actions kommen automatisch aus K1Env
 train_cfg:
   algorithm:
     class_name: PPO
     clip_param: 0.2
     desired_kl: 0.01
-    entropy_coef: 0.01  # 0.01→0.004→0.008: 0.004 ließ action_std auf ~0.27 kollabieren (festgefahren im
-                         #        Assist-Shuffle); wieder höher hält Exploration offen, ohne 1.41-Zappeln
+    entropy_coef: 0.01
     gamma: 0.99
     lam: 0.95
     learning_rate: 0.001
@@ -272,8 +230,7 @@ train_cfg:
     activation: elu
     distribution_cfg:
       class_name: GaussianDistribution
-      init_std: 1.0  # zurück auf 1.0 → mehr Anfangs-Exploration, damit die Policy nicht früh in den
-                     #        Assist-Shuffle kollabiert (vgl. entropy_coef)
+      init_std: 1.0
       std_type: scalar
 
   critic:
@@ -295,4 +252,3 @@ train_cfg:
 
   logger:
     class_name: WandbLogWriter
-    # project_name filled from wandb_project at train start
