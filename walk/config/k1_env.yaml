@@ -146,11 +146,17 @@ reward_cfg:
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
   feet_air_cmd_threshold: 0.15    # [m/s] — darunter (Stehen) kein Reward (war 0.2 → bei langsamem
                                   #     Anlauf unter Assist kein Abheb-Reward; 0.15 lässt ihn früher zählen)
-  # Air-Gate-Kopplung: stuft die feet_air_time-Belohnung je Env zusätzlich mit command_accuracy ∈
-  # [0,1]. Abheben zählt dann nur, soweit das Kommando auch getrackt wird → killt den Anreiz, auf
-  # der Stelle zu treten/trippeln (Füße heben ohne Vortrieb → command_accuracy niedrig → wenig
-  # Reward). Der binäre feet_air_cmd_threshold-Gate bleibt als Floor. false → reines cmd_speed-Gate.
+  # Gang→Tracking-Kopplung: stuft die feet_air_time-Belohnung je Env mit command_accuracy ∈ [0,1].
+  # Abheben zählt nur, soweit das Kommando auch getrackt wird → killt den Anreiz, auf der Stelle zu
+  # trippeln (Füße heben ohne Vortrieb). Der binäre feet_air_cmd_threshold-Gate bleibt als Floor.
   feet_air_couple_command_accuracy: true
+  # Tracking→Gang-Kopplung (symmetrisches Gegenstück, P0 gegen „keine Strecke"): stuft den
+  # command_accuracy-REWARD mit air_gate = clamp(max(foot_air_time)/air_gate_ref_s, floor, 1). Vortrieb
+  # ohne echtes Schreiten (Gleiten/Schlurfen → max_air≈0 → air_gate≈floor) bringt dann kaum Tracking-
+  # Reward. tracking_lin_vel bleibt ungated (Anlauf-Lernanreiz). false → command_accuracy ungated.
+  command_accuracy_couple_air: true
+  air_gate_ref_s: 0.1             # [s] Schwungfuß-Luftzeit, ab der air_gate=1 (volles Tracking-Credit)
+  air_gate_floor: 0.0             # Rest-air_gate bei 0 Luftzeit (0 = striktes Anti-Gleiten; >0 = milder)
   # foot_roll: Heel-to-Toe-Abrollen über Ankle_Pitch (keine separaten Zeh/Hacken-Links im URDF).
   # Aufsetzen → Hacke (heel_target); letzte ~3 Steps vor Liftoff → Zeh (toe_target).
   ankle_heel_target: -0.15        # [rad] Ziel-Ankle_Pitch beim Touchdown (Ferse zuerst)
@@ -191,20 +197,27 @@ reward_cfg:
   gait_stance_ratio: 0.6          # Anteil des Zyklus mit Bodenkontakt je Fuß (Duty; >0.5 → Double-Support-Überlapp)
   gait_phase_offset: 0.5          # Phasenversatz Links/Rechts (0.5 = exakt alternierend)
   gait_cmd_threshold: 0.2         # [m/s] darunter (Stehen) kein Gait-Penalty; Takt läuft aber weiter
+  # Gang-Kopplung: skaliert die gait_phase-Taktstrafe je Env mit command_accuracy ∈ [0,1] → der
+  # Takt-Zwang greift nur, wenn der Roboter das Kommando auch trackt ("erst tracken, dann Kadenz").
+  # false → reines cmd_speed-Gate.
+  gait_couple_command_accuracy: true
 
   # Reward-Curriculum (Style-Ramp): "erst laufen, dann Stil". Die unter 'terms' gelisteten Polish-
-  # Terme werden erst hochgefahren, sobald die Tracking-Qualität cmd_curr_perf (0..1, gemessen über
-  # command_accuracy je Episode) 'threshold' übersteigt — dann öffnet ein gelatchtes Gate und
-  # style_weight läuft über 'ramp_s' Sim-Sekunden linear 0→1 (skaliert NUR die terms; Task-/
-  # Survival-Terme bleiben stets voll). Logik: K1_env._current_style_weight / _update_style_curriculum.
-  # enabled=false → alle Terme dauerhaft voll (kein Ramp). Fortschritt: episode/curriculum_style_weight.
+  # Terme werden erst hochgefahren, sobald (Warmup abgelaufen UND) cmd_curr_perf > threshold UND
+  # gait_curr_perf > gait_threshold — also der Roboter das Kommando trackt UND dabei WIRKLICH schreitet
+  # (gait_curr_perf = mittleres air_gate/Step). Dann öffnet ein gelatchtes Gate und style_weight läuft
+  # über 'ramp_s' Sim-Sekunden linear 0→1 (skaliert NUR die terms; Task-/Survival-Terme bleiben voll).
+  # Logik: K1_env._current_style_weight / _update_style_curriculum. enabled=false → Terme dauerhaft voll.
+  # Fortschritt: episode/curriculum_style_weight, curriculum_cmd_perf, curriculum_gait_perf.
   style_curriculum:
     enabled: true
     threshold: 0.6      # cmd_curr_perf (0..1), ab der das Gate öffnet (war 0.5 → öffnete zu früh:
                         #     grobes Vorwärtslurchen reicht schon für ~0.5, der Gang ist da noch schlecht)
+    gait_threshold: 0.5 # gait_curr_perf (mittleres air_gate/Step, 0..1): zweite Gate-Bedingung →
+                        #     verhindert Style-Start auf einem GLEITENDEN (nicht schreitenden) Roboter
     warmup_s: 120.0     # [s] harte Zeit-Sperre: das Gate kann FRÜHESTENS nach warmup_s Sim-Sekunden
-                        #     öffnen, egal wie hoch cmd_curr_perf ist (verhindert sofortiges Aktivieren,
-                        #     solange der Gang noch instabil ist). 0 = keine Sperre.
+                        #     öffnen, egal wie hoch die Perf-Signale sind (verhindert sofortiges
+                        #     Aktivieren, solange der Gang noch instabil ist). 0 = keine Sperre.
     ema: 0.1            # Glättungsfaktor der cmd_curr_perf-Schätzung (höher = reaktiver)
     ramp_s: 60.0        # [s] Sim-Zeit für den linearen Anstieg style_weight 0→1 nach Gate-Öffnung
     terms:              # müssen in reward_scales AKTIV sein (sonst Assertion in K1_env.__init__)
@@ -219,7 +232,7 @@ reward_cfg:
     action_rate: -0.005
     #tracking_lin_vel: 1.0
     # Heading-/Weltframe: verhindert Drift — cmd [vx,vy] = Soll in Spawn-Richtung, nicht Körperframe.
-    command_accuracy: 1.3
+    command_accuracy: 1.8
     # tracking_ang_vel gesenkt (war 1.0): yaw-Command ist konstant 0 → das war ein
     # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
     tracking_ang_vel: 0.25

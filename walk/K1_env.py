@@ -183,21 +183,24 @@ class K1Env:
             )
         )
 
-        # Geglättete Tracking-Qualität (mittlere command_accuracy/Step der endenden Episoden, 0..1).
-        # Treibt das Style-Curriculum-Gate (s. _update_style_curriculum); der vx-Sollbereich ist fix.
+        # Geglättete Tracking-Qualität (mittlere RAW command_accuracy/Step der endenden Episoden, 0..1)
+        # UND geglättete Gangqualität (mittleres air_gate/Step = „schreitet wirklich"). Beide treiben
+        # das Style-Curriculum-Gate (s. _update_style_curriculum); der vx-Sollbereich ist fix.
         self.cmd_curr_perf = 0.0
+        self.gait_curr_perf = 0.0
         self.total_steps = 0                                                   # monotoner globaler Step-Zähler
 
         # Reward-Curriculum (Style-Ramp): erst LAUFEN, dann STIL. Polish-Terme (Knie beugen,
         # Heel-to-Toe-Abrollen, Stützpose …) werden erst hochgefahren, NACHDEM Laufen steht. Gate
-        # = cmd_curr_perf (geglättete Tracking-Qualität 0..1, gepflegt in _update_style_curriculum).
-        # Überschreitet sie style_threshold, öffnet das Gate (gelatcht) und style_weight läuft über
-        # style_ramp_s Sim-Sekunden linear 0→1. style_weight skaliert in step() die Scales der
-        # style_terms; alle übrigen (Task-/Survival-)Terme bleiben stets voll.
+        # öffnet (gelatcht), sobald Warmup abgelaufen UND cmd_curr_perf > threshold UND gait_curr_perf
+        # > gait_threshold — also erst wenn der Roboter das Kommando trackt UND dabei wirklich schreitet
+        # (nicht nur vorwärts gleitet). Dann läuft style_weight über style_ramp_s Sim-Sekunden linear
+        # 0→1 und skaliert in step() die Scales der style_terms; alle übrigen Terme bleiben stets voll.
         sc = self.reward_cfg.get("style_curriculum", {})
         self.style_enabled = bool(sc.get("enabled", False))
         self.style_threshold = float(sc.get("threshold", 0.5))
-        self.perf_ema = float(sc.get("ema", 0.1))  # Glättung der cmd_curr_perf-Schätzung
+        self.style_gait_threshold = float(sc.get("gait_threshold", 0.5))  # min. air_gate-Mittel fürs Gate
+        self.perf_ema = float(sc.get("ema", 0.1))  # Glättung der cmd_curr_perf/gait_curr_perf-Schätzung
         # Harte Zeit-Sperre: das Gate kann frühestens nach warmup_s Sim-Sekunden öffnen, egal wie
         # hoch cmd_curr_perf ist → verhindert sofortiges Aktivieren, solange der Gang noch instabil ist.
         self.style_warmup_steps = max(0, int(float(sc.get("warmup_s", 0.0)) / self.dt))
@@ -311,13 +314,29 @@ class K1Env:
 
         self.obs_buf = torch.empty((num_envs, self.obs_dim), dtype=gs.tc_float, device=gs.device)
         self.rew_buf = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
-        # command_accuracy ∈ [0,1] je Env, EINMAL pro Step in step() berechnet (Single Source):
-        # liest sowohl _reward_command_accuracy als auch das Air-Gate in _reward_feet_air_time.
+        # command_accuracy ∈ [0,1] je Env, EINMAL pro Step in step() berechnet (RAW Tracking-Güte,
+        # exp(-Heading-Vel-Fehler/sigma)). Single Source für: den command_accuracy-Reward, die
+        # gait_phase-Kopplung, die feet_air_time-Kopplung und cmd_curr_perf (Style-Gate).
         self.command_accuracy = torch.ones((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # air_gate ∈ [floor,1] je Env: misst, ob der Roboter WIRKLICH schreitet — Schwungfuß-Luftzeit
+        # max(foot_air_time)/ref, gesättigt auf 1. Bei Schlurfen/Gleiten (Füße bleiben am Boden,
+        # max_air≈0) → air_gate≈floor. Koppelt Tracking AN Gang (command_accuracy × air_gate, s.
+        # _reward_command_accuracy) → kein Tracking-Reward für „Strecke ohne Schritt".
+        self.air_gate = torch.ones((num_envs,), dtype=gs.tc_float, device=gs.device)
         # Air-Gate-Kopplung: feet_air_time-Belohnung mit command_accuracy stufen → Abheben wird nur
         # belohnt, soweit das Kommando auch getrackt wird (kein Reward fürs Treten auf der Stelle ohne
         # Vortrieb). Aus → reines cmd_speed-Gate (feet_air_cmd_threshold).
         self.feet_air_couple_cmd_acc = bool(self.reward_cfg.get("feet_air_couple_command_accuracy", False))
+        # Tracking AN Gang koppeln: command_accuracy-Reward zusätzlich mit air_gate stufen (s. o.).
+        self.cmd_acc_couple_air = bool(self.reward_cfg.get("command_accuracy_couple_air", False))
+        self.air_gate_ref = max(1e-6, float(self.reward_cfg.get("air_gate_ref_s", 0.1)))  # Luftzeit für Gate=1
+        self.air_gate_floor = float(self.reward_cfg.get("air_gate_floor", 0.0))           # Rest-Gate bei 0 Luft
+        # gait_phase-Taktstrafe zusätzlich mit command_accuracy stufen (Takt-Zwang nur bei gutem Tracking).
+        self.gait_couple_cmd_acc = bool(self.reward_cfg.get("gait_couple_command_accuracy", False))
+        # Episoden-Akkumulatoren (RAW, ungated) fürs Style-Gate: mittlere Tracking-Güte und mittlere
+        # Gangqualität (air_gate) je Episode → cmd_curr_perf / gait_curr_perf in _update_style_curriculum.
+        self.episode_cmd_acc_sum = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        self.episode_air_gate_sum = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
         self.reset_buf = torch.ones((num_envs,), dtype=gs.tc_bool, device=gs.device)
         self.episode_length_buf = torch.zeros((num_envs,), dtype=gs.tc_int, device=gs.device)
         self.extras = {}
@@ -372,12 +391,19 @@ class K1Env:
         if self.push_enabled:
             self._apply_push()
 
-        # command_accuracy je Env [0,1] EINMAL berechnen (Single Source) — _reward_command_accuracy
-        # UND das Air-Gate in _reward_feet_air_time lesen denselben Wert, unabhängig von der
-        # Auswertungsreihenfolge der Reward-Funktionen. commands sind in diesem Step noch stabil
-        # (Resampling passiert erst nach der Reward-Schleife).
+        # command_accuracy je Env [0,1] EINMAL berechnen (RAW Tracking-Güte, Single Source) — der
+        # command_accuracy-Reward, die gait_phase-/feet_air_time-Kopplungen und cmd_curr_perf lesen
+        # denselben Wert, unabhängig von der Auswertungsreihenfolge der Reward-Funktionen. commands
+        # sind in diesem Step noch stabil (Resampling passiert erst nach der Reward-Schleife).
         ca_err = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel_heading[:, :2]), dim=1)
         self.command_accuracy.copy_(torch.exp(-ca_err / self.reward_cfg["tracking_sigma"]))
+        # air_gate ∈ [floor,1]: Schwungfuß-Luftzeit max(foot_air_time)/ref, gesättigt → misst echtes
+        # Schreiten. foot_air_time ist hier frisch (in _update_foot_contact bereits aktualisiert/genullt).
+        max_air = self.foot_air_time.max(dim=1).values
+        self.air_gate.copy_(torch.clamp(max_air / self.air_gate_ref, min=self.air_gate_floor, max=1.0))
+        # RAW-Akkumulatoren fürs Style-Gate (ungated, längenunabhängig in _update_style_curriculum normiert).
+        self.episode_cmd_acc_sum += self.command_accuracy
+        self.episode_air_gate_sum += self.air_gate
 
         self.rew_buf.zero_()
         style_w = self._current_style_weight()  # 0→1 Ramp, skaliert nur die style_terms
@@ -472,6 +498,8 @@ class K1Env:
             self.foot_flat_time.zero_()
             self.foot_roll_reward.zero_()
             self.foot_flat_penalty.zero_()
+            self.episode_cmd_acc_sum.zero_()
+            self.episode_air_gate_sum.zero_()
             self.next_push_step.copy_(self._sample_push_interval((self.num_envs,)))
             self.gait_phase.uniform_(0.0, 1.0)
         else:
@@ -498,6 +526,8 @@ class K1Env:
             self.foot_flat_time.masked_fill_(envs_idx[:, None], 0.0)
             self.foot_roll_reward.masked_fill_(envs_idx, 0.0)
             self.foot_flat_penalty.masked_fill_(envs_idx, 0.0)
+            self.episode_cmd_acc_sum.masked_fill_(envs_idx, 0.0)
+            self.episode_air_gate_sum.masked_fill_(envs_idx, 0.0)
             torch.where(envs_idx, self._sample_push_interval((self.num_envs,)), self.next_push_step,
                         out=self.next_push_step)
             torch.where(envs_idx, torch.rand_like(self.gait_phase), self.gait_phase, out=self.gait_phase)
@@ -515,9 +545,13 @@ class K1Env:
                 value.zero_()
             else:
                 value.masked_fill_(envs_idx, 0.0)
-        # Curriculum-Fortschritt mitloggen (Style-Ramp-Gewicht)
+        # Curriculum-Fortschritt mitloggen (Style-Ramp-Gewicht + Gate-Signale)
         self.extras["episode"]["curriculum_style_weight"] = torch.tensor(
             self.style_weight, dtype=gs.tc_float, device=gs.device)
+        self.extras["episode"]["curriculum_cmd_perf"] = torch.tensor(
+            self.cmd_curr_perf, dtype=gs.tc_float, device=gs.device)
+        self.extras["episode"]["curriculum_gait_perf"] = torch.tensor(
+            self.gait_curr_perf, dtype=gs.tc_float, device=gs.device)
         # Assist-Force-Curriculum: aktuelle Stützstärke + Gate-Signal (command_accuracy-EMA) mitloggen
         self.extras["episode"]["assist_scale"] = torch.tensor(
             self.assist_scale, dtype=gs.tc_float, device=gs.device
@@ -530,38 +564,36 @@ class K1Env:
         self._resample_commands(envs_idx)
 
     def _update_style_curriculum(self, envs_idx):
-        """Pflegt cmd_curr_perf und öffnet darüber das Style-Ramp-Gate.
+        """Pflegt cmd_curr_perf (Tracking) + gait_curr_perf (Schreiten) und öffnet das Style-Ramp-Gate.
 
-        Misst die mittlere command_accuracy PRO STEP der gerade endenden Episoden — normiert auf die
-        ECHTE Episodenlänge (episode_length_buf), nicht auf max_episode_length. Sonst skaliert die
-        Qualität mit der Episodendauer: kurze Episoden (z. B. unter Assist mit ~75 statt 1000 Steps)
-        liefern selbst bei perfektem Tracking nur ~length/max_len ≈ 7 % → das Style-Gate (0.5) öffnet
-        NIE, obwohl pro Step gut getrackt wird. Mit der Echtlängen-Normierung ist batch_quality ∈
-        [0,1] längenunabhängig die mittlere Tracking-Güte. Übersteigt der EMA-Wert style_threshold,
-        öffnet das Gate (einmalig gelatcht) und style_weight beginnt zu rampen.
+        Misst je endender Episode die mittleren RAW-Signale PRO STEP — normiert auf die ECHTE
+        Episodenlänge (episode_length_buf), nicht auf max_episode_length. Sonst skaliert die Qualität
+        mit der Episodendauer: kurze Episoden (z. B. ~75 statt 1000 Steps) lägen selbst bei perfektem
+        Tracking nur bei ~length/max_len → die Gates öffneten NIE. Mit Echtlängen-Normierung sind
+        beide Größen ∈ [0,1] längenunabhängig:
+          cmd_curr_perf  = mittlere RAW command_accuracy/Step  (trackt es das Kommando?)
+          gait_curr_perf = mittleres air_gate/Step             (schreitet es wirklich, statt zu gleiten?)
+        Beide werden EMA-geglättet. Das Gate öffnet (einmalig gelatcht), sobald Warmup abgelaufen UND
+        cmd_curr_perf > style_threshold UND gait_curr_perf > style_gait_threshold — verhindert, dass
+        die Style-Ramp auf einem vorwärts GLEITENDEN (aber nicht schreitenden) Roboter startet.
         """
         if not self.style_enabled:
             return
         n = int(envs_idx.sum())
         if n == 0:
             return
-        curriculum_key = (
-            "command_accuracy" if "command_accuracy" in self.reward_scales else "tracking_lin_vel"
-        )
-        # je Env: Episode-Summe / (echte Länge · scale) = mittlere command_accuracy/Step ∈ [0,1],
-        # dann über die endenden Envs mitteln (längenunabhängig, s. Docstring).
-        scale = self.reward_scales[curriculum_key]
         ep_len = self.episode_length_buf[envs_idx].clamp(min=1).to(gs.tc_float)
-        batch_quality = (self.episode_sums[curriculum_key][envs_idx] / (ep_len * scale + 1e-9)).mean().item()
-        self.cmd_curr_perf = (1.0 - self.perf_ema) * self.cmd_curr_perf + self.perf_ema * batch_quality
+        batch_cmd = (self.episode_cmd_acc_sum[envs_idx] / ep_len).mean().item()
+        batch_gait = (self.episode_air_gate_sum[envs_idx] / ep_len).mean().item()
+        self.cmd_curr_perf = (1.0 - self.perf_ema) * self.cmd_curr_perf + self.perf_ema * batch_cmd
+        self.gait_curr_perf = (1.0 - self.perf_ema) * self.gait_curr_perf + self.perf_ema * batch_gait
 
-        # Style-Gate öffnen (einmalig gelatcht), sobald (a) die Warmup-Sperre abgelaufen ist UND
-        # (b) Laufen/Tracking gut genug ist. Die Warmup-Sperre verhindert ein sofortiges Öffnen,
-        # bevor der Gang überhaupt Zeit hatte, sich zu stabilisieren.
+        # Style-Gate öffnen (einmalig gelatcht): Warmup abgelaufen UND Tracking gut UND echtes Schreiten.
         if (
             self.style_start_step < 0
             and self.total_steps >= self.style_warmup_steps
             and self.cmd_curr_perf > self.style_threshold
+            and self.gait_curr_perf > self.style_gait_threshold
         ):
             self.style_start_step = self.total_steps
 
@@ -782,9 +814,18 @@ class K1Env:
           cmd [0.5, 0], Heading [0.5, 0]  → return 1.0
           cmd [0.5, 0], Roboter 90° gedreht, Körper-vx=0.5 → Heading≈[0, 0.5] → return≈0.37
 
-        Wert wird in step() vorab berechnet (self.command_accuracy) und auch vom Air-Gate
-        (_reward_feet_air_time) genutzt → eine gemeinsame Quelle, keine doppelte Berechnung.
+        RAW-Wert wird in step() vorab berechnet (self.command_accuracy) und auch von den Kopplungen
+        (gait_phase, feet_air_time) sowie cmd_curr_perf genutzt → eine gemeinsame Quelle.
+
+        Tracking AN Gang koppeln (command_accuracy_couple_air): der REWARD (nicht das RAW-Signal) wird
+        mit air_gate ∈ [floor,1] gestuft → Tracking-Reward gibt es nur, soweit der Roboter wirklich
+        SCHREITET. Bekämpft „keine Strecke": vorwärts gleiten/schlurfen (Füße bleiben am Boden,
+        air_gate≈floor) bringt dann kaum command_accuracy-Reward. Symmetrisch zur Gang→Tracking-
+        Kopplung (feet_air_time × command_accuracy). tracking_lin_vel (Körperframe) bleibt ungated →
+        der Vortriebs-Lernanreiz fürs Anlaufen bleibt erhalten (kein Bootstrap-Deadlock).
         """
+        if self.cmd_acc_couple_air:
+            return self.command_accuracy * self.air_gate
         return self.command_accuracy
 
     def _reward_tracking_ang_vel(self):
@@ -927,11 +968,16 @@ class K1Env:
         nur bei cmd_speed > gait_cmd_threshold (im Stand kein Takt-Zwang). sin/cos(2πφ) liegt
         in der Observation → die Policy kann den Takt aktiv timen.
 
-        Beispiel (offset=0.5, stance_ratio=0.6, scale=-0.5 → *dt=-0.01):
-          beide Füße passend zum Takt   → mismatch=0 → 0/Step
-          1 Fuß am Boden statt in Swing  → mismatch=1 → -0.01/Step
-          beide Füße falsch (z. B. Stehen während Swing) → mismatch=2 → -0.02/Step
-          cmd≈0 (Stehen)                 → 0
+        Gang-Kopplung (gait_couple_command_accuracy): die Strafe wird zusätzlich mit command_accuracy
+        ∈ [0,1] skaliert → der Takt-Zwang greift nur, wenn der Roboter das Kommando auch trackt.
+        Trackt er schlecht (Stolpern/Erholung), entfällt die Off-Beat-Strafe weitgehend, statt das
+        ohnehin kämpfende Tracking weiter zu untergraben ("erst tracken, dann Kadenz"). Der dominante
+        command_accuracy-Reward verhindert dabei Sandbagging.
+
+        Beispiel (offset=0.5, stance_ratio=0.6, scale=-0.3 → *dt=-0.006):
+          mismatch=1, command_accuracy=1.0 (perfektes Tracking) → -0.006/Step (voller Takt-Zwang)
+          mismatch=1, command_accuracy=0.3 (schlechtes Tracking) → -0.0018/Step (entkoppelt)
+          cmd≈0 (Stehen)                                         → 0
         """
         left_stance = self.gait_phase < self.gait_stance_ratio
         right_stance = ((self.gait_phase + self.gait_phase_offset) % 1.0) < self.gait_stance_ratio
@@ -939,7 +985,10 @@ class K1Env:
         mismatch = (desired_contact != self.foot_in_contact).to(gs.tc_float).sum(dim=1)
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
-        return mismatch * active
+        penalty = mismatch * active
+        if self.gait_couple_cmd_acc:
+            penalty = penalty * self.command_accuracy
+        return penalty
 
     def _reward_dof_vel(self):
         """Strafe: hohe Gelenkgeschwindigkeiten dämpfen (Energie/Vibration), ergänzt action_rate.
