@@ -222,6 +222,7 @@ class K1Env:
         self.knee_pitch_idx = torch.tensor(
             [jn.index("Left_Knee_Pitch"), jn.index("Right_Knee_Pitch")], dtype=gs.tc_int, device=gs.device
         )
+        self.knee_default = self.default_dof_pos[self.knee_pitch_idx].clone()
         self.foot_roll_window = int(self.reward_cfg["foot_roll_window_steps"])
         # Rolling-History der Ankle_Pitch-Winkel (je Fuß, letzte N Steps) für die Zeh-Pose vor Liftoff.
         self.ankle_pitch_hist = torch.zeros((num_envs, 2, self.foot_roll_window), dtype=gs.tc_float, device=gs.device)
@@ -785,6 +786,30 @@ class K1Env:
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
         return (shortfall * desired_swing).sum(dim=1) * active
+
+    def _reward_swing_knee_flex(self):
+        """Belohnung: extra Kniebeugung im Swing-Fenster (Phase-Clock + Fuß in der Luft).
+
+        Je Fuß: flex = knee − default_knee. Belohnung exp(−max(0, target−flex)²/σ) nur wenn die
+        Phase-Clock SWING vorschreibt UND der Fuß nicht am Boden ist — zwingt Schwungbeugung über
+        das Knie statt nur Ankle-Zeh-hoch für Clearance. Beide Beine alternieren durch den Takt.
+
+        Beispiel (target=0.15, default_knee=0.6, sigma=0.02, scale=4, dt=0.02):
+          Swing+Luft, knee=0.75 (flex=0.15) → exp(0)=1.0  → +0.08/Step je Fuß
+          Swing+Luft, knee=0.60 (flex=0)     → exp(-0.11)≈0.006 → +0.0005/Step
+          Stance oder Fuß am Boden           → 0
+        """
+        knee = self.dof_pos[:, self.knee_pitch_idx]
+        flex = knee - self.knee_default.unsqueeze(0)
+        target = self.reward_cfg["swing_knee_flex_target"]
+        sigma = self.reward_cfg["swing_knee_flex_sigma"]
+        shortfall = torch.clamp(target - flex, min=0.0)
+        score = torch.exp(-torch.square(shortfall) / sigma)
+        desired_swing = (~self._desired_stance()).to(gs.tc_float)
+        in_air = (~self.foot_in_contact).to(gs.tc_float)
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
+        return (score * desired_swing * in_air).sum(dim=1) * active
 
     def _reward_foot_roll(self):
         """Belohnung: sauberes Heel-to-Toe-Abrollen (kein separater Zeh/Hacken-Link → Ankle_Pitch als Proxy).

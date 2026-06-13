@@ -157,6 +157,10 @@ reward_cfg:
   gait_phase_offset: 0.5          # L/R-Versatz (0.5 = alternierend)
   gait_cmd_threshold: 0.2         # [m/s] darunter kein Penalty
 
+  # swing_knee_flex (phasen-gekoppelt: extra Kniebeugung im Schwung, je Fuß)
+  swing_knee_flex_target: 0.15    # [rad] Mindest-Flex über Default-Knie während Swing+Luft
+  swing_knee_flex_sigma: 0.02     # Gauß-Breite um die Soll-Flexion
+
   # torso_pitch (SPRINT r_reg: Vorne-Neigung via projected_gravity gx, aktiv Richtung gf)
   torso_pitch_target: 0.1         # gf: Soll-Vorne-Neigung (fix, nicht speed-abhängig)
   torso_pitch_backward: 0.0       # gb: extra Strafe bei Rück-Neigung (gx < gb)
@@ -175,6 +179,7 @@ reward_cfg:
     feet_slip: -2.0
     gait_phase: -5.0
     swing_clearance: -10.0
+    swing_knee_flex: 4.0
 
     # SPRINT-Stil Fuß-Design
     close_feet: -5.0
