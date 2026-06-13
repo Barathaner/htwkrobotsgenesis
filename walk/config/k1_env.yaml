@@ -1,21 +1,20 @@
-# Booster K1 locomotion — 20-DOF (legs + arms; head not actuated)
-# Obs dim = 9 + 3*20 + 2 (heading vx,vy) + 2 (gait phase sin/cos) + 2 (L/R foot contact) = 75 (auto in K1_env.py)
+# Booster K1 locomotion — 16-DOF (12 legs + 4 arms: shoulder pitch + elbow pitch je Seite).
+# Bewusst reduziert von 20: Shoulder_Roll, Elbow_Yaw und der Kopf sind für Vorwärts-Laufen
+# unnötige Freiheitsgrade, die den Suchraum aufblähen — sie werden wie der Kopf per PD auf
+# fester Default-Pose gehalten (fixed_joint_names), nicht von der Policy gesteuert.
+# Obs dim = 9 + 3*16 + 2 (heading vx,vy) + 2 (gait phase sin/cos) + 2 (L/R foot contact) = 63 (auto in K1_env.py)
 
 env_cfg:
-  num_actions: 20
+  num_actions: 16
 
-  # Policy action order — all actuated joints (must match default_joint_angles keys)
+  # Policy action order — die 16 policy-gesteuerten Gelenke (müssen default_joint_angles-Keys sein)
   joint_names:
-    # left arm
+    # left arm (nur Schulter-Pitch + Ellbogen-Pitch → Armschwung)
     - ALeft_Shoulder_Pitch
-    - Left_Shoulder_Roll
     - Left_Elbow_Pitch
-    - Left_Elbow_Yaw
     # right arm
     - ARight_Shoulder_Pitch
-    - Right_Shoulder_Roll
     - Right_Elbow_Pitch
-    - Right_Elbow_Yaw
     # left leg
     - Left_Hip_Pitch
     - Left_Hip_Roll
@@ -31,11 +30,16 @@ env_cfg:
     - Right_Ankle_Pitch
     - Right_Ankle_Roll
 
-  # Kopfgelenke: NICHT von der Policy gesteuert, aber per PD auf fester Pose gehalten
-  # (sonst schlackert der Kopf lose mit). Ziel = head_fixed_angles, geradeaus + leicht nach unten.
-  head_joint_names:
+  # Fixierte Gelenke: NICHT von der Policy gesteuert, aber per PD auf fester Default-Pose gehalten
+  # (sonst schlackern sie lose mit). Ziel = default_joint_angles. Enthält den Kopf plus die fürs
+  # Laufen unnötigen Arm-DOFs (Shoulder_Roll, Elbow_Yaw) → kleinerer Aktionsraum.
+  fixed_joint_names:
     - AAHead_yaw
     - Head_pitch
+    - Left_Shoulder_Roll
+    - Right_Shoulder_Roll
+    - Left_Elbow_Yaw
+    - Right_Elbow_Yaw
 
   default_joint_angles:
     # Kopf: geradeaus (yaw 0) und leicht nach unten geneigt (pitch +, Limit +0.855) → Blick auf den Ball
@@ -146,17 +150,6 @@ reward_cfg:
   feet_air_time_max: 0.25         # [s] Cap pro Lande-Event
   feet_air_cmd_threshold: 0.15    # [m/s] — darunter (Stehen) kein Reward (war 0.2 → bei langsamem
                                   #     Anlauf unter Assist kein Abheb-Reward; 0.15 lässt ihn früher zählen)
-  # Gang→Tracking-Kopplung: stuft die feet_air_time-Belohnung je Env mit command_accuracy ∈ [0,1].
-  # Abheben zählt nur, soweit das Kommando auch getrackt wird → killt den Anreiz, auf der Stelle zu
-  # trippeln (Füße heben ohne Vortrieb). Der binäre feet_air_cmd_threshold-Gate bleibt als Floor.
-  feet_air_couple_command_accuracy: true
-  # Tracking→Gang-Kopplung (symmetrisches Gegenstück, P0 gegen „keine Strecke"): stuft den
-  # command_accuracy-REWARD mit air_gate = clamp(max(foot_air_time)/air_gate_ref_s, floor, 1). Vortrieb
-  # ohne echtes Schreiten (Gleiten/Schlurfen → max_air≈0 → air_gate≈floor) bringt dann kaum Tracking-
-  # Reward. tracking_lin_vel bleibt ungated (Anlauf-Lernanreiz). false → command_accuracy ungated.
-  command_accuracy_couple_air: true
-  air_gate_ref_s: 0.1             # [s] Schwungfuß-Luftzeit, ab der air_gate=1 (volles Tracking-Credit)
-  air_gate_floor: 0.0             # Rest-air_gate bei 0 Luftzeit (0 = striktes Anti-Gleiten; >0 = milder)
   # foot_roll: Heel-to-Toe-Abrollen über Ankle_Pitch (keine separaten Zeh/Hacken-Links im URDF).
   # Aufsetzen → Hacke (heel_target); letzte ~3 Steps vor Liftoff → Zeh (toe_target).
   ankle_heel_target: -0.15        # [rad] Ziel-Ankle_Pitch beim Touchdown (Ferse zuerst)
@@ -174,6 +167,12 @@ reward_cfg:
   support_knee_max: 0.8           # [rad] obere Grenze gewünschter Kniebeugung
   support_pose_sigma: 0.05        # [rad²] eigener Falloff am Bandrand (entkoppelt von foot_roll_sigma)
   support_pose_cmd_speed: 0.6     # [m/s] — nur darunter (Stehen/langsam) belohnen
+  # --- SPRINT-Stil Fuß-Terme (close_feet / feet_air_height / feet_ground_parallel / feet_guidance) ---
+  # Kontakt = Höhen-Proxy (foot_in_contact), nicht echte Kontaktkraft (s. _update_foot_contact).
+  close_feet_d_min: 0.15          # [m] seitlicher Mindestabstand der Füße (Basis-Frame y); darunter Strafe
+  feet_air_height_target: 0.12    # [m] Soll-z des Schwungfuß-LINKS (Origin sitzt ~5-6 cm über der Sohle!)
+  feet_air_height_sigma: 0.03     # [m] Breite der Gauß-Höhenbelohnung im Flug
+  feet_guidance_t_target: 0.16    # [s] Mindest-Flugzeit (Paper: D_swing/f_cmd = 0.4/2.5); darunter Strafe
   # push_robustness (Stage 3): zufälliger Horizontal-Stoß auf den Rumpf zum Robustheits-Training.
   # WICHTIG: als Soll-Δv [m/s] parametriert, NICHT als roher Impuls [N·s] — bei ~10 kg Robotermasse
   # wären 50–150 N·s = 5–15 m/s und damit garantiert unaufholbar (sofortiger Sturz).
@@ -197,42 +196,15 @@ reward_cfg:
   gait_stance_ratio: 0.6          # Anteil des Zyklus mit Bodenkontakt je Fuß (Duty; >0.5 → Double-Support-Überlapp)
   gait_phase_offset: 0.5          # Phasenversatz Links/Rechts (0.5 = exakt alternierend)
   gait_cmd_threshold: 0.2         # [m/s] darunter (Stehen) kein Gait-Penalty; Takt läuft aber weiter
-  # Gang-Kopplung: skaliert die gait_phase-Taktstrafe je Env mit command_accuracy ∈ [0,1] → der
-  # Takt-Zwang greift nur, wenn der Roboter das Kommando auch trackt ("erst tracken, dann Kadenz").
-  # false → reines cmd_speed-Gate.
-  gait_couple_command_accuracy: true
 
-  # Reward-Curriculum (Style-Ramp): "erst laufen, dann Stil". Die unter 'terms' gelisteten Polish-
-  # Terme werden erst hochgefahren, sobald (Warmup abgelaufen UND) cmd_curr_perf > threshold UND
-  # gait_curr_perf > gait_threshold — also der Roboter das Kommando trackt UND dabei WIRKLICH schreitet
-  # (gait_curr_perf = mittleres air_gate/Step). Dann öffnet ein gelatchtes Gate und style_weight läuft
-  # über 'ramp_s' Sim-Sekunden linear 0→1 (skaliert NUR die terms; Task-/Survival-Terme bleiben voll).
-  # Logik: K1_env._current_style_weight / _update_style_curriculum. enabled=false → Terme dauerhaft voll.
-  # Fortschritt: episode/curriculum_style_weight, curriculum_cmd_perf, curriculum_gait_perf.
-  style_curriculum:
-    enabled: true
-    threshold: 0.6      # cmd_curr_perf (0..1), ab der das Gate öffnet (war 0.5 → öffnete zu früh:
-                        #     grobes Vorwärtslurchen reicht schon für ~0.5, der Gang ist da noch schlecht)
-    gait_threshold: 0.5 # gait_curr_perf (mittleres air_gate/Step, 0..1): zweite Gate-Bedingung →
-                        #     verhindert Style-Start auf einem GLEITENDEN (nicht schreitenden) Roboter
-    warmup_s: 120.0     # [s] harte Zeit-Sperre: das Gate kann FRÜHESTENS nach warmup_s Sim-Sekunden
-                        #     öffnen, egal wie hoch die Perf-Signale sind (verhindert sofortiges
-                        #     Aktivieren, solange der Gang noch instabil ist). 0 = keine Sperre.
-    ema: 0.1            # Glättungsfaktor der cmd_curr_perf-Schätzung (höher = reaktiver)
-    ramp_s: 60.0        # [s] Sim-Zeit für den linearen Anstieg style_weight 0→1 nach Gate-Öffnung
-    terms:              # müssen in reward_scales AKTIV sein (sonst Assertion in K1_env.__init__)
-      - foot_roll
-      #- flat_foot
-      - support_pose
   reward_scales:
     # Step-by-step reward tuning — Scales in reward_scales unten
     base_height: -50.0
     #similar_to_default: -0.1
-    lin_vel_z: -1.0
-    action_rate: -0.005
-    #tracking_lin_vel: 1.0
-    # Heading-/Weltframe: verhindert Drift — cmd [vx,vy] = Soll in Spawn-Richtung, nicht Körperframe.
-    command_accuracy: 1.8
+    #lin_vel_z: -0.5
+    #action_rate: -0.005
+    # Körperframe-Geschwindigkeitstracking: cmd [vx,vy] vs. Ist-vx,vy (exp(-Fehler/sigma)).
+    tracking_lin_vel: 1.0
     # tracking_ang_vel gesenkt (war 1.0): yaw-Command ist konstant 0 → das war ein
     # garantiertes +1.0/s Stehen-Einkommen, das mit dem Laufen konkurrierte (Stehen-Attraktor).
     tracking_ang_vel: 0.25
@@ -243,18 +215,19 @@ reward_cfg:
     gait_phase: -0.8          # TEMPORÄR gesenkt (war -1.0): reine Takt-Strafe ohne belohntes Abheben
                               #         (feet_air_time war tot) unterdrückte das Stepping-Risiko. Zurück auf
                               #         -0.8/-1.0, SOBALD rew_feet_air_time > 0 (Füße heben wieder ab).
+    # --- SPRINT-Stil Fuß-Design (Genesis Fuß-Pose/-Geschwindigkeit; Params s. reward_cfg oben) ---
+    close_feet: -100.0        # Kollisionsschutz: seitlicher Fuß-Abstand < d_min wird hart bestraft
+    feet_air_height: 5.0      # Schwungfuß auf saubere Soll-Flughöhe (Gauß) → definierte Bodenfreiheit
+    feet_ground_parallel: 1.0 # Stützfuß flach aufsetzen (Fuß-Normale senkrecht) → volle Traktion
+    feet_guidance: -15.0      # geschwindigkeitsabh. Mindest-Flugzeit: zu kurze Airtime im Flug bestraft
     # --- Standard-Regularisierer (legged-gym-Stil) ---
     dof_vel: -2.0e-4          # leichte Energie-/Vibrationsbremse über Gelenkgeschwindigkeiten
-    orientation: -2.0         # Haltung aufrecht (roll²+pitch², in rad)
+    #orientation: -2.0         # Haltung aufrecht (roll²+pitch², in rad)
     ang_vel_xy: -0.05         # Roll/Pitch-Raten dämpfen, ohne den natürlichen Rumpf-Schwung zu überdämpfen
-    # --- Style/Polish-Terme: aktiv, aber via style_curriculum gerampt (greifen erst NACH dem
-    #     Laufenlernen, s. reward_cfg.style_curriculum + K1_env._current_style_weight). Genau das
-    #     "erst Gang, dann Feintuning", nur automatisch statt manuell wieder einkommentieren. ---
-    # Hochgezogen (~3×): bei den alten Werten waren die Style-Beiträge ~0.004–0.01/Step und gingen
-    # gegen feet_air_time(3.0)/tracking(1.0)/orientation(-2.0) unter → kein sichtbarer Stil-Effekt.
+    # --- Style/Polish-Terme: durchgehend voll aktiv (kein Style-Curriculum mehr) ---
     foot_roll: 1.5           # Heel-to-Toe-Abrollen (Ankle_Pitch-Proxy); Event-Reward (~1.5*dt pro Touchdown/Liftoff)
     #flat_foot: -0.6          # Strafe für dauerhaft flach hängenden Fuß (ergänzt foot_roll)
-    support_pose: 0.6        # leichte Kniebeugung beim Stehen/langsam (Federung, bend knees)
+    #support_pose: 0.6        # leichte Kniebeugung beim Stehen/langsam (Federung, bend knees)
     #similar_to_default: -0.03 # war -0.1 (~-0.34/s, größter Penalty!) → begünstigte stehende Default-
                               #          Pose mit hektischen Füßen statt echtem Gang; abgeschwächt
 

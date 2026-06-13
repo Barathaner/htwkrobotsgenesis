@@ -29,7 +29,6 @@ ALL_REWARDS = [
     "lin_vel_z",
     "action_rate",
     "tracking_lin_vel",
-    "command_accuracy",
     "tracking_ang_vel",
     "feet_air_time",
 ]
@@ -39,7 +38,6 @@ REWARD_SCALE_DEFAULTS = {
     "lin_vel_z": -1.0,
     "action_rate": -0.005,
     "tracking_lin_vel": 1.0,
-    "command_accuracy": 1.0,
     "tracking_ang_vel": 0.2,
     "feet_air_time": 0.5,
 }
@@ -218,7 +216,6 @@ def test_c(reward_name: str | None = None, steps: int = 200) -> bool:
         "lin_vel_z": ("zero", "vz≈0 → contrib≈0; beim Fallen vz groß → contrib negativ"),
         "action_rate": ("random", "jeder Step neue Random-Aktion → contrib < 0; bei zero = 0"),
         "tracking_lin_vel": ("zero", "cmd=[0.5,0], vx≈0 → raw≈exp(-0.25)≈0.37; vx=0.5 → raw≈1.0"),
-        "command_accuracy": ("zero", "cmd=[0.5,0], Heading-vx≈0 → raw≈0.37; Heading-vx=0.5 → raw≈1.0"),
         "tracking_ang_vel": ("zero", "cmd=0, yaw_rate≈0 → raw≈1.0"),
         "feet_air_time": ("random", "raw>0 beim Aufsetzen nach >0.12s Luft; 0 bei cmd≈0 / Schlurfen"),
     }
