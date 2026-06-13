@@ -199,8 +199,10 @@ class K1Env:
         self.actions = torch.zeros_like(self.dof_pos)
         self.last_actions = torch.zeros_like(self.dof_pos)
 
-        # Fuß-Kontakt-Proxy (Höhe): foot_in_contact startet True (Spawn stehend → kein Fake-Touchdown).
+        # Fuß-Kontakt via net contact force (Genesis links_state.contact_force); start True (Spawn stehend).
         self.feet_idx_local = [self.robot.get_link(n).idx_local for n in ("left_foot_link", "right_foot_link")]
+        self.feet_link_idx = torch.tensor(self.feet_idx_local, dtype=gs.tc_int, device=gs.device)
+        self.foot_contact_force_threshold = float(self.reward_cfg["foot_contact_force_threshold"])
         self.foot_in_contact = torch.ones((num_envs, 2), dtype=gs.tc_bool, device=gs.device)
 
         # feet_air_time: Luftphase je Fuß [s]; phasen-gekoppelte Belohnung beim Aufsetzen.
@@ -347,11 +349,7 @@ class K1Env:
             self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0
         )
 
-        self.reset_buf.copy_(self.episode_length_buf > self.max_episode_length)
-        self.reset_buf.logical_or_(torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
-        self.reset_buf.logical_or_(torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
-        self.reset_buf.logical_or_(self.base_pos[:, 2] < 0.35)
-        self.reset_buf.logical_or_(self.scene.rigid_solver.get_error_envs_mask())
+        self.reset_buf.copy_(self._termination_mask())
 
         self.extras["time_outs"] = (self.episode_length_buf > self.max_episode_length).to(dtype=gs.tc_float)
 
@@ -470,15 +468,29 @@ class K1Env:
         # random sample command upon reset
         self._resample_commands(envs_idx)
 
+    def _read_foot_contact_forces(self):
+        """Net contact force on foot links (n_envs, 2, 3) [N], world frame.
+
+        Uses RigidEntity.get_links_net_contact_force() → rigid_solver.links_state.contact_force.
+        """
+        link_forces = self.robot.get_links_net_contact_force()
+        if link_forces.ndim == 2:
+            link_forces = link_forces.unsqueeze(0)
+        return link_forces[:, self.feet_link_idx, :]
+
+    def _foot_in_contact_from_force(self):
+        """Bodenkontakt je Fuß: |F_net| > foot_contact_force_threshold."""
+        foot_forces = self._read_foot_contact_forces()
+        force_norm = torch.linalg.norm(foot_forces, dim=2)
+        return force_norm > self.foot_contact_force_threshold
+
     def _update_foot_contact(self):
-        """Fußhöhe-Proxy: Fuß am Boden wenn z < foot_contact_height; zählt Touchdowns (Flanke hoch→Kontakt).
+        """Fuß-Kontakt via net contact force; zählt Touchdowns (Flanke hoch→Kontakt).
 
         Akkumuliert außerdem foot_air_time (dt pro Step ohne Bodenkontakt) und verbucht beim
-        Aufsetzen die Lande-Belohnung (feet_air_time) — beide nutzen denselben foot_z-Read.
-        Inference-mode-kompatibel: copy_ / in-place +=, *=, masked-fill.
+        Aufsetzen die Lande-Belohnung (feet_air_time). Inference-mode-kompatibel: copy_ / in-place.
         """
-        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
-        in_contact = foot_z < self.reward_cfg["foot_contact_height"]
+        in_contact = self._foot_in_contact_from_force()
         touchdown = in_contact & ~self.foot_in_contact
 
         # feet_air_time (phasen-gekoppelt): dt für die Luftphase addieren, dann beim Touchdown nur
@@ -632,22 +644,35 @@ class K1Env:
     def get_observations(self):
         return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
 
+    def _termination_mask(self):
+        """True je Env, wenn Episode endet (Fall, zu tief, Timeout, Sim-Fehler)."""
+        terminate = self.episode_length_buf > self.max_episode_length
+        terminate = terminate | (torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
+        terminate = terminate | (torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
+        terminate = terminate | (self.base_pos[:, 2] < 0.35)
+        terminate = terminate | self.scene.rigid_solver.get_error_envs_mask()
+        return terminate
+
     # ------------ reward functions ----------------
     # Jede Funktion gibt einen Wert pro Env zurück (0..N).
     # Beitrag zum Step-Reward: funktion() * reward_scales[name]  (scale schon * dt in __init__)
 
     def _reward_tracking_lin_vel(self):
-        """Belohnung: vorwärts/seitwärts wie commands [vx, vy] fahren.
+        """Belohnung: vorwärts/seitwärts wie commands [vx, vy] in Spawn-Heading fahren.
 
-        Misst quadrierten Fehler zwischen Ziel- und Ist-Geschwindigkeit (Körper-Frame).
+        Misst quadrierten Fehler zwischen Ziel- und Ist-Geschwindigkeit im Heading-Frame
+        (base_lin_vel_heading, fixiert bei Episode-Start) — nicht im rotierenden Körper-Frame.
+        Verhindert den Spin-Hack: Körper-vx kann hoch bleiben, während die Welt-Bahn driftet.
         exp(-fehler / sigma) → 1.0 bei perfektem Treffer, sinkt bei Abweichung.
 
         Beispiel (sigma=0.25, scale=1.0, dt=0.02):
-          command [0.5, 0.0], Ist [0.5, 0.0]  → fehler=0      → return 1.0   → +0.02/Step
-          command [0.5, 0.0], Ist [0.3, 0.0]  → fehler=0.04   → return≈0.85  → +0.017/Step
-          command [0.5, 0.0], Ist [0.0, 0.0]  → fehler=0.25   → return≈0.37  → +0.007/Step
+          command [0.5, 0.0], Heading-Ist [0.5, 0.0]  → fehler=0      → return 1.0   → +0.02/Step
+          command [0.5, 0.0], Heading-Ist [0.3, 0.0]  → fehler=0.04   → return≈0.85  → +0.017/Step
+          Spin: Körper-vx=0.5, Heading-vx=0.0         → fehler=0.25   → return≈0.37  → +0.007/Step
         """
-        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        lin_vel_error = torch.sum(
+            torch.square(self.commands[:, :2] - self.base_lin_vel_heading[:, :2]), dim=1
+        )
         return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
 
     def _reward_tracking_ang_vel(self):
@@ -661,6 +686,17 @@ class K1Env:
         """
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
+
+    def _reward_survival(self):
+        """Belohnung: +1 pro Step solange keine Termination greift (Alive-Bonus).
+
+        Nutzt dieselben Bedingungen wie _termination_mask() — auf dem Fall-/Crash-Step 0.
+
+        Beispiel (scale=1.0, dt=0.02):
+          stehend/laufend  → return 1.0 → +0.02/Step
+          Kippen/Fall      → return 0.0 → 0/Step
+        """
+        return (~self._termination_mask()).to(gs.tc_float)
 
     def _reward_lin_vel_z(self):
         """Strafe: nicht in der Höhe hopsen (vz soll ≈ 0).
@@ -895,18 +931,43 @@ class K1Env:
         """
         return torch.sum(torch.square(self.dof_vel), dim=1)
 
+    def _reward_torso_pitch(self):
+        """Strafe: Rumpf-Neigung via projected_gravity gx — zieht aktiv Richtung gf (SPRINT r_reg).
+
+        gx = Schwerkraft-Komponente im Körper-x (positiv = leicht nach vorne geneigt).
+        gf = torso_pitch_target (fix), gb = torso_pitch_backward (0).
+        rt = (max(0, gx−gf) + max(0, gf−gx) + max(0, gb−gx))²
+          → Minimum bei gx=gf; unter gf wird aktiv gezogen; über gf und Rück-Neigung extra bestraft.
+
+        Beispiel (gf=0.1, gb=0, scale=-10, dt=0.02):
+          gx=0.10 (Soll)          → term=0     → 0/Step
+          gx=0.05 (zu wenig)      → term=0.05  → sq=0.0025 → -0.0005/Step
+          gx=0.0  (aufrecht)      → term=0.1   → sq=0.01   → -0.002/Step
+          gx=-0.05 (Rück-Neigung) → term=0.25  → sq=0.0625 → -0.0125/Step
+          gx=0.15 (zu weit vorne) → term=0.05  → sq=0.0025 → -0.0005/Step
+        """
+        gx = self.projected_gravity[:, 0]
+        gf = self.reward_cfg["torso_pitch_target"]
+        gb = self.reward_cfg["torso_pitch_backward"]
+        term = (
+            torch.clamp(gx - gf, min=0.0)
+            + torch.clamp(gf - gx, min=0.0)
+            + torch.clamp(gb - gx, min=0.0)
+        )
+        return torch.square(term)
+
     def _reward_orientation(self):
-        """Strafe: Rumpf soll aufrecht bleiben — roll² + pitch² (dynamische Stabilität, push-resistent).
+        """Strafe: seitliches Kippen dämpfen (nur Roll — Pitch über torso_pitch asymmetrisch).
 
         base_euler liegt in Grad vor → in Radian umrechnen, damit die Skala physikalisch sinnvoll ist.
 
         Beispiel (scale=-2.0, dt=0.02):
-          roll=0°, pitch=0°  → 0           → 0/Step
-          roll=10°, pitch=0° → 0.0305 rad² → -0.0012/Step
-          roll=20°, pitch=10°→ 0.1523 rad² → -0.0061/Step
+          roll=0°   → 0           → 0/Step
+          roll=10°  → 0.0305 rad² → -0.0012/Step
+          roll=20°  → 0.1220 rad² → -0.0049/Step
         """
-        rp = torch.deg2rad(self.base_euler[:, :2])
-        return torch.sum(torch.square(rp), dim=1)
+        roll = torch.deg2rad(self.base_euler[:, 0])
+        return torch.square(roll)
 
     def _reward_ang_vel_xy(self):
         """Strafe: Roll-/Pitch-Raten des Rumpfes dämpfen (kein Kippeln/Schwanken).
@@ -918,6 +979,19 @@ class K1Env:
           ω_x=0.5 rad/s    → 0.25   → -0.00025/Step
         """
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+
+    def _reward_ang_vel_z(self):
+        """Strafe: Yaw-Rate vom Kommando abweichen (direkte ω_z-Dämpfung, ergänzt tracking_ang_vel).
+
+        tracking_ang_vel belohnt nur exp(-err/sigma) und bleibt bei cmd=0 bei ω_z>0 noch leicht positiv.
+        Dieser Term bestraft (ω_z − cmd_yaw)² quadratisch → Spin-Hacks werden teuer.
+
+        Beispiel (scale=-1.0, dt=0.02, cmd_yaw=0):
+          ω_z=0     → 0    → 0/Step
+          ω_z=0.5   → 0.25 → -0.005/Step
+          ω_z=1.0   → 1.0  → -0.02/Step
+        """
+        return torch.square(self.base_ang_vel[:, 2] - self.commands[:, 2])
 
     def _reward_support_pose(self):
         """Belohnung: leichte Kniebeugung [support_knee_min, support_knee_max] beim Stehen/langsamen Gehen.

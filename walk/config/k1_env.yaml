@@ -112,8 +112,8 @@ reward_cfg:
   base_height_target: 0.53        # [m]
   feet_height_target: 0.0
 
-  # contact (Höhen-Proxy)
-  foot_contact_height: 0.08       # [m] Fuß-Link-z darunter = Bodenkontakt
+  # contact (net contact force on foot links, via RigidEntity.get_links_net_contact_force)
+  foot_contact_force_threshold: 20.0  # [N] |F| on foot link above = in_contact
 
   # feet_air_time (phasen-gekoppelt; Soll-Luftzeit = (1−stance_ratio)·gait_period_s)
   feet_air_sigma: 0.02            # [s²] Gauß-Breite um die Soll-Schwungdauer
@@ -157,11 +157,16 @@ reward_cfg:
   gait_phase_offset: 0.5          # L/R-Versatz (0.5 = alternierend)
   gait_cmd_threshold: 0.2         # [m/s] darunter kein Penalty
 
+  # torso_pitch (SPRINT r_reg: Vorne-Neigung via projected_gravity gx, aktiv Richtung gf)
+  torso_pitch_target: 0.1         # gf: Soll-Vorne-Neigung (fix, nicht speed-abhängig)
+  torso_pitch_backward: 0.0       # gb: extra Strafe bei Rück-Neigung (gx < gb)
+
   reward_scales:
     # task
-    tracking_lin_vel: 1.6
-    tracking_ang_vel: 1.3
-    base_height: -50.0
+    tracking_lin_vel: 1.6   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
+    tracking_ang_vel: 0.5
+    survival: 1.0
+    base_height: -30.0
     #lin_vel_z: -0.5
     #action_rate: -0.005
 
@@ -180,12 +185,14 @@ reward_cfg:
     # foot style
     foot_roll: 3.5
     #flat_foot: -0.6
-    #support_pose: 0.6
+    support_pose: 0.6
 
     # regularizer
     dof_vel: -2.0e-4
     ang_vel_xy: -0.05
-    orientation: -2.0
+    ang_vel_z: -1.0
+    torso_pitch: -3.0
+    orientation: -2.0              # nur Roll (Pitch → torso_pitch)
     #similar_to_default: -0.03
 
 command_cfg:
@@ -237,7 +244,7 @@ train_cfg:
     actor: [policy]
     critic: [policy]
 
-  num_steps_per_env: 24
+  num_steps_per_env: 48
   save_interval: 250
   video_interval: 250
   video_steps: 300
