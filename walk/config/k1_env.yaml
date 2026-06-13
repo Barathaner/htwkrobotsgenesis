@@ -166,7 +166,7 @@ reward_cfg:
     tracking_lin_vel: 1.6   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
     tracking_ang_vel: 0.5
     survival: 1.0
-    base_height: -30.0
+    base_height: -40.0
     #lin_vel_z: -0.5
     #action_rate: -0.005
 
@@ -183,7 +183,7 @@ reward_cfg:
     #feet_guidance: -15.0
 
     # foot style
-    foot_roll: 3.5
+    foot_roll: 4.5
     #flat_foot: -0.6
     support_pose: 0.6
 
@@ -192,7 +192,7 @@ reward_cfg:
     ang_vel_xy: -0.05
     ang_vel_z: -1.0
     torso_pitch: -3.0
-    orientation: -2.0              # nur Roll (Pitch → torso_pitch)
+    orientation: -5.0              # nur Roll (Pitch → torso_pitch)
     #similar_to_default: -0.03
 
 command_cfg:
