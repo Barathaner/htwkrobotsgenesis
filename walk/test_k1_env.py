@@ -217,7 +217,7 @@ def test_c(reward_name: str | None = None, steps: int = 200) -> bool:
         "action_rate": ("random", "jeder Step neue Random-Aktion → contrib < 0; bei zero = 0"),
         "tracking_lin_vel": ("zero", "cmd=[0.5,0], vx≈0 → raw≈exp(-0.25)≈0.37; vx=0.5 → raw≈1.0"),
         "tracking_ang_vel": ("zero", "cmd=0, yaw_rate≈0 → raw≈1.0"),
-        "feet_air_time": ("random", "raw>0 beim Aufsetzen nach >0.12s Luft; 0 bei cmd≈0 / Schlurfen"),
+        "feet_air_time": ("random", "raw>0 nur bei On-Beat-Landung mit air_time≈swing_time; 0 bei cmd≈0"),
     }
 
     all_ok = True
@@ -295,14 +295,13 @@ def test_d(num_envs: int = 64, steps: int = 50) -> bool:
 # Test E — feet_air_time landing reward (deterministisch)
 # ---------------------------------------------------------------------------
 def test_e() -> bool:
-    print("\n=== Test E: feet_air_time + Alternations-Gate ===")
-    print("Idee: stehen lassen bis gewünschte Fußkonfiguration, dann (ohne scene.step!) den")
-    print("vorherigen Zustand auf 'in der Luft' setzen und _update_foot_contact() auslösen.")
-    print("Da keine Physik dazwischen läuft, sind die Fußpositionen identisch → deterministisch.\n")
+    print("\n=== Test E: feet_air_time (phasen-gekoppelt) ===")
+    print("Idee: stehen lassen bis beide Füße Kontakt, dann (ohne scene.step!) den vorherigen")
+    print("Zustand auf 'in der Luft' setzen, gait_phase + air_time vorgeben, _update_foot_contact()")
+    print("auslösen. Keine Physik dazwischen → Fußpositionen identisch → deterministisch.\n")
 
     env = make_env(num_envs=1, reward_names=["feet_air_time"])
-    min_air = env.reward_cfg["feet_air_time_min"]
-    cap = env.reward_cfg["feet_air_time_max"]
+    swing_t = env.gait_swing_time            # Soll-Schwungdauer = (1−stance_ratio)·gait_period_s
     fwd = torch.tensor([0.6, 0.0, 0.0], device=gs.device)
 
     def settle_until(n_target: int, max_steps: int = 150) -> bool:
@@ -313,39 +312,42 @@ def test_e() -> bool:
                 return True
         return False
 
-    def land_with(cmd, air_time):
+    def land_with(cmd, air_time, phase, prime=(1.0, 1.0)):
         env.commands[:] = cmd
-        env.foot_in_contact[:] = False  # vorheriger Step: alle Füße galten als 'in der Luft'
-        env.foot_air_time[:] = air_time
-        env._update_foot_contact()  # liest aktuelle (unveränderte) Fußhöhen → Touchdown
+        env.gait_phase[:] = phase            # steuert das Soll-Stance/Swing-Fenster je Fuß
+        env.foot_step_quality[:] = torch.tensor(prime, device=gs.device)  # On-Beat-Güte des je anderen Fußes
+        env.foot_in_contact[:] = False       # vorheriger Step: alle Füße galten als 'in der Luft'
+        env.foot_air_time[:] = air_time      # _update_foot_contact addiert intern noch dt
+        env._update_foot_contact()
         return float(env._reward_feet_air_time()[0]), int(env.foot_in_contact[0].sum())
 
     ok = True
-
-    # --- feet_air_time positiv: BEIDE Füße am Boden → Alternation erfüllt → Reward > 0 ---
     if settle_until(2):
-        rew, n = land_with(fwd, 0.30)
-        expected = min(0.30 + env.dt - min_air, cap) * n
-        print(f"  Landung beide Füße (cmd=0.6): raw={rew:.4f} (≈{expected:.4f}), in_contact={n}")
-        ok &= rew > 0.0 and n == 2
-        rew0, _ = land_with(torch.zeros(3, device=gs.device), 0.30)
-        print(f"  Landung bei cmd=0 (Stehen):   raw={rew0:.4f} (erwartet 0)")
+        # On-Beat: phase 0.05 → beide Füße im Stance-Fenster; air=swing; beide Füße "gut" → max (≈2.0)
+        rew_on, n = land_with(fwd, swing_t - env.dt, 0.05)
+        print(f"  On-Beat, air≈swing ({swing_t:.2f}s): raw={rew_on:.4f} (≈{n}.0), in_contact={n}")
+        ok &= rew_on > 1.8 and n == 2
+        # cmd=0 (Stehen) → kein Reward
+        rew0, _ = land_with(torch.zeros(3, device=gs.device), swing_t - env.dt, 0.05)
+        print(f"  cmd=0 (Stehen):                raw={rew0:.4f} (erwartet 0)")
         ok &= rew0 == 0.0
-        rews, _ = land_with(fwd, 0.05)
-        print(f"  Landung nach 0.05s (< min):   raw={rews:.4f} (erwartet 0)")
-        ok &= rews == 0.0
+        # Off-Beat: phase 0.7 → linker Fuß im Swing-Fenster → nur rechter zählt → kleiner als On-Beat
+        rew_ob, _ = land_with(fwd, swing_t - env.dt, 0.7)
+        print(f"  Off-Beat (phase=0.7):          raw={rew_ob:.4f} (erwartet < On-Beat)")
+        ok &= rew_ob < rew_on
+        # Zu kurze Luftzeit → Gauß-Abfall, trotz On-Beat
+        rew_short, _ = land_with(fwd, 0.10 - env.dt, 0.05)
+        print(f"  On-Beat, kurze Luftzeit (0.10s): raw={rew_short:.4f} (erwartet < On-Beat)")
+        ok &= rew_short < rew_on
+        # Symmetrie-Kopplung: rechter Fuß hat zuletzt NICHT gesteppt (Güte 0) → linke Landung zahlt ~0,
+        # nur die rechte Landung (gekoppelt an die gute linke Güte) bringt Reward → ~halbiert.
+        rew_sym, _ = land_with(fwd, swing_t - env.dt, 0.05, prime=(1.0, 0.0))
+        print(f"  Drag-Fuß (other_q=0 für links): raw={rew_sym:.4f} (erwartet ≈ ½ On-Beat)")
+        ok &= rew_sym < 0.75 * rew_on
     else:
-        print("  HINWEIS: kein Frame mit beiden Füßen in Kontakt — feet_air_time-Test übersprungen.")
+        print("  HINWEIS: kein Frame mit beiden Füßen in Kontakt — Test übersprungen.")
 
-    # --- Alternations-Gate: nur EIN Fuß am Boden → Landung NICHT belohnt (kein Einbein-Hüpfen) ---
-    if settle_until(1):
-        rew, n = land_with(fwd, 0.30)
-        print(f"  Landung nur EIN Fuß (cmd=0.6): raw={rew:.4f} (erwartet 0 = Gate), in_contact={n}")
-        ok &= rew == 0.0 and n == 1
-    else:
-        print("  HINWEIS: kein Frame mit genau einem Fuß in Kontakt — Alternations-Test übersprungen.")
-
-    print(f"  {'PASS' if ok else 'FAIL'}: Reward nur bei Wechselschritt.")
+    print(f"  {'PASS' if ok else 'FAIL'}: Reward nur on-beat, kadenz-treu, symmetrie-gekoppelt.")
     return ok
 
 

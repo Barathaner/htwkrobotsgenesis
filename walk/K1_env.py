@@ -203,9 +203,14 @@ class K1Env:
         self.feet_idx_local = [self.robot.get_link(n).idx_local for n in ("left_foot_link", "right_foot_link")]
         self.foot_in_contact = torch.ones((num_envs, 2), dtype=gs.tc_bool, device=gs.device)
 
-        # feet_air_time: Luftphase je Fuß [s]; Belohnung beim Aufsetzen (legged-gym-Stil).
+        # feet_air_time: Luftphase je Fuß [s]; phasen-gekoppelte Belohnung beim Aufsetzen.
         self.foot_air_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
         self.feet_air_time_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # foot_step_quality: zerfallende On-Beat-Landequalität je Fuß (Latch bei Touchdown, sonst
+        # *feet_air_decay/Step). Koppelt beide Füße: eine Landung zählt nur, soweit der ANDERE Fuß
+        # zuletzt auch on-beat gelandet ist → ein schleifender Fuß kann feet_air_time nicht allein tragen.
+        self.foot_step_quality = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.feet_air_decay = float(self.reward_cfg["feet_air_decay"])
 
         # foot_roll / flat_foot: Ankle_Pitch- und Knee_Pitch-Spaltenindizes in dof_pos (Reihenfolge = joint_names).
         jn = env_cfg["joint_names"]
@@ -233,29 +238,15 @@ class K1Env:
         # Welt-Frame Linear-DOFs der Floating-Base (Index 0,1,2 = x,y,z); xy für Horizontal-Push.
         self.base_xy_dof_idx = torch.tensor([0, 1], dtype=gs.tc_int, device=gs.device)
 
-        # Assist-Force-Curriculum: WIDERSTAND am Rumpf-COM, der ENTGEGEN der kommandierten Bewegung
-        # zieht — der Roboter muss sich dagegen lehnen, um Fortschritt zu machen (Gegenstück zum Push,
-        # aber gerichtet: Push stört impulsiv, dieser Widerstand bremst dauerhaft). Magnitude folgt
-        # einer Glockenkurve: klein zu Beginn → Maximum bei peak_steps → wieder kleiner → ausgeblendet.
-        # Begründung/Mechanik: _apply_assist_force.
+        # Assist-Force-Curriculum: HILFSKRAFT am Rumpf-COM, die IN Kommandorichtung schiebt — hilft dem
+        # Roboter anzulaufen (Anschubhilfe). Magnitude startet voll und fällt LINEAR über decay_steps auf
+        # scale_min ab (kein Glocken-Anstieg mehr). Begründung/Mechanik: _apply_assist_force.
         ac = env_cfg.get("assist", {})
         self.assist_enabled = bool(ac.get("enabled", False))
-        self.assist_force_kp = float(ac.get("force_kp", 40.0))
-        self.assist_force_dir = float(ac.get("force_dir", 30.0))
-        self.assist_force_max = float(ac.get("force_max", 80.0))
-        self.assist_start_scale = float(ac.get("start_scale", 0.2))  # kleine Anfangskraft (Glocken-Start)
-        self.assist_peak_steps = max(1, int(ac.get("peak_steps", 50_000)))  # Step des Kraft-Maximums
-        self.assist_decay_steps = max(1, int(ac.get("decay_steps", 200_000)))
+        self.assist_force = float(ac.get("force", 30.0))             # [N] Schub in Kommandorichtung bei Step 0
+        self.assist_decay_steps = max(1, int(ac.get("decay_steps", 100_000)))
         self.assist_scale_min = float(ac.get("scale_min", 0.0))
-        # Performance-Gate: Assist zusätzlich zum Zeit-Abbau zurückfahren, sobald command_accuracy
-        # steigt — aber nur bis perf_floor (Rest bleibt, der Zeit-Abbau blendet final aus).
-        self.assist_accuracy_target = max(1e-6, float(ac.get("accuracy_target", 0.7)))
-        self.assist_perf_floor = float(ac.get("perf_floor", 0.5))
-        self.assist_perf_alpha = float(ac.get("perf_ema", 0.01))
-        # Gate-Signal: command_accuracy (Heading-Frame, drift-bewusst), sonst tracking_lin_vel.
-        self.assist_perf_key = "command_accuracy" if "command_accuracy" in self.reward_scales else "tracking_lin_vel"
-        self.assist_perf_ema = 0.0                                 # EMA der mittleren Gate-Reward-Qualität
-        self.assist_scale = self.assist_start_scale if self.assist_enabled else 0.0  # Logging vor dem 1. Step
+        self.assist_scale = 1.0 if self.assist_enabled else 0.0      # Logging vor dem 1. Step (Start: voll)
         self.assist_link_idx = [self.robot.base_link_idx]         # globaler Index des Rumpf-Links
         self.assist_force_buf = torch.zeros((num_envs, 1, 3), dtype=gs.tc_float, device=gs.device)
 
@@ -265,6 +256,9 @@ class K1Env:
         self.gait_stance_ratio = float(self.reward_cfg["gait_stance_ratio"])
         self.gait_phase_offset = float(self.reward_cfg["gait_phase_offset"])
         self.gait_phase = torch.rand((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # Soll-Schwungdauer = (1 − stance_ratio) · Periode: Ziel-Luftzeit je Schritt fürs Kontaktmodell.
+        self.gait_swing_time = (1.0 - self.gait_stance_ratio) * float(self.reward_cfg["gait_period_s"])
+        self.feet_air_sigma = float(self.reward_cfg["feet_air_sigma"])
 
         self._obs_slices = {
             "base_ang_vel": self.base_ang_vel.shape[-1],
@@ -345,13 +339,9 @@ class K1Env:
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
-            raw = reward_func()
-            rew = raw * self.reward_scales[name]
+            rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
-            # Performance-EMA fürs Assist-Gate (raw des Gate-Terms, i. d. R. tracking_lin_vel).
-            if self.assist_enabled and name == self.assist_perf_key:
-                self.assist_perf_ema += self.assist_perf_alpha * (raw.mean().item() - self.assist_perf_ema)
 
         self._resample_commands(
             self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0
@@ -423,6 +413,7 @@ class K1Env:
             self.foot_in_contact.fill_(True)
             self.foot_air_time.zero_()
             self.feet_air_time_reward.zero_()
+            self.foot_step_quality.zero_()
             self.ankle_pitch_hist.zero_()
             self.foot_flat_time.zero_()
             self.foot_roll_reward.zero_()
@@ -449,6 +440,7 @@ class K1Env:
             self.foot_in_contact.masked_fill_(envs_idx[:, None], True)
             self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
+            self.foot_step_quality.masked_fill_(envs_idx[:, None], 0.0)
             self.ankle_pitch_hist.masked_fill_(envs_idx[:, None, None], 0.0)
             self.foot_flat_time.masked_fill_(envs_idx[:, None], 0.0)
             self.foot_roll_reward.masked_fill_(envs_idx, 0.0)
@@ -470,12 +462,9 @@ class K1Env:
                 value.zero_()
             else:
                 value.masked_fill_(envs_idx, 0.0)
-        # Assist-Force-Curriculum: aktuelle Stützstärke + Gate-Signal (Performance-EMA) mitloggen
+        # Assist-Force-Curriculum: aktuelle Stützstärke mitloggen
         self.extras["episode"]["assist_scale"] = torch.tensor(
             self.assist_scale, dtype=gs.tc_float, device=gs.device
-        )
-        self.extras["episode"]["assist_perf_ema"] = torch.tensor(
-            self.assist_perf_ema, dtype=gs.tc_float, device=gs.device
         )
 
         # random sample command upon reset
@@ -492,20 +481,23 @@ class K1Env:
         in_contact = foot_z < self.reward_cfg["foot_contact_height"]
         touchdown = in_contact & ~self.foot_in_contact
 
-        # feet_air_time: erst dt für alle Füße addieren (zählt diesen Step zur Luftphase),
-        # dann beim Touchdown die Luftphase belohnen, danach Füße in Kontakt auf 0 setzen.
+        # feet_air_time (phasen-gekoppelt): dt für die Luftphase addieren, dann beim Touchdown nur
+        # belohnen, wenn die Landung INS STANCE-FENSTER der Phase-Clock fällt (richtiger Takt) UND die
+        # vorausgegangene Luftzeit nahe der Soll-Schwungdauer (1−stance_ratio)·Periode liegt (Gauß).
+        # → bewertet OB der Schritt zum Takt passt, nicht bloß die Dauer. Danach Timer in Kontakt nullen.
         self.foot_air_time += self.dt
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
-        # Alternations-Gate: Landung nur belohnen, wenn der ANDERE Fuß am Boden ist
-        # (echtes Wechselschreiten / Double-Support, kein Hüpfen auf einem Bein).
-        other_in_contact = in_contact[:, [1, 0]].to(gs.tc_float)
-        landing = torch.clamp(
-            self.foot_air_time - self.reward_cfg["feet_air_time_min"],
-            min=0.0,
-            max=self.reward_cfg["feet_air_time_max"],
-        ) * touchdown.to(gs.tc_float) * other_in_contact
+        on_beat_land = touchdown & self._desired_stance()  # Aufsetzen im richtigen Phase-Fenster
+        air_quality = torch.exp(-torch.square(self.foot_air_time - self.gait_swing_time) / self.feet_air_sigma)
+        # Symmetrie-Kopplung: Landung je Fuß × On-Beat-Güte des ANDEREN Fußes (foot_step_quality, vor
+        # Update gelesen) → schleift ein Fuß (Güte→0), zählt auch die gute Landung des anderen kaum.
+        other_quality = self.foot_step_quality[:, [1, 0]]
+        landing = air_quality * on_beat_land.to(gs.tc_float) * other_quality
         self.feet_air_time_reward.copy_(landing.sum(dim=1) * active)
+        # foot_step_quality: pro Step zerfallen, bei On-Beat-Landung auf die frische air_quality latchen
+        self.foot_step_quality.mul_(self.feet_air_decay)
+        self.foot_step_quality.copy_(torch.where(on_beat_land, air_quality, self.foot_step_quality))
         self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
 
         # --- foot_roll (Heel-to-Toe) & flat_foot über Ankle_Pitch ---
@@ -535,6 +527,18 @@ class K1Env:
         self.foot_flat_penalty.copy_(flat_excess.sum(dim=1) * roll_active)
 
         self.foot_in_contact.copy_(in_contact)
+
+    def _desired_stance(self):
+        """Soll-Bodenkontakt je Fuß (n,2) aus der Phase-Clock: True = soll Stance, False = soll Swing.
+
+        Gemeinsames Kontaktmodell für gait_phase (Off-Beat-Strafe) UND die phasen-gekoppelte
+        Lande-Belohnung (feet_air_time): linkes Bein folgt gait_phase, rechtes um gait_phase_offset
+        versetzt; Stance solange Phase < gait_stance_ratio.
+        """
+        phase = torch.stack(
+            [self.gait_phase, (self.gait_phase + self.gait_phase_offset).remainder(1.0)], dim=1
+        )
+        return phase < self.gait_stance_ratio
 
     def _sample_push_interval(self, batch_shape):
         """Zufälliges Push-Intervall [steps] im konfigurierten Band (je Env dekorreliert)."""
@@ -570,61 +574,33 @@ class K1Env:
         self.next_push_step[envs_idx] = self.episode_length_buf[envs_idx] + self._sample_push_interval((n,))
 
     def _apply_assist_force(self):
-        """Widerstands-Curriculum: virtueller Zug am Rumpf-COM, der ENTGEGEN der kommandierten
-        Bewegung wirkt — der Roboter muss sich dagegen lehnen und aktiv dagegen anlaufen, um
-        Fortschritt zu erzielen (Resistance-Training). Gegenstück zum Push (_apply_push): Push STÖRT
-        impulsiv, dieser Widerstand BREMST dauerhaft und gerichtet. Zwei Anteile (Heading-/Welt-xy):
+        """Hilfskraft-Curriculum: konstanter Schub am Rumpf-COM IN Kommandorichtung — eine Anschubhilfe,
+        die dem Roboter das Anlaufen erleichtert (Gegenteil eines Widerstands). Gegenstück zum Push
+        (_apply_push): Push STÖRT impulsiv, diese Hilfe SCHIEBT gerichtet und blendet über die Zeit aus.
 
-          force = scale · ( −force_kp·v_ist        geschwindigkeitsproportionaler Drag (entgegen der
-                                                    Ist-Bewegung): bremst Vorwärtsfahrt, dämpft Drift
-                          − force_dir·cmd_dir )     konstanter Gegen-Zug ENTGEGEN der Kommandorichtung
-                                                    (Einheitsvektor): „Gegenwind", gegen den der COM
-                                                    nach vorn gelehnt werden muss → erzwingt Anlehnen.
+          force = scale · force · cmd_dir        Schub entlang der Kommandorichtung (Einheitsvektor);
+                                                 inaktiv bei ~null Kommando.
 
-        |Gesamtkraft| auf force_max [N] gedeckelt; am Rumpf-COM (ref='root_com' → reine Linearkraft,
-        KEIN Stör-Drehmoment). NICHT in der Observation → die Policy erlebt den Widerstand nur als
-        veränderte Dynamik, die über das Curriculum erst zunimmt und dann verschwindet.
+        Am Rumpf-COM (ref='root_com' → reine Linearkraft, KEIN Stör-Drehmoment). NICHT in der
+        Observation → die Policy erlebt nur die veränderte Dynamik, die über das Curriculum verschwindet.
 
-        Heading == Welt gilt bei Identity-Spawn (base_init_quat = Einheit); base_lin_vel_heading ist
-        dann Welt-xy. Bei späterem Random-Yaw-Spawn müssten v_ist und cmd_dir von Heading nach Welt
-        rotiert werden, bevor die Kraft im Weltframe angewandt wird.
+        Heading == Welt gilt bei Identity-Spawn (base_init_quat = Einheit); cmd_dir (Heading-Frame) ist
+        dann Welt-xy. Bei späterem Random-Yaw-Spawn müsste cmd_dir vor dem Anwenden nach Welt rotiert werden.
 
-        Skala = time_scale · perf_factor. time_scale folgt einer GLOCKENKURVE (Dreieck) über die Zeit:
-          total_steps ≤ peak_steps:  ramp start_scale → 1.0   (kleine Anfangskraft, steigend)
-          total_steps > peak_steps:  ramp 1.0 → scale_min     (fallend bis ausgeblendet)
-          perf_factor = 1 − (1−perf_floor) · clamp(acc_ema/accuracy_target, 0, 1)
-        command_accuracy (EMA) hoch → perf_factor fällt auf perf_floor (nicht 0): läuft der Roboter
-        gut, wird der Widerstand etwas entlastet, ganz weg ist er erst nach dem Zeit-Abbau.
+        Skala = LINEARER Abbau über die Zeit (start stark, dann ausblenden):
+          scale = max(scale_min, 1 − total_steps/decay_steps)
 
-        Beispiel (force_dir=30, start_scale=0.2, peak_steps=5e4, decay_steps=2e5, perf_floor=0.5):
-          total_steps=0,     acc=0.0 → time=0.20, perf=1.0  → scale=0.20 → F≈−6 N (leichter Gegenwind)
-          total_steps=5e4,   acc=0.5 → time=1.00, perf≈0.64 → scale≈0.64 → F≈−19 N (max. Widerstand)
-          total_steps≥2e5                                   → time=0      → scale=0 (frei laufen)
+        Beispiel (force=30, decay_steps=1e5):
+          total_steps=0     → scale=1.00 → F≈+30 N (volle Anschubhilfe vorwärts)
+          total_steps=5e4   → scale=0.50 → F≈+15 N
+          total_steps≥1e5   → scale=0    → frei laufen
         """
-        if self.total_steps <= self.assist_peak_steps:
-            # Anstieg: kleine Anfangskraft (start_scale) linear hoch zum Maximum (1.0) bei peak_steps
-            time_scale = self.assist_start_scale + (1.0 - self.assist_start_scale) * (
-                self.total_steps / self.assist_peak_steps
-            )
-        else:
-            # Abfall: Maximum (1.0) linear hinunter auf scale_min am Ende des Decay-Fensters
-            span = max(1, self.assist_decay_steps - self.assist_peak_steps)
-            time_scale = max(self.assist_scale_min, 1.0 - (self.total_steps - self.assist_peak_steps) / span)
-        acc = min(1.0, max(0.0, self.assist_perf_ema / self.assist_accuracy_target))
-        perf_factor = 1.0 - (1.0 - self.assist_perf_floor) * acc
-        self.assist_scale = time_scale * perf_factor
+        self.assist_scale = max(self.assist_scale_min, 1.0 - self.total_steps / self.assist_decay_steps)
         if self.assist_scale <= 0.0:
             return
-        # (1) geschwindigkeitsproportionaler Drag ENTGEGEN der Ist-Bewegung
-        force_xy = -self.assist_force_kp * self.base_lin_vel_heading[:, :2]
-        # (2) konstanter Gegen-Zug ENTGEGEN der Kommandorichtung (Einheitsvektor); inaktiv bei ~null Kommando
         cmd_speed = torch.norm(self.commands[:, :2], dim=1, keepdim=True)
         cmd_dir = self.commands[:, :2] / (cmd_speed + 1e-6)
-        force_xy = force_xy - self.assist_force_dir * cmd_dir * (cmd_speed > 1e-3).to(gs.tc_float)
-        # gemeinsame Curriculum-Skalierung, dann Betrag der Gesamtkraft deckeln
-        force_xy = self.assist_scale * force_xy
-        mag = torch.norm(force_xy, dim=1, keepdim=True)
-        force_xy = force_xy * torch.clamp(self.assist_force_max / (mag + 1e-6), max=1.0)
+        force_xy = self.assist_scale * self.assist_force * cmd_dir * (cmd_speed > 1e-3).to(gs.tc_float)
         self.assist_force_buf[:, 0, 0] = force_xy[:, 0]
         self.assist_force_buf[:, 0, 1] = force_xy[:, 1]
         self.scene.rigid_solver.apply_links_external_force(
@@ -734,21 +710,45 @@ class K1Env:
         return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
 
     def _reward_feet_air_time(self):
-        """Belohnung: Füße sollen genug abheben (gegen Schlurfen/Trippeln ohne Bodenfreiheit).
+        """Belohnung: phasen-gekoppelter, kadenz-treuer Schritt (Event beim Aufsetzen).
 
-        Legged-Gym-Stil: Belohnung NUR beim Aufsetzen (Touchdown), proportional zur
-        vorausgegangenen Luftphase. foot_air_time wird in _update_foot_contact akkumuliert
-        (dt pro Step ohne Bodenkontakt) und bei Landung in feet_air_time_reward verbucht:
-          je Fuß  clamp(air_time - feet_air_time_min, 0, feet_air_time_max),  über beide summiert.
-        Nur wenn cmd_speed > feet_air_cmd_threshold (beim Stehen kein Reward) UND der andere Fuß
-        beim Aufsetzen am Boden ist (Alternations-Gate → kein Einbein-Hüpfen, siehe _update_foot_contact).
+        In _update_foot_contact berechnet (gemeinsames Kontaktmodell mit gait_phase): beim Touchdown
+        nur belohnt, wenn die Landung INS STANCE-FENSTER der Phase-Clock fällt (richtiger Takt), und
+        zwar exp(−(air_time − gait_swing_time)² / feet_air_sigma) — voll nur, wenn die Luftzeit nahe der
+        Soll-Schwungdauer (1−stance_ratio)·gait_period_s liegt. Misst also OB der Schritt zum Takt passt,
+        nicht bloß die Dauer. Off-Beat oder zu kurze/lange Luftzeit → kaum Reward. Gate: cmd_speed >
+        feet_air_cmd_threshold (im Stand kein Reward); Alternation folgt aus dem Phasenversatz.
 
-        Beispiel (min=0.05, max=0.25, scale=5.0 → effektiv *dt=0.1, dt=0.02):
-          Landung raw=0.18 → contrib≈+0.018
-          kein Touchdown in diesem Step → raw=0 → 0
-          cmd≈0 (Stehen)               → raw=0 → 0
+        Symmetrie-Kopplung: jede Landung wird mit der zerfallenden On-Beat-Güte des ANDEREN Fußes
+        (foot_step_quality) multipliziert → ein schleifender/dragender Fuß (Güte→0) zieht den Term
+        gegen 0, auch wenn das andere Bein sauber schreitet. Ein Fuß kann ihn so nicht allein tragen.
+
+        Beispiel (swing_time=0.44, sigma=0.02, scale=7 → *dt=0.14):
+          beide on-beat (other_q≈0.8), air=0.44 → 1.0·0.8 ≈ 0.8 → +0.11/Step
+          ein Fuß dragt (other_q≈0)              → ≈ 0        → 0
+          Off-Beat-Landung / cmd≈0               → 0
         """
         return self.feet_air_time_reward
+
+    def _reward_swing_clearance(self):
+        """Strafe: Fuß bleibt im Swing-Fenster der Phase-Clock am Boden (Schleif-/Drag-Fuß).
+
+        Schärfere, kontinuierliche Variante der gait_phase-Off-Beat-Strafe: bestraft je Fuß den
+        Höhen-FEHLBETRAG max(0, feet_air_height_target − z), wenn die Phase-Clock SWING vorschreibt
+        (~_desired_stance). Ein Fuß, der schreiten SOLL, aber tief am Boden schleift, zahlt proportional
+        zur Tiefe; ein sauber abhebender Fuß (z ≥ target) zahlt 0. Gate: cmd_speed > gait_cmd_threshold.
+
+        Beispiel (target=0.12, scale=-10 → *dt=-0.2):
+          Schwungfuß z=0.12 (sauber)  → 0       → 0/Step
+          Drag-Fuß  z=0.05 im Swing   → 0.07    → -0.014/Step je Fuß
+          Stehen (cmd≈0)              → 0
+        """
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]  # (n,2)
+        desired_swing = (~self._desired_stance()).to(gs.tc_float)
+        shortfall = torch.clamp(self.reward_cfg["feet_air_height_target"] - foot_z, min=0.0)
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
+        return (shortfall * desired_swing).sum(dim=1) * active
 
     def _reward_foot_roll(self):
         """Belohnung: sauberes Heel-to-Toe-Abrollen (kein separater Zeh/Hacken-Link → Ankle_Pitch als Proxy).
@@ -831,24 +831,23 @@ class K1Env:
         sigma = self.reward_cfg["feet_air_height_sigma"]
         return (torch.exp(-torch.abs(foot_z - h_target) / sigma) * is_air).sum(dim=1)
 
-    def _reward_feet_ground_parallel(self):
-        """Belohnung: Stützfuß steht flach (Sohle parallel zum Boden) → volle Traktion, SPRINT-Stil.
+    def _reward_feet_parallel(self):
+        """Belohnung: beide Füße zeigen in dieselbe Richtung (parallel) → kein Spreizen/Einwärtsdrehen.
 
-        Fuß-Normale = lokale +z-Achse des Fußes in den Welt-Raum rotiert. Bei flachem Fuß zeigt sie
-        senkrecht nach oben → horizontale (x,y)-Komponenten ≈ 0. Belohnt exp(−||normal_xy||²), nur bei
-        Kontakt (foot_in_contact). Direkter als die Ankle_Pitch-Proxys (foot_roll/flat_foot): erfasst
-        die echte 3D-Fußlage inkl. seitlicher Schräglage (Ankle_Roll).
+        Vergleicht die in die Horizontale projizierten Vorwärtsachsen (lokale +x) beider Füße: bei
+        parallelen Füßen sind die normierten xy-Vektoren gleich → Differenz 0. exp(−||Δ||²/sigma).
+        Yaw/Heading-basiert → robust gegen das Anstellen (Pitch) des Schwungfußes im Schritt.
 
-        Beispiel (scale=1.0 → *dt=0.02):
-          Fuß flach (||xy||²≈0) im Kontakt → exp(0)=1.0 → +0.02/Step je Fuß
-          Fuß gekippt (||xy||²=0.5)        → exp(-0.5)≈0.61
-          Fuß in der Luft                  → contact=0  → 0
+        Beispiel (sigma=0.1, scale=1.0 → *dt=0.02):
+          Füße parallel (Δ≈0) → exp(0)=1.0    → +0.02/Step
+          Füße ~25° verdreht  → ||Δ||²≈0.19   → exp(-1.9)≈0.15
         """
         foot_quat = self.robot.get_links_quat(self.feet_idx_local)  # (n,2,4)
-        world_up = -self.global_gravity  # [0,0,1]
-        normal = transform_by_quat(world_up, foot_quat.reshape(-1, 4)).reshape(-1, 2, 3)
-        tilt = torch.sum(torch.square(normal[:, :, :2]), dim=2)  # (n,2)
-        return (torch.exp(-tilt) * self.foot_in_contact.to(gs.tc_float)).sum(dim=1)
+        world_fwd = torch.tensor([1.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
+        fwd = transform_by_quat(world_fwd, foot_quat.reshape(-1, 4)).reshape(-1, 2, 3)[:, :, :2]  # (n,2,2) xy
+        fwd = fwd / (torch.norm(fwd, dim=2, keepdim=True) + 1e-6)
+        diff = torch.sum(torch.square(fwd[:, 0] - fwd[:, 1]), dim=1)  # (n,)
+        return torch.exp(-diff / self.reward_cfg["feet_parallel_sigma"])
 
     def _reward_feet_guidance(self):
         """Strafe: Schwungfuß unterschreitet die Soll-Flugzeit t_target (Mindest-Airtime, SPRINT-Stil).
@@ -870,21 +869,16 @@ class K1Env:
     def _reward_gait_phase(self):
         """Strafe: Fuß-Kontakt passt nicht zum Phase-Clock-Takt (Siekmann/Margolis-Stil).
 
-        Der Takt schreibt je Bein vor, wann es am Boden sein soll (Stance) und wann in der Luft
-        (Swing): linkes Bein folgt gait_phase, rechtes Bein um gait_phase_offset (0.5) versetzt
-        → erzwingt Alternation und feste Kadenz. Stance, solange Phase < gait_stance_ratio.
-        Bestraft wird je Fuß die Abweichung von Soll-Kontakt vs. Ist-Kontakt (Höhen-Proxy),
-        nur bei cmd_speed > gait_cmd_threshold (im Stand kein Takt-Zwang). sin/cos(2πφ) liegt
-        in der Observation → die Policy kann den Takt aktiv timen.
+        Nutzt dasselbe Kontaktmodell wie die phasen-gekoppelte feet_air_time-Belohnung (_desired_stance):
+        bestraft je Fuß die Abweichung Soll-Kontakt vs. Ist-Kontakt (Höhen-Proxy), nur bei
+        cmd_speed > gait_cmd_threshold (im Stand kein Takt-Zwang). gait_phase liefert die kontinuierliche
+        Off-Beat-Strafe, feet_air_time die positive Belohnung fürs korrekte Stepping → zusammen ein Modell.
 
         Beispiel (offset=0.5, stance_ratio=0.6, scale=-0.8 → *dt=-0.016):
           mismatch=1 (ein Fuß off-beat) → -0.016/Step
           cmd≈0 (Stehen)                → 0
         """
-        left_stance = self.gait_phase < self.gait_stance_ratio
-        right_stance = ((self.gait_phase + self.gait_phase_offset) % 1.0) < self.gait_stance_ratio
-        desired_contact = torch.stack([left_stance, right_stance], dim=1)  # (n,2) True = soll am Boden
-        mismatch = (desired_contact != self.foot_in_contact).to(gs.tc_float).sum(dim=1)
+        mismatch = (self._desired_stance() != self.foot_in_contact).to(gs.tc_float).sum(dim=1)
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
         return mismatch * active
