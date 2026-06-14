@@ -33,7 +33,12 @@ class K1Env:
         command_cfg,
         show_viewer=False,
         record_camera=False,
+        num_steps_per_env=None,
     ):
+        # num_steps_per_env: step()-Aufrufe pro PPO-Iteration (aus train_cfg). Nur damit das
+        # Style-Curriculum in ITERATIONEN statt rohen Steps zählen kann. None (eval/test) → kein
+        # Curriculum, Stil-Strafen sofort voll.
+        self._num_steps_per_env = num_steps_per_env
         self.num_envs = num_envs
         self.cfg = _WandbEnvCfg(env_cfg)  # rsl-rl Logger / wandb config upload
         self.env_cfg = env_cfg
@@ -223,12 +228,17 @@ class K1Env:
             [jn.index("Left_Knee_Pitch"), jn.index("Right_Knee_Pitch")], dtype=gs.tc_int, device=gs.device
         )
         self.knee_default = self.default_dof_pos[self.knee_pitch_idx].clone()
-        self.foot_roll_window = int(self.reward_cfg["foot_roll_window_steps"])
-        # Rolling-History der Ankle_Pitch-Winkel (je Fuß, letzte N Steps) für die Zeh-Pose vor Liftoff.
-        self.ankle_pitch_hist = torch.zeros((num_envs, 2, self.foot_roll_window), dtype=gs.tc_float, device=gs.device)
         self.foot_flat_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        # foot_roll als BELOHNUNG: Roll-Güte je Stance-Step (Heel-to-Toe-Abrollen), positiver Scale
+        # im YAML → aktives Abrollen wird bezahlt, statt nur den steifen Pflock-Fuß zu bestrafen.
         self.foot_roll_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # Symmetrie-Kopplung foot_roll: zerfallender Peak-Hold der Roll-Güte je Fuß → je Fuß × Güte des
+        # ANDEREN Fußes (überbrückt die nur in Doppelstütze überlappenden Stance-Phasen beider Beine).
+        self.foot_roll_good = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
         self.foot_flat_penalty = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # Symmetrie-Kopplung swing_quality: zerfallender Peak-Hold der Schwung-Güte (clear·flex) je Fuß
+        # → je Fuß × Güte des ANDEREN Fußes (überbrückt die nie überlappenden Swing-Phasen beider Beine).
+        self.swing_quality_good = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
 
         # push_robustness (Stage 3): je Env zufällig getaktet (2–5 s), Stoß als Soll-Δv [m/s].
         self.push_enabled = bool(self.reward_cfg.get("push_enabled", False))
@@ -297,6 +307,21 @@ class K1Env:
             self.reward_functions[name] = getattr(self, "_reward_" + name)
             self.episode_sums[name] = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
 
+        # Style-Curriculum: ausgewählte Stil-Strafen (gait_phase, swing_quality, foot_roll, feet_slip,
+        # orientation) bleiben warmup_iters PPO-Iterationen lang bei 0 (saubere Phase 1: erst nacktes
+        # Gehen über tracking/survival lernen), faden dann LINEAR über ramp_iters auf 100 % und bleiben
+        # voll (Phase 2). Geglätteter Step statt Dauer-Fade: kurze Nicht-Stationarität, danach wieder
+        # stationäres Ziel. Nur aktiv beim Training (num_steps_per_env gesetzt); in eval/test ohne
+        # num_steps_per_env sind die Stil-Strafen sofort voll (style_scale=1).
+        sc = reward_cfg.get("style_curriculum", {})
+        self.style_curriculum_enabled = bool(sc.get("enabled", False)) and self._num_steps_per_env is not None
+        nspe = int(self._num_steps_per_env or 1)
+        # total_steps zählt step()-Aufrufe; 1 Iteration = num_steps_per_env davon → in Steps umrechnen.
+        self.style_warmup_steps = max(0, int(sc.get("warmup_iters", 800))) * nspe
+        self.style_ramp_steps = max(1, int(sc.get("ramp_iters", 200))) * nspe
+        self.style_terms = [t for t in sc.get("terms", []) if t in self.reward_scales]
+        self.style_scale = 0.0 if self.style_curriculum_enabled else 1.0  # Logging vor dem 1. Step
+
         self.reset()
 
     def step(self, actions):
@@ -340,9 +365,17 @@ class K1Env:
         if self.push_enabled:
             self._apply_push()
 
+        # Style-Curriculum-Faktor: warmup_steps lang 0, dann linear 0→1 über ramp_steps, danach 1.
+        if self.style_curriculum_enabled:
+            self.style_scale = min(
+                1.0, max(0.0, (self.total_steps - self.style_warmup_steps) / self.style_ramp_steps)
+            )
+
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
             rew = reward_func() * self.reward_scales[name]
+            if name in self.style_terms:
+                rew = rew * self.style_scale
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
@@ -413,10 +446,11 @@ class K1Env:
             self.foot_air_time.zero_()
             self.feet_air_time_reward.zero_()
             self.foot_step_quality.zero_()
-            self.ankle_pitch_hist.zero_()
             self.foot_flat_time.zero_()
             self.foot_roll_reward.zero_()
+            self.foot_roll_good.zero_()
             self.foot_flat_penalty.zero_()
+            self.swing_quality_good.zero_()
             self.next_push_step.copy_(self._sample_push_interval((self.num_envs,)))
             self.gait_phase.uniform_(0.0, 1.0)
         else:
@@ -440,10 +474,11 @@ class K1Env:
             self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
             self.foot_step_quality.masked_fill_(envs_idx[:, None], 0.0)
-            self.ankle_pitch_hist.masked_fill_(envs_idx[:, None, None], 0.0)
             self.foot_flat_time.masked_fill_(envs_idx[:, None], 0.0)
             self.foot_roll_reward.masked_fill_(envs_idx, 0.0)
+            self.foot_roll_good.masked_fill_(envs_idx[:, None], 0.0)
             self.foot_flat_penalty.masked_fill_(envs_idx, 0.0)
+            self.swing_quality_good.masked_fill_(envs_idx[:, None], 0.0)
             torch.where(envs_idx, self._sample_push_interval((self.num_envs,)), self.next_push_step,
                         out=self.next_push_step)
             torch.where(envs_idx, torch.rand_like(self.gait_phase), self.gait_phase, out=self.gait_phase)
@@ -464,6 +499,10 @@ class K1Env:
         # Assist-Force-Curriculum: aktuelle Stützstärke mitloggen
         self.extras["episode"]["assist_scale"] = torch.tensor(
             self.assist_scale, dtype=gs.tc_float, device=gs.device
+        )
+        # Style-Curriculum: aktuellen Fade-In-Faktor der Stil-Strafen mitloggen
+        self.extras["episode"]["style_scale"] = torch.tensor(
+            self.style_scale, dtype=gs.tc_float, device=gs.device
         )
 
         # random sample command upon reset
@@ -513,24 +552,33 @@ class K1Env:
         self.foot_step_quality.copy_(torch.where(on_beat_land, air_quality, self.foot_step_quality))
         self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
 
-        # --- foot_roll (Heel-to-Toe) & flat_foot über Ankle_Pitch ---
-        liftoff = (~in_contact) & self.foot_in_contact
+        # --- foot_roll: KONTINUIERLICHES Heel-to-Toe-Abrollen während der Stance-Phase ---
         ankle_pitch = self.dof_pos[:, self.ankle_pitch_idx]  # (n,2)
         roll_active = (cmd_speed > self.reward_cfg["foot_roll_cmd_threshold"]).to(gs.tc_float)
         sigma = self.reward_cfg["foot_roll_sigma"]
 
-        # Rolling-History fortschreiben (älteste raus, aktuellen Step rein).
-        self.ankle_pitch_hist[:, :, :-1] = self.ankle_pitch_hist[:, :, 1:].clone()
-        self.ankle_pitch_hist[:, :, -1] = ankle_pitch
-
-        # Touchdown → Ferse zuerst (heel_target); Liftoff → Zeh-Abdruck über die letzten N Stance-Steps.
-        heel_rew = torch.exp(
-            -torch.square(ankle_pitch - self.reward_cfg["ankle_heel_target"]) / sigma
-        ) * touchdown.to(gs.tc_float)
-        toe_rew = torch.exp(
-            -torch.square(self.ankle_pitch_hist - self.reward_cfg["ankle_toe_target"]) / sigma
-        ).mean(dim=2) * liftoff.to(gs.tc_float)
-        self.foot_roll_reward.copy_((heel_rew + toe_rew).sum(dim=1) * roll_active)
+        # Erwarteter Ankle_Pitch läuft mit dem Stance-Fortschritt der Phase-Clock LINEAR von heel→toe;
+        # je Step belohnt, soweit der Ist-Winkel folgt UND der Fuß am Boden ist → die ganze Abroll-
+        # bewegung wird belohnt, nicht nur Touchdown/Liftoff-Events.
+        phase = torch.stack([self.gait_phase, (self.gait_phase + self.gait_phase_offset).remainder(1.0)], dim=1)
+        in_stance = (phase < self.gait_stance_ratio) & in_contact  # (n,2) Soll-Stance UND wirklich am Boden
+        stance_progress = torch.clamp(phase / self.gait_stance_ratio, max=1.0)  # 0=Touchdown … 1=Liftoff
+        heel, toe = self.reward_cfg["ankle_heel_target"], self.reward_cfg["ankle_toe_target"]
+        expected_pitch = heel + (toe - heel) * stance_progress
+        # roll_quality∈[0,1]: 1 = Ist-Winkel folgt dem Soll-Abrollen exakt, →0 = steif/Pflock.
+        roll_quality = torch.exp(-torch.square(ankle_pitch - expected_pitch) / sigma)
+        in_stance_f = in_stance.to(gs.tc_float)
+        # BELOHNUNG: je Stance-Step zählt die Roll-Güte direkt. Symmetrie-Kopplung (wie
+        # swing_quality/feet_air_time): Belohnung je Fuß × zerfallender Peak-Hold der Roll-Güte des ANDEREN
+        # Fußes (foot_roll_good, vor Update gelesen). Da Stance-Phasen nur in der Doppelstütze überlappen,
+        # trägt der Peak-Hold die Güte des jüngsten Abrollens nach vorne → ein steif feststeckender Fuß
+        # wird gegen das zuletzt sauber abrollende Bein gemessen; beide Füße müssen gleich abrollen.
+        other_roll = self.foot_roll_good[:, [1, 0]]
+        roll_hit = roll_quality * in_stance_f * other_roll
+        self.foot_roll_reward.copy_(roll_hit.sum(dim=1) * roll_active)
+        # Roll-Güte je Fuß fortschreiben (zerfallender Peak-Hold, nur Stance-Phase zählt rein)
+        self.foot_roll_good.mul_(self.feet_air_decay)
+        self.foot_roll_good.copy_(torch.maximum(self.foot_roll_good, roll_quality * in_stance_f))
 
         # flat_foot: |Ankle_Pitch| zu klein während Bodenkontakt → Plattfuß-Dauer akkumulieren.
         flat = (ankle_pitch.abs() < self.reward_cfg["foot_flat_threshold"]) & in_contact
@@ -767,62 +815,66 @@ class K1Env:
         """
         return self.feet_air_time_reward
 
-    def _reward_swing_clearance(self):
-        """Strafe: Fuß bleibt im Swing-Fenster der Phase-Clock am Boden (Schleif-/Drag-Fuß).
+    def _reward_swing_quality(self):
+        """Belohnung: sauberer Schwung — koppelt Fuß-Clearance UND Kniebeugung in EINER Metrik.
 
-        Schärfere, kontinuierliche Variante der gait_phase-Off-Beat-Strafe: bestraft je Fuß den
-        Höhen-FEHLBETRAG max(0, feet_air_height_target − z), wenn die Phase-Clock SWING vorschreibt
-        (~_desired_stance). Ein Fuß, der schreiten SOLL, aber tief am Boden schleift, zahlt proportional
-        zur Tiefe; ein sauber abhebender Fuß (z ≥ target) zahlt 0. Gate: cmd_speed > gait_cmd_threshold.
+        Ersetzt die getrennten Terme swing_clearance + swing_knee_flex (gleiches Gate, gleiche
+        Mechanik, physikalisch korreliert: Kniebeugung ERZEUGT die Clearance) durch eine konjunktive
+        Größe. Je Fuß: clear_score · flex_score, NUR wenn die Phase-Clock SWING vorschreibt
+        (~_desired_stance) UND der Fuß wirklich in der Luft ist (~foot_in_contact). Der Kontakt-Check
+        schützt das tragende Stützbein (in_contact) vor der Strafe — sonst zöge sie es hoch (Konflikt
+        mit foot_roll); das „Fuß am Boden, obwohl Swing" fängt weiterhin gait_phase ab. Gate:
+        cmd_speed > gait_cmd_threshold.
 
-        Beispiel (target=0.12, scale=-10 → *dt=-0.2):
-          Schwungfuß z=0.12 (sauber)  → 0       → 0/Step
-          Drag-Fuß  z=0.05 im Swing   → 0.07    → -0.014/Step je Fuß
-          Stehen (cmd≈0)              → 0
+        clear_score = clamp(z / feet_air_height_target, max=1.0): erreichte Schwunghöhe ∈[0,1].
+        flex_score  = clamp((knee − default) / swing_knee_flex_target, 0, 1): erreichte Beugung ∈[0,1].
+        q = clear_score · flex_score: kombinierte Schwung-Güte je Fuß; beide müssen GLEICHZEITIG gut
+        sein, ein tiefer ODER steifer Schwungfuß treibt die Belohnung → 0.
+
+        Symmetrie-Kopplung (wie früher swing_clearance/swing_knee_flex, jetzt EIN Puffer): die Belohnung
+        je Fuß × zerfallender Peak-Hold der Schwung-Güte des ANDEREN Fußes (swing_quality_good). Da die
+        Beine NIE gleichzeitig in der Luft sind (eins steht, eins schwingt), trägt der Peak-Hold die
+        Güte des jüngsten Swings des Stützbeins zeitlich nach vorne → der schwingende Fuß wird gegen
+        das zuletzt gut abhebende Bein gemessen. Beide Beine müssen gleich sauber schwingen (kein
+        eigener Stil je Bein).
+
+        Beispiel (h_target=0.12, flex_target=0.15, scale positiv → *dt=0.02; anderes Bein sauber, other_q≈1):
+          z=0.12, flex=0.15 (sauber)   → 1.0·1.0·1 = 1.0   je Fuß
+          z=0.12, flex=0    (steif)    → 1.0·0·1   = 0
+          z=0.06, flex=0.15 (zu tief)  → 0.5·1.0·1 = 0.5
+          Stützfuß am Boden / cmd≈0    → 0
         """
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]  # (n,2)
-        desired_swing = (~self._desired_stance()).to(gs.tc_float)
-        shortfall = torch.clamp(self.reward_cfg["feet_air_height_target"] - foot_z, min=0.0)
-        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
-        active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
-        return (shortfall * desired_swing).sum(dim=1) * active
-
-    def _reward_swing_knee_flex(self):
-        """Belohnung: extra Kniebeugung im Swing-Fenster (Phase-Clock + Fuß in der Luft).
-
-        Je Fuß: flex = knee − default_knee. Belohnung exp(−max(0, target−flex)²/σ) nur wenn die
-        Phase-Clock SWING vorschreibt UND der Fuß nicht am Boden ist — zwingt Schwungbeugung über
-        das Knie statt nur Ankle-Zeh-hoch für Clearance. Beide Beine alternieren durch den Takt.
-
-        Beispiel (target=0.15, default_knee=0.6, sigma=0.02, scale=4, dt=0.02):
-          Swing+Luft, knee=0.75 (flex=0.15) → exp(0)=1.0  → +0.08/Step je Fuß
-          Swing+Luft, knee=0.60 (flex=0)     → exp(-0.11)≈0.006 → +0.0005/Step
-          Stance oder Fuß am Boden           → 0
-        """
+        clear_score = torch.clamp(foot_z / self.reward_cfg["feet_air_height_target"], max=1.0)
         knee = self.dof_pos[:, self.knee_pitch_idx]
         flex = knee - self.knee_default.unsqueeze(0)
-        target = self.reward_cfg["swing_knee_flex_target"]
-        sigma = self.reward_cfg["swing_knee_flex_sigma"]
-        shortfall = torch.clamp(target - flex, min=0.0)
-        score = torch.exp(-torch.square(shortfall) / sigma)
-        desired_swing = (~self._desired_stance()).to(gs.tc_float)
-        in_air = (~self.foot_in_contact).to(gs.tc_float)
+        flex_score = torch.clamp(flex / self.reward_cfg["swing_knee_flex_target"], min=0.0, max=1.0)
+        q = clear_score * flex_score  # (n,2) kombinierte Schwung-Güte, ungated
+        gate_f = ((~self._desired_stance()) & (~self.foot_in_contact)).to(gs.tc_float)  # Swing UND abgehoben
+        # Symmetrie-Kopplung: Belohnung je Fuß × Güte des ANDEREN Fußes (Peak-Hold, vor Update gelesen).
+        other_q = self.swing_quality_good[:, [1, 0]]
+        bonus = q * gate_f * other_q  # (n,2)
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["gait_cmd_threshold"]).to(gs.tc_float)
-        return (score * desired_swing * in_air).sum(dim=1) * active
+        reward = bonus.sum(dim=1) * active
+        # Schwung-Güte je Fuß fortschreiben (zerfallender Peak-Hold, nur Swing-Phase zählt rein)
+        self.swing_quality_good.mul_(self.feet_air_decay)
+        self.swing_quality_good.copy_(torch.maximum(self.swing_quality_good, q * gate_f))
+        return reward
 
     def _reward_foot_roll(self):
-        """Belohnung: sauberes Heel-to-Toe-Abrollen (kein separater Zeh/Hacken-Link → Ankle_Pitch als Proxy).
+        """Belohnung: aktives Heel-to-Toe-Abrollen (Ankle_Pitch-Proxy, kein Zeh/Hacken-Link).
 
-        In _update_foot_contact je Fuß als Event-Reward verbucht (analog feet_air_time):
-          Touchdown → Ankle_Pitch nahe ankle_heel_target (-0.15 rad, Ferse zuerst),
-          Liftoff   → Ankle_Pitch der letzten foot_roll_window Stance-Steps nahe ankle_toe_target (+0.10 rad).
-        exp(-(Δ)²/foot_roll_sigma) je Event, über beide Füße summiert; nur wenn cmd_speed > foot_roll_cmd_threshold.
+        In _update_foot_contact je Stance-Step verbucht: der erwartete Ankle_Pitch läuft mit dem
+        Stance-Fortschritt der Phase-Clock linear von ankle_heel_target (-0.15, Touchdown) →
+        ankle_toe_target (+0.10, Liftoff). roll_quality = exp(-(ist-erwartet)²/foot_roll_sigma) je Step,
+        solange der Fuß am Boden ist UND die Phase Stance vorschreibt; nur wenn
+        cmd_speed > foot_roll_cmd_threshold. Folgt der Fuß dem Abrollen → ~1 je Fuß; bleibt er steif → ~0.
+        Positive Magnitude, positiver Scale im YAML.
 
-        Beispiel (heel=-0.15, sigma=0.05, scale=0.5 → *dt=0.01):
-          Touchdown mit Ankle=-0.15 → exp(0)=1.0      → contrib≈+0.01 (einmalig)
-          Touchdown mit Ankle=-0.30 → exp(-0.0225/0.05)≈0.64 → +0.0064
-          Stehen (cmd≈0)            → 0
+        Symmetrie-Kopplung (wie swing_quality/feet_air_time): Belohnung je Fuß × zerfallender Peak-Hold der
+        Roll-Güte des ANDEREN Fußes (foot_roll_good) → beide Füße müssen gleich sauber abrollen, ein
+        steifes Bein kann sich nicht hinter einem gut abrollenden verstecken.
         """
         return self.foot_roll_reward
 
@@ -855,23 +907,48 @@ class K1Env:
         slip = torch.sum(torch.square(foot_vel_xy), dim=2)  # (n,2)
         return (slip * self.foot_in_contact.to(gs.tc_float)).sum(dim=1)
 
-    def _reward_close_feet(self):
-        """Strafe: Füße kommen sich seitlich zu nah (Kollisions-/Verhakungsschutz, SPRINT-Stil).
+    def _reward_feet_stance(self):
+        """Strafe: koppelt Fuß-Parallelität UND seitlichen Versatz JE Fuß zur Rumpf-Mitte in EINER Metrik.
 
-        Seitlicher Abstand = |y_links − y_rechts| im BASIS-Frame (rotationsinvariant, anders als
-        Welt-y bei gedrehtem Rumpf). max(0, d_min − Abstand) → greift erst unter dem Mindestabstand
-        d_min und wird hart gewichtet (scale −100) gegen kreuzende/kollidierende Füße beim Gehen/Drehen.
+        Strafmagnitude = 1 − sep_score · parallel_score (beide ∈[0,1]) → 0 nur, wenn die Füße
+        GLEICHZEITIG parallel stehen UND weit genug auseinander; zu nah ODER verdreht treibt die Strafe
+        gegen 1. Ersetzt die getrennten Terme feet_parallel (Bonus) und close_feet (Strafe) durch eine
+        konjunktive Größe; positive Magnitude, negativer Scale im YAML.
 
-        Beispiel (d_min=0.15, scale=-100 → *dt=-2.0):
-          Abstand 0.18 m → 0     → 0/Step
-          Abstand 0.10 m → 0.05  → -0.10/Step
+        parallel_score = exp(−||Δfwd||²/feet_parallel_sigma): normierte Vorwärtsachsen (lokale +x)
+          beider Füße in die Horizontale projiziert; gleich → 1.0, verdreht → →0. Yaw-basiert, robust
+          gegen das Anstellen (Pitch) des Schwungfußes im Schritt.
+        sep_score = left_sep · right_sep: lateraler Versatz JE Fuß von der Rumpf-Mittellinie (Basis-y=0),
+          NICHT der Fuß-zu-Fuß-Abstand. Der reine Fuß-zu-Fuß-Abstand |y_l − y_r| ist y-translations-
+          invariant → er erlaubt, beide Füße auf eine Seite zu legen bzw. den Rumpf über EINEN Fuß zu
+          lehnen (Einbein-Balance) und trotzdem voll zu scoren. Per-Fuß-Versatz verankert den Rumpf:
+          links muss nach +y, rechts nach −y, je um die Soll-Halbspur close_feet_d_min/2; je Fuß ∈[0,1],
+          konjunktiv multipliziert → ein Fuß auf der Mittellinie ODER auf der falschen Seite zieht den
+          Score auf 0. So muss der Rumpf MITTIG zwischen beiden Füßen stehen (echte Zweibein-Stütze).
+
+        Beispiel (sigma=0.1, d_min=0.15 → half=0.075, scale feet_stance negativ → *dt=0.02):
+          parallel, L=+0.075/R=−0.075 (zentriert) → 1 − (1.0·1.0)·1.0 = 0     (keine Strafe)
+          parallel, L=+0.15/R=0.0 (über R gelehnt) → 1 − (1.0·0.0)·1.0 = 1.0   (Einbein-Lehne bestraft)
+          parallel, L=+0.0375/R=−0.0375 (halb)     → 1 − (0.5·0.5)·1.0 = 0.75
         """
+        foot_quat = self.robot.get_links_quat(self.feet_idx_local)  # (n,2,4)
+        world_fwd = torch.tensor([1.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
+        fwd = transform_by_quat(world_fwd, foot_quat.reshape(-1, 4)).reshape(-1, 2, 3)[:, :, :2]  # (n,2,2) xy
+        fwd = fwd / (torch.norm(fwd, dim=2, keepdim=True) + 1e-6)
+        diff = torch.sum(torch.square(fwd[:, 0] - fwd[:, 1]), dim=1)  # (n,)
+        parallel_score = torch.exp(-diff / self.reward_cfg["feet_parallel_sigma"])
+
         foot_pos = self.robot.get_links_pos(self.feet_idx_local)  # (n,2,3) Welt
         inv_bq = inv_quat(self.base_quat)
         left_base = transform_by_quat(foot_pos[:, 0] - self.base_pos, inv_bq)   # (n,3) im Basis-Frame
         right_base = transform_by_quat(foot_pos[:, 1] - self.base_pos, inv_bq)
-        lateral_dist = torch.abs(left_base[:, 1] - right_base[:, 1])
-        return torch.clamp(self.reward_cfg["close_feet_d_min"] - lateral_dist, min=0.0)
+        # Lateraler Versatz JE Fuß von der Rumpf-Mittellinie (Basis-y), statt Fuß-zu-Fuß-Abstand:
+        # erzwingt den Rumpf MITTIG zwischen den Füßen, killt die Einbein-Lehne (s. Docstring).
+        half_width = 0.5 * self.reward_cfg["close_feet_d_min"]
+        left_sep = torch.clamp(left_base[:, 1] / half_width, min=0.0, max=1.0)     # links soll +y
+        right_sep = torch.clamp(-right_base[:, 1] / half_width, min=0.0, max=1.0)  # rechts soll −y
+        sep_score = left_sep * right_sep
+        return 1.0 - sep_score * parallel_score
 
     def _reward_feet_air_height(self):
         """Belohnung: Schwungfuß hält eine saubere Soll-Flughöhe (Gauß um feet_air_height_target).
@@ -891,24 +968,6 @@ class K1Env:
         h_target = self.reward_cfg["feet_air_height_target"]
         sigma = self.reward_cfg["feet_air_height_sigma"]
         return (torch.exp(-torch.abs(foot_z - h_target) / sigma) * is_air).sum(dim=1)
-
-    def _reward_feet_parallel(self):
-        """Belohnung: beide Füße zeigen in dieselbe Richtung (parallel) → kein Spreizen/Einwärtsdrehen.
-
-        Vergleicht die in die Horizontale projizierten Vorwärtsachsen (lokale +x) beider Füße: bei
-        parallelen Füßen sind die normierten xy-Vektoren gleich → Differenz 0. exp(−||Δ||²/sigma).
-        Yaw/Heading-basiert → robust gegen das Anstellen (Pitch) des Schwungfußes im Schritt.
-
-        Beispiel (sigma=0.1, scale=1.0 → *dt=0.02):
-          Füße parallel (Δ≈0) → exp(0)=1.0    → +0.02/Step
-          Füße ~25° verdreht  → ||Δ||²≈0.19   → exp(-1.9)≈0.15
-        """
-        foot_quat = self.robot.get_links_quat(self.feet_idx_local)  # (n,2,4)
-        world_fwd = torch.tensor([1.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
-        fwd = transform_by_quat(world_fwd, foot_quat.reshape(-1, 4)).reshape(-1, 2, 3)[:, :, :2]  # (n,2,2) xy
-        fwd = fwd / (torch.norm(fwd, dim=2, keepdim=True) + 1e-6)
-        diff = torch.sum(torch.square(fwd[:, 0] - fwd[:, 1]), dim=1)  # (n,)
-        return torch.exp(-diff / self.reward_cfg["feet_parallel_sigma"])
 
     def _reward_feet_guidance(self):
         """Strafe: Schwungfuß unterschreitet die Soll-Flugzeit t_target (Mindest-Airtime, SPRINT-Stil).
@@ -982,17 +1041,20 @@ class K1Env:
         return torch.square(term)
 
     def _reward_orientation(self):
-        """Strafe: seitliches Kippen dämpfen (nur Roll — Pitch über torso_pitch asymmetrisch).
+        """Strafe: Rumpf aufrecht halten — Roll UND Pitch dämpfen (gegen Kippen/Nicken).
 
-        base_euler liegt in Grad vor → in Radian umrechnen, damit die Skala physikalisch sinnvoll ist.
+        Seit torso_pitch deaktiviert ist, regelt dieser Term auch die Vorne-/Rück-Neigung: roll² + pitch²
+        zieht den Rumpf gegen senkrecht (0°/0°). base_euler liegt in Grad vor → in Radian umrechnen,
+        damit die Skala physikalisch sinnvoll ist.
 
-        Beispiel (scale=-2.0, dt=0.02):
-          roll=0°   → 0           → 0/Step
-          roll=10°  → 0.0305 rad² → -0.0012/Step
-          roll=20°  → 0.1220 rad² → -0.0049/Step
+        Beispiel (scale=-5.0, dt=0.02):
+          roll=0°,  pitch=0°  → 0                  → 0/Step
+          roll=10°, pitch=0°  → 0.0305 rad²        → -0.0030/Step
+          roll=0°,  pitch=10° → 0.0305 rad²        → -0.0030/Step
+          roll=10°, pitch=10° → 0.0610 rad²        → -0.0061/Step
         """
-        roll = torch.deg2rad(self.base_euler[:, 0])
-        return torch.square(roll)
+        roll_pitch = torch.deg2rad(self.base_euler[:, :2])
+        return torch.sum(torch.square(roll_pitch), dim=1)
 
     def _reward_ang_vel_xy(self):
         """Strafe: Roll-/Pitch-Raten des Rumpfes dämpfen (kein Kippeln/Schwanken).

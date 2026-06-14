@@ -120,11 +120,10 @@ reward_cfg:
   feet_air_cmd_threshold: 0.15    # [m/s] darunter kein Reward
   feet_air_decay: 0.99            # Zerfall/Step der On-Beat-Güte je Fuß (Symmetrie-Kopplung)
 
-  # foot_roll (Heel-to-Toe via Ankle_Pitch)
-  ankle_heel_target: -0.15        # [rad] beim Touchdown
-  ankle_toe_target: 0.10          # [rad] vor Liftoff
+  # foot_roll (kontinuierliches Heel-to-Toe via Ankle_Pitch, stance-phasen-gekoppelt)
+  ankle_heel_target: -0.15        # [rad] Stance-Start (Touchdown)
+  ankle_toe_target: 0.10          # [rad] Stance-Ende (Liftoff)
   foot_roll_sigma: 0.05
-  foot_roll_window_steps: 3
   foot_roll_cmd_threshold: 0.2    # [m/s] darunter kein Reward
 
   # flat_foot
@@ -151,15 +150,23 @@ reward_cfg:
   push_vel_min: 0.3
   push_vel_max: 0.8
 
+  # Style-Curriculum: Stil-Strafen bleiben warmup_iters bei 0 (erst nacktes Gehen lernen), faden dann
+  # linear über ramp_iters auf 100 % und bleiben voll. Geglätteter Step (kurze Nicht-Stationarität,
+  # danach wieder stationäres Ziel). Nur beim Training aktiv; in eval/test sind die Strafen sofort voll.
+  style_curriculum:
+    enabled: true
+    warmup_iters: 800     # PPO-Iterationen mit style_scale=0 (Phase 1: Gehen lernen)
+    ramp_iters: 200       # PPO-Iterationen für den linearen 0→1 Anstieg danach
+    terms: [gait_phase, swing_quality, foot_roll, feet_slip,feet_air_time,]
+
   # gait phase-clock
   gait_period_s: 1.1              # [s] voller Schrittzyklus
   gait_stance_ratio: 0.6          # Stance-Anteil je Fuß
   gait_phase_offset: 0.5          # L/R-Versatz (0.5 = alternierend)
   gait_cmd_threshold: 0.2         # [m/s] darunter kein Penalty
 
-  # swing_knee_flex (phasen-gekoppelt: extra Kniebeugung im Schwung, je Fuß)
-  swing_knee_flex_target: 0.15    # [rad] Mindest-Flex über Default-Knie während Swing+Luft
-  swing_knee_flex_sigma: 0.02     # Gauß-Breite um die Soll-Flexion
+  # swing_quality (Strafe: koppelt Schwung-Clearance feet_air_height_target + Kniebeugung)
+  swing_knee_flex_target: 0.15    # [rad] Soll-Flex über Default-Knie während Swing+Luft
 
   # torso_pitch (SPRINT r_reg: Vorne-Neigung via projected_gravity gx, aktiv Richtung gf)
   torso_pitch_target: 0.1         # gf: Soll-Vorne-Neigung (fix, nicht speed-abhängig)
@@ -167,37 +174,39 @@ reward_cfg:
 
   reward_scales:
     # task
-    tracking_lin_vel: 1.6   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
-    tracking_ang_vel: 0.5
+    tracking_lin_vel: 2.5   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
+    tracking_ang_vel: 0.6
     survival: 1.0
-    base_height: -40.0
-    #lin_vel_z: -0.5
+    base_height: -30.0
+    #lin_vel_z: -0.8
     #action_rate: -0.005
 
     # gait
-    feet_air_time: 10.0
+    feet_air_time: 5.0
     feet_slip: -2.0
-    gait_phase: -5.0
-    swing_clearance: -10.0
-    swing_knee_flex: 4.0
+    gait_phase: -3.0
+    # swing_quality = BELOHNUNG clear_score·flex_score: koppelt Schwung-Clearance UND Kniebeugung
+    # in EINER Metrik (ersetzt swing_clearance + swing_knee_flex). Magnitude ∈[0,1] je Fuß.
+    swing_quality: 3.5
 
     # SPRINT-Stil Fuß-Design
-    close_feet: -5.0
-    feet_air_height: 5.0
-    feet_parallel: 1.0
+    # feet_stance = STRAFE 1 − sep_score·parallel_score: koppelt Mindestabstand UND Parallelität in
+    # EINER Metrik (ersetzt close_feet + feet_parallel). Magnitude ∈[0,1], negativer Scale.
+    #feet_air_height: 5.0
     #feet_guidance: -15.0
 
     # foot style
-    foot_roll: 4.5
+    foot_roll: 4.5   # BELOHNUNG: aktives Heel-to-Toe-Abrollen (Roll-Güte) je Stance-Step, gegen steifen Pflock-Fuß
+    feet_stance: -3.5
     #flat_foot: -0.6
-    support_pose: 0.6
+    #support_pose: 1.5
 
     # regularizer
     dof_vel: -2.0e-4
     ang_vel_xy: -0.05
     ang_vel_z: -1.0
-    torso_pitch: -3.0
-    orientation: -5.0              # nur Roll (Pitch → torso_pitch)
+    #torso_pitch: -3.0
+    orientation: -5.0              # Roll² + Pitch² (Rumpf aufrecht; ersetzt deaktiviertes torso_pitch)
     #similar_to_default: -0.03
 
 command_cfg:
