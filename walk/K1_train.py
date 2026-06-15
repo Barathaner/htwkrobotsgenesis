@@ -101,7 +101,6 @@ def main() -> None:
         reward_cfg=reward_cfg,
         command_cfg=command_cfg,
         show_viewer=False,
-        num_steps_per_env=train_cfg_yaml["num_steps_per_env"],  # für Style-Curriculum (Iterationen)
     )
 
     print(

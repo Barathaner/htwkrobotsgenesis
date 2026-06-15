@@ -92,14 +92,6 @@ env_cfg:
   simulate_action_latency: true
   clip_actions: 100.0
 
-  # Hilfskraft-Curriculum: Schub am Rumpf-COM IN Kommandorichtung (Anschubhilfe), startet voll und
-  # fällt LINEAR über decay_steps auf scale_min. Nicht in der Obs. Eval: enabled=false.
-  assist:
-    enabled: false
-    force: 50.0             # [N] Schub in Kommandorichtung bei Step 0
-    decay_steps: 100000     # Steps bis zur vollständigen Ausblendung (linearer Abbau)
-    scale_min: 0.0          # Rest-Hilfe nach Abbau
-
 obs_cfg:
   obs_scales:
     lin_vel: 2.0
@@ -115,10 +107,12 @@ reward_cfg:
   # contact (net contact force on foot links, via RigidEntity.get_links_net_contact_force)
   foot_contact_force_threshold: 20.0  # [N] |F| on foot link above = in_contact
 
-  # feet_air_time (phasen-gekoppelt; Soll-Luftzeit = (1−stance_ratio)·gait_period_s)
-  feet_air_sigma: 0.02            # [s²] Gauß-Breite um die Soll-Schwungdauer
+  # feet_air_time (klassisch legged_gym: Bonus = air_time − target beim Aufsetzen)
+  feet_air_time_target: 0.3       # [s] Soll-Luftzeit je Schritt; darüber Bonus, darunter Malus
   feet_air_cmd_threshold: 0.15    # [m/s] darunter kein Reward
-  feet_air_decay: 0.99            # Zerfall/Step der On-Beat-Güte je Fuß (Symmetrie-Kopplung)
+
+  # leg_symmetry (alternierender Gang: ein Fuß schwingt, der andere stützt; dann Wechsel)
+  leg_symmetry_ds_allow_s: 0.15   # [s] erlaubte Doppelstütz-Dauer je Phase (natürl. (2·stance_ratio−1)·period/2 ≈ 0.11)
 
   # foot_roll (kontinuierliches Heel-to-Toe via Ankle_Pitch, stance-phasen-gekoppelt)
   ankle_heel_target: -0.15        # [rad] Stance-Start (Touchdown)
@@ -150,15 +144,6 @@ reward_cfg:
   push_vel_min: 0.3
   push_vel_max: 0.8
 
-  # Style-Curriculum: Stil-Strafen bleiben warmup_iters bei 0 (erst nacktes Gehen lernen), faden dann
-  # linear über ramp_iters auf 100 % und bleiben voll. Geglätteter Step (kurze Nicht-Stationarität,
-  # danach wieder stationäres Ziel). Nur beim Training aktiv; in eval/test sind die Strafen sofort voll.
-  style_curriculum:
-    enabled: true
-    warmup_iters: 800     # PPO-Iterationen mit style_scale=0 (Phase 1: Gehen lernen)
-    ramp_iters: 200       # PPO-Iterationen für den linearen 0→1 Anstieg danach
-    terms: [gait_phase, swing_quality, foot_roll, feet_slip,feet_air_time,]
-
   # gait phase-clock
   gait_period_s: 1.1              # [s] voller Schrittzyklus
   gait_stance_ratio: 0.6          # Stance-Anteil je Fuß
@@ -174,20 +159,24 @@ reward_cfg:
 
   reward_scales:
     # task
-    tracking_lin_vel: 2.5   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
-    tracking_ang_vel: 0.6
-    survival: 1.0
-    base_height: -30.0
-    #lin_vel_z: -0.8
-    #action_rate: -0.005
+    tracking_lin_vel: 1.5   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
+    tracking_ang_vel: 0.5
+    survival: 0.5
+    #base_height: -30.0
+    lin_vel_z: -1.0
+    action_rate: -0.5
 
     # gait
-    feet_air_time: 5.0
-    feet_slip: -2.0
+    feet_air_time: 3.0
+    #feet_slip: -1.0
     gait_phase: -3.0
+    # leg_symmetry = STRAFE für nicht-alternierenden Gang: both_air (Flugphase) sofort, Doppelstütze
+    # nur über das natürliche Fenster hinaus. Bündelt die früher in feet_air_time/foot_roll/swing_quality
+    # verteilte L/R-Kopplung in EINEN Term.
+    #leg_symmetry: -1.0
     # swing_quality = BELOHNUNG clear_score·flex_score: koppelt Schwung-Clearance UND Kniebeugung
     # in EINER Metrik (ersetzt swing_clearance + swing_knee_flex). Magnitude ∈[0,1] je Fuß.
-    swing_quality: 3.5
+    #swing_quality: 3.5
 
     # SPRINT-Stil Fuß-Design
     # feet_stance = STRAFE 1 − sep_score·parallel_score: koppelt Mindestabstand UND Parallelität in
@@ -196,17 +185,17 @@ reward_cfg:
     #feet_guidance: -15.0
 
     # foot style
-    foot_roll: 4.5   # BELOHNUNG: aktives Heel-to-Toe-Abrollen (Roll-Güte) je Stance-Step, gegen steifen Pflock-Fuß
-    feet_stance: -3.5
+    #foot_roll: 1.5   # BELOHNUNG: aktives Heel-to-Toe-Abrollen (Roll-Güte) je Stance-Step, gegen steifen Pflock-Fuß
+    #feet_stance: -3.5
     #flat_foot: -0.6
     #support_pose: 1.5
 
     # regularizer
     dof_vel: -2.0e-4
     ang_vel_xy: -0.05
-    ang_vel_z: -1.0
-    #torso_pitch: -3.0
-    orientation: -5.0              # Roll² + Pitch² (Rumpf aufrecht; ersetzt deaktiviertes torso_pitch)
+    ang_vel_z: -0.0
+    orientation: -2.0 
+    #torso_pitch: -3.0             # Roll² + Pitch² (Rumpf aufrecht; ersetzt deaktiviertes torso_pitch)
     #similar_to_default: -0.03
 
 command_cfg:
