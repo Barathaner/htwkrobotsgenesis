@@ -9,6 +9,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+*.zip
+*.mp4
+
 
 # --- Genesis & MuJoCo Runtime ---
 # MuJoCo generiert oft temporäre XMLs oder Cache-Files

@@ -831,7 +831,28 @@ class K1Env:
         # Per-Fuß-Versatz zur Rumpf-Mitte wäre NICHT kippsicher (±0.5·sinθ je Roll überdeckt die Spur).
         lateral_dist = torch.abs(left_base[:, 1] - right_base[:, 1])
         sep_score = torch.clamp(lateral_dist / self.reward_cfg["close_feet_d_min"], max=1.0)
-        return 1.0 - sep_score * parallel_score
+
+        # height_score: Gauß auf Höhenunterschied beider Füße (Weltkoordinaten), nur bei beidseitigem Kontakt.
+        foot_z = foot_pos[:, :, 2]  # (n,2)
+        height_diff = torch.abs(foot_z[:, 0] - foot_z[:, 1])
+        height_sigma = self.reward_cfg.get("feet_height_diff_sigma", 0.02)
+        both_contact = self.foot_in_contact[:, 0] & self.foot_in_contact[:, 1]
+        height_score = torch.where(
+            both_contact,
+            torch.exp(-height_diff / height_sigma),
+            torch.ones_like(height_diff),  # neutral wenn nur ein Fuß in Kontakt
+        )
+
+        return 1.0 - sep_score * parallel_score * height_score
+
+    def _reward_feet_not_both_contact(self):
+        """Strafe: mindestens ein Fuß hat keinen Bodenkontakt.
+
+        Gibt 1.0 zurück sobald nicht beide Füße gleichzeitig am Boden sind.
+        Mit negativem Scale im YAML wird fehlender beidseitiger Kontakt bestraft.
+        """
+        both_contact = self.foot_in_contact[:, 0] & self.foot_in_contact[:, 1]
+        return (~both_contact).to(gs.tc_float)
 
     def _reward_feet_air_height(self):
         """Belohnung: Schwungfuß hält eine saubere Soll-Flughöhe (Gauß um feet_air_height_target).
