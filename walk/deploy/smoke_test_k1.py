@@ -343,19 +343,128 @@ class RobotStateBuffer:
 # SDK command builder
 # ---------------------------------------------------------------------------
 
-def build_low_cmd(
-    target_dof_pos: list[float],              # URDF policy order (16 joints)
-    current_crank_pos: tuple[float, float, float, float],  # (up_l, dn_l, up_r, dn_r)
-) -> LowCmd:
-    """Map 16-DOF URDF targets → 22-motor K1 LowCmd (K1Ji ordering, SERIAL mode).
+_K1JI_NAMES: dict[int, str] = {
+    K1Ji.kHeadYaw:            "HeadYaw",
+    K1Ji.kHeadPitch:          "HeadPitch",
+    K1Ji.kLeftShoulderPitch:  "L_ShoulderPitch",
+    K1Ji.kLeftShoulderRoll:   "L_ShoulderRoll",
+    K1Ji.kLeftElbowPitch:     "L_ElbowPitch",
+    K1Ji.kLeftElbowYaw:       "L_ElbowYaw",
+    K1Ji.kRightShoulderPitch: "R_ShoulderPitch",
+    K1Ji.kRightShoulderRoll:  "R_ShoulderRoll",
+    K1Ji.kRightElbowPitch:    "R_ElbowPitch",
+    K1Ji.kRightElbowYaw:      "R_ElbowYaw",
+    K1Ji.kLeftHipPitch:       "L_HipPitch",
+    K1Ji.kLeftHipRoll:        "L_HipRoll",
+    K1Ji.kLeftHipYaw:         "L_HipYaw",
+    K1Ji.kLeftKneePitch:      "L_KneePitch",
+    K1Ji.kCrankUpLeft:        "L_CrankUp",
+    K1Ji.kCrankDownLeft:      "L_CrankDown",
+    K1Ji.kRightHipPitch:      "R_HipPitch",
+    K1Ji.kRightHipRoll:       "R_HipRoll",
+    K1Ji.kRightHipYaw:        "R_HipYaw",
+    K1Ji.kRightKneePitch:     "R_KneePitch",
+    K1Ji.kCrankUpRight:       "R_CrankUp",
+    K1Ji.kCrankDownRight:     "R_CrankDown",
+}
 
-    Crank joints use the torque approach (kp=0) to avoid issues with the
-    parallel-linkage non-linearity: tau = clip((target-current)×stiffness, ±limit).
-    All other joints use position control (kp/kd from SDK_JOINT_GAINS).
+
+def dump_debug(
+    state_buf: "RobotStateBuffer",
+    dof_pos: list[float],
+    dof_vel: list[float],
+    filtered_dof_pos: list[float],
+    low_cmd: "LowCmd",
+    path: str = "joint_debug.txt",
+) -> None:
+    """Write a one-shot snapshot of joint state and commands to *path*.
+
+    Section 1 — Raw SDK motor slots (what the SDK gives us):
+        serial[i] and parallel[i] with their K1Ji index and name.
+    Section 2 — URDF policy mapping (what the policy sees / commands):
+        JOINT_NAMES order with observed pos, default, filtered target.
+    Section 3 — LowCmd sent to robot:
+        Every K1Ji slot: name, q, tau, kp, kd.
     """
-    motor_cmds = [MotorCmd() for _ in range(K1_JOINT_CNT)]
+    s = state_buf._state
+    ms = s.motor_state_serial
+    mp = s.motor_state_parallel
 
-    # Policy targets in URDF order
+    lines: list[str] = []
+
+    lines.append("=" * 70)
+    lines.append("SECTION 1 — Raw SDK motor_state_serial")
+    lines.append(f"  len(motor_state_serial)  = {len(ms)}")
+    lines.append(f"{'serial_idx':>10}  {'K1Ji_idx':>8}  {'K1Ji_name':<18}  {'q':>10}  {'dq':>10}")
+    for i, m in enumerate(ms):
+        k1name = _K1JI_NAMES.get(i, "???")
+        lines.append(f"  serial[{i:2d}]    K1Ji[{i:2d}]   {k1name:<18}  {m.q:+10.4f}  {m.dq:+10.4f}")
+
+    lines.append("")
+    lines.append("SECTION 1b — Raw SDK motor_state_parallel")
+    lines.append(f"  len(motor_state_parallel) = {len(mp)}")
+    lines.append(f"{'par_idx':>10}  {'K1Ji_idx':>8}  {'K1Ji_name':<18}  {'q':>10}  {'dq':>10}")
+    for i, m in enumerate(mp):
+        k1_idx = i + K1_LEG_OFFSET
+        k1name = _K1JI_NAMES.get(k1_idx, "???")
+        lines.append(f"  par[{i:2d}]      K1Ji[{k1_idx:2d}]   {k1name:<18}  {m.q:+10.4f}  {m.dq:+10.4f}")
+
+    lines.append("")
+    lines.append("SECTION 2 — URDF policy joint order (16 joints)")
+    lines.append(f"  {'#':>2}  {'URDF_name':<24}  {'obs_pos':>10}  {'default':>10}  {'filtered_tgt':>12}")
+    for i, (name, obs, default, tgt) in enumerate(
+        zip(JOINT_NAMES, dof_pos, DEFAULT_DOF_POS.tolist(), filtered_dof_pos)
+    ):
+        lines.append(f"  {i:2d}  {name:<24}  {obs:+10.4f}  {default:+10.4f}  {tgt:+12.4f}")
+
+    lines.append("")
+    lines.append("SECTION 3 — LowCmd sent to robot (K1Ji order, 22 slots)")
+    lines.append(f"  {'K1Ji_idx':>8}  {'K1Ji_name':<18}  {'q':>10}  {'tau':>10}  {'kp':>6}  {'kd':>6}  ctrl")
+    for i in range(K1_JOINT_CNT):
+        mc = low_cmd.motor_cmd[i]
+        ctrl = "TORQUE" if i in K1_CRANK_INDICES else "pos"
+        name = _K1JI_NAMES.get(i, "???")
+        lines.append(
+            f"  K1Ji[{i:2d}]   {name:<18}  {mc.q:+10.4f}  {mc.tau:+10.4f}"
+            f"  {mc.kp:6.1f}  {mc.kd:6.1f}  {ctrl}"
+        )
+
+    lines.append("=" * 70)
+    text = "\n".join(lines) + "\n"
+    with open(path, "w") as f:
+        f.write(text)
+    print(f"[debug] joint snapshot written to {path}")
+
+
+def alloc_low_cmd() -> LowCmd:
+    """Allocate the LowCmd once; reuse it every step via update_low_cmd()."""
+    motor_cmds = [MotorCmd() for _ in range(K1_JOINT_CNT)]
+    low_cmd = LowCmd()
+    low_cmd.cmd_type = LowCmdType.SERIAL
+    low_cmd.motor_cmd = motor_cmds
+    # Write constant fields once (kp/kd for non-crank joints never change)
+    for idx in range(K1_JOINT_CNT):
+        kp, kd, _ = SDK_JOINT_GAINS.get(idx, (0.0, 0.0, 0.0))
+        mc = low_cmd.motor_cmd[idx]
+        mc.dq     = 0.0
+        mc.weight = 0.0
+        mc.kp     = kp   # 0.0 for crank joints (torque mode)
+        mc.kd     = kd
+        mc.tau    = 0.0
+        mc.q      = 0.0
+    return low_cmd
+
+
+def update_low_cmd(
+    low_cmd: LowCmd,
+    target_dof_pos: list[float],
+    current_crank_pos: tuple[float, float, float, float],
+) -> None:
+    """Update the pre-allocated LowCmd in-place (no heap allocation per step).
+
+    Crank joints: kp=0, tau = clip((target−current)×stiffness, ±limit).
+    All other joints: position control, kp/kd already set in alloc_low_cmd.
+    """
     (
         l_sh_pitch, l_el_yaw,
         r_sh_pitch, r_el_yaw,
@@ -369,61 +478,38 @@ def build_low_cmd(
     r_crank_up_tgt, r_crank_dn_tgt = ankle_to_crank(r_ank_p, r_ank_r)
     crank_cur_ul, crank_cur_dl, crank_cur_ur, crank_cur_dr = current_crank_pos
 
-    # Position targets for all joints (K1Ji indices)
-    pos_targets: dict[int, float] = {
-        K1Ji.kLeftShoulderPitch:  l_sh_pitch,
-        K1Ji.kLeftElbowYaw:       l_el_yaw,
-        K1Ji.kRightShoulderPitch: r_sh_pitch,
-        K1Ji.kRightElbowYaw:      r_el_yaw,
-        K1Ji.kLeftHipPitch:       l_hip_p,
-        K1Ji.kLeftHipRoll:        l_hip_r,
-        K1Ji.kLeftHipYaw:         l_hip_y,
-        K1Ji.kLeftKneePitch:      l_knee,
-        K1Ji.kRightHipPitch:      r_hip_p,
-        K1Ji.kRightHipRoll:       r_hip_r,
-        K1Ji.kRightHipYaw:        r_hip_y,
-        K1Ji.kRightKneePitch:     r_knee,
-        # Fixed joints
-        K1Ji.kHeadYaw:            FIXED_JOINT_DEFAULTS["AAHead_yaw"],
-        K1Ji.kHeadPitch:          FIXED_JOINT_DEFAULTS["Head_pitch"],
-        K1Ji.kLeftShoulderRoll:   FIXED_JOINT_DEFAULTS["Left_Shoulder_Roll"],
-        K1Ji.kRightShoulderRoll:  FIXED_JOINT_DEFAULTS["Right_Shoulder_Roll"],
-        K1Ji.kLeftElbowPitch:     FIXED_JOINT_DEFAULTS["Left_Elbow_Pitch"],
-        K1Ji.kRightElbowPitch:    FIXED_JOINT_DEFAULTS["Right_Elbow_Pitch"],
-    }
+    mc = low_cmd.motor_cmd
 
-    # Torque targets for crank joints (target crank position, current crank position)
-    crank_torque: dict[int, tuple[float, float, float]] = {
-        K1Ji.kCrankUpLeft:   (l_crank_up_tgt, crank_cur_ul, CRANK_STIFFNESS[K1Ji.kCrankUpLeft]),
-        K1Ji.kCrankDownLeft: (l_crank_dn_tgt, crank_cur_dl, CRANK_STIFFNESS[K1Ji.kCrankDownLeft]),
-        K1Ji.kCrankUpRight:  (r_crank_up_tgt, crank_cur_ur, CRANK_STIFFNESS[K1Ji.kCrankUpRight]),
-        K1Ji.kCrankDownRight:(r_crank_dn_tgt, crank_cur_dr, CRANK_STIFFNESS[K1Ji.kCrankDownRight]),
-    }
+    # Position-controlled joints
+    mc[K1Ji.kHeadYaw].q           = FIXED_JOINT_DEFAULTS["AAHead_yaw"]
+    mc[K1Ji.kHeadPitch].q         = FIXED_JOINT_DEFAULTS["Head_pitch"]
+    mc[K1Ji.kLeftShoulderPitch].q  = l_sh_pitch
+    mc[K1Ji.kLeftShoulderRoll].q   = FIXED_JOINT_DEFAULTS["Left_Shoulder_Roll"]
+    mc[K1Ji.kLeftElbowPitch].q     = FIXED_JOINT_DEFAULTS["Left_Elbow_Pitch"]
+    mc[K1Ji.kLeftElbowYaw].q       = l_el_yaw
+    mc[K1Ji.kRightShoulderPitch].q = r_sh_pitch
+    mc[K1Ji.kRightShoulderRoll].q  = FIXED_JOINT_DEFAULTS["Right_Shoulder_Roll"]
+    mc[K1Ji.kRightElbowPitch].q    = FIXED_JOINT_DEFAULTS["Right_Elbow_Pitch"]
+    mc[K1Ji.kRightElbowYaw].q      = r_el_yaw
+    mc[K1Ji.kLeftHipPitch].q       = l_hip_p
+    mc[K1Ji.kLeftHipRoll].q        = l_hip_r
+    mc[K1Ji.kLeftHipYaw].q         = l_hip_y
+    mc[K1Ji.kLeftKneePitch].q      = l_knee
+    mc[K1Ji.kRightHipPitch].q      = r_hip_p
+    mc[K1Ji.kRightHipRoll].q       = r_hip_r
+    mc[K1Ji.kRightHipYaw].q        = r_hip_y
+    mc[K1Ji.kRightKneePitch].q     = r_knee
 
-    low_cmd = LowCmd()
-    low_cmd.cmd_type = LowCmdType.SERIAL
-    low_cmd.motor_cmd = motor_cmds
+    # Torque-controlled crank joints
+    def _crank(idx: int, tgt: float, cur: float) -> None:
+        _, _, limit = SDK_JOINT_GAINS[idx]
+        mc[idx].q   = cur   # hold current position; no position-mode jump
+        mc[idx].tau = max(-limit, min(limit, (tgt - cur) * CRANK_STIFFNESS[idx]))
 
-    for idx in range(K1_JOINT_CNT):
-        _, kd, effort_limit = SDK_JOINT_GAINS.get(idx, (0.0, 0.0, 0.0))
-        mc = low_cmd.motor_cmd[idx]
-        mc.dq     = 0.0
-        mc.weight = 0.0
-
-        if idx in crank_torque:
-            tgt, cur, stiff = crank_torque[idx]
-            mc.q   = cur                                          # hold current to avoid position jump
-            mc.kp  = 0.0
-            mc.kd  = kd
-            mc.tau = max(-effort_limit, min(effort_limit, (tgt - cur) * stiff))
-        else:
-            kp, _, _ = SDK_JOINT_GAINS.get(idx, (0.0, 0.0, 0.0))
-            mc.q   = pos_targets.get(idx, 0.0)
-            mc.kp  = kp
-            mc.kd  = kd
-            mc.tau = 0.0
-
-    return low_cmd
+    _crank(K1Ji.kCrankUpLeft,    l_crank_up_tgt, crank_cur_ul)
+    _crank(K1Ji.kCrankDownLeft,  l_crank_dn_tgt, crank_cur_dl)
+    _crank(K1Ji.kCrankUpRight,   r_crank_up_tgt, crank_cur_ur)
+    _crank(K1Ji.kCrankDownRight, r_crank_dn_tgt, crank_cur_dr)
 
 
 def damp_cmd() -> LowCmd:
@@ -539,6 +625,7 @@ def run(args: argparse.Namespace) -> None:
     fall_detected = False
     t_start = time.monotonic()
     t_next  = t_start
+    low_cmd = alloc_low_cmd()   # allocate once; updated in-place each step
 
     while running:
         now = time.monotonic()
@@ -591,8 +678,12 @@ def run(args: argparse.Namespace) -> None:
         ]
 
         # --- send command ---
-        low_cmd = build_low_cmd(filtered_dof_pos, state_buf.get_crank_pos())
+        update_low_cmd(low_cmd, filtered_dof_pos, state_buf.get_crank_pos())
         publisher.Write(low_cmd)
+
+        # --- one-shot debug dump on first step ---
+        if step == 0:
+            dump_debug(state_buf, dof_pos, dof_vel, filtered_dof_pos, low_cmd)
 
         # --- advance phase clock ---
         gait_phase = (gait_phase + 1.0 / GAIT_PERIOD_STEPS) % 1.0
