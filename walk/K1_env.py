@@ -1,6 +1,8 @@
 import math
+import os
 
 import genesis as gs
+import numpy as np
 import torch
 from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat, xyz_to_quat
 from tensordict import TensorDict
@@ -216,6 +218,12 @@ class K1Env:
         # zusammenhängende Doppelstütze; Gemeinsames Stehen darüber hinaus wird bestraft.
         self.ds_allow_time = float(self.reward_cfg["leg_symmetry_ds_allow_s"])
 
+        # style (feature-matching Style-Reward): belohnt Nähe der Live-Bewegung zur NPZ-Referenz im
+        # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
+        self.style_enabled = "style" in self.reward_scales
+        if self.style_enabled:
+            self._setup_style_reference()
+
         # Obs nur aus deploy-fähigen Größen (IMU + Gelenke + commands + letzte Aktion). base_lin_vel_heading
         # (privilegiert, auf der Hardware nicht messbar) und feet_contact (Deploy liefert nur Fake) sind
         # bewusst NICHT in der Obs — sie bleiben aber als Reward-Eingang erhalten (tracking_lin_vel bzw.
@@ -244,6 +252,49 @@ class K1Env:
             self.episode_sums[name] = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
 
         self.reset()
+
+    def _setup_style_reference(self):
+        """Lädt die NPZ-Referenz und baut die standardisierte Style-Feature-Matrix (siehe
+        _reward_style). Feature je Frame: [root_height(1), projected_gravity(3), dof_pos(16),
+        dof_vel(16), foot_clear(2)] = 38 — identische Definition für Referenz und Live, alle
+        Größen frame-konsistent (kein Phasen-Clock, timing-/speed-agnostisch).
+        """
+        path = self.reward_cfg["style_motion_file"]
+        if not os.path.isabs(path):
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.path.join(repo_root, path)
+        data = np.load(path, allow_pickle=True)
+
+        # 22-DOF-Referenz (NPZ joint_names) → 16 policy-Gelenke in env-Action-Reihenfolge (by name),
+        # damit ref dof_pos/dof_vel spaltenweise zu self.dof_pos/self.dof_vel passen.
+        ref_jn = [str(n) for n in data["joint_names"]]
+        col = [ref_jn.index(n) for n in self.env_cfg["joint_names"]]
+        ref = np.concatenate(
+            [
+                data["root_pos"][:, 2:3],          # root height
+                data["projected_gravity"],          # (M,3) Schwerkraft im Body-Frame (Rumpfneigung)
+                data["dof_pos"][:, col],            # (M,16)
+                data["dof_vel"][:, col],            # (M,16) rad/s
+                data["foot_clear"],                 # (M,2) Schwunghöhe je Fuß
+            ],
+            axis=1,
+        ).astype(np.float32)
+
+        mean = ref.mean(0)
+        std = ref.std(0) + 1e-6  # per-Feature standardisieren → Distanz nicht von dof_vel dominiert
+        self.style_feat_dim = ref.shape[1]
+        self.style_sigma = float(self.reward_cfg.get("style_sigma", 1.0))
+        self.style_mean = torch.tensor(mean, dtype=gs.tc_float, device=gs.device)
+        self.style_std = torch.tensor(std, dtype=gs.tc_float, device=gs.device)
+        self.style_ref_feat = torch.tensor((ref - mean) / std, dtype=gs.tc_float, device=gs.device)
+
+        # Steh-Fußhöhe (FK auf Default-Pose) als Live-Clearance-Nulllinie — passt zur per-Fuß-Ground
+        # der Referenz (foot_clear = z − Steh-z), siehe build_motion_reference.
+        q0 = self.init_qpos.unsqueeze(0).expand(self.num_envs, -1).contiguous()
+        links_pos, _ = self.robot.forward_kinematics(q0)
+        self.style_ground_z = links_pos[0, self.feet_link_idx, 2].clone()  # (2,)
+        print(f"[style] ref={self.style_ref_feat.shape[0]} frames  feat_dim={self.style_feat_dim}  "
+              f"sigma={self.style_sigma}  ground_z={np.round(self.style_ground_z.cpu().numpy(), 3)}")
 
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
@@ -508,18 +559,6 @@ class K1Env:
         """
         return (~self._termination_mask()).to(gs.tc_float)
 
-    def _reward_lin_vel_z(self):
-        """Strafe: nicht in der Höhe hopsen (vz soll ≈ 0).
-
-        Quadriert die vertikale Geschwindigkeit des Rumpfes.
-
-        Beispiel (scale=-1.0, dt=0.02):
-          vz=0.0   → return 0      → 0/Step
-          vz=0.1   → return 0.01   → -0.01/Step
-          vz=0.5   → return 0.25   → -0.25/Step
-        """
-        return torch.square(self.base_lin_vel[:, 2])
-
     def _reward_action_rate(self):
         """Strafe: Aktionen sollen sich nicht ruckartig ändern (glatte Bewegung).
 
@@ -563,6 +602,32 @@ class K1Env:
         slip = torch.sum(torch.square(foot_vel_xy), dim=2)  # (n,2)
         return (slip * self.foot_in_contact.to(gs.tc_float)).sum(dim=1)
 
+
+    def _reward_style(self):
+        """Belohnung: Live-Bewegung sieht aus wie die NPZ-Referenz (feature-matching, nicht-adversariell).
+
+        Baut je Step dasselbe 38-dim Feature wie die Referenz (root_height, projected_gravity, dof_pos,
+        dof_vel, foot_clear), standardisiert mit den Referenz-Statistiken und misst die Distanz zum
+        NÄCHSTEN Referenz-Frame im Feature-Raum. Da dof_vel/foot_clear enthalten sind, kodiert das
+        BEWEGUNG (eine eingefrorene Pose hat v=0 → weit weg vom Jog) — timing-/speed-agnostisch, kein
+        Phasen-Clock. r = exp(−mean_sq_z / (2σ²)) ∈ (0,1]: 1 wenn die Pose+Dynamik im Schnitt < σ Std
+        von einem Referenz-Frame entfernt ist.
+
+        Beispiel (σ=1.0, scale positiv → *dt):
+          Bewegung trifft Referenz-Stil    → mean_sq_z≈0   → r≈1
+          im Schnitt 1 Std daneben         → mean_sq_z≈1   → r≈0.61
+          völlig anderer Gang/steif        → mean_sq_z groß → r→0
+        """
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]  # (n,2)
+        foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
+        feat = torch.cat(
+            [self.base_pos[:, 2:3], self.projected_gravity, self.dof_pos, self.dof_vel, foot_clear], dim=1
+        )
+        feat = (feat - self.style_mean) / self.style_std
+        # nächster Referenz-Frame je Env: min ||feat − ref_k||² (in Std-Einheiten), gemittelt über Features
+        min_sq = torch.cdist(feat, self.style_ref_feat).pow(2).min(dim=1).values
+        mean_sq = min_sq / self.style_feat_dim
+        return torch.exp(-mean_sq / (2.0 * self.style_sigma**2))
 
     def _reward_leg_symmetry(self):
         """Strafe: Beine laufen nicht alternierend (anti-phasig: ein Fuß schwingt, der andere stützt).

@@ -107,18 +107,20 @@ reward_cfg:
 
   # feet_air_time (klassisch legged_gym: Bonus = air_time − target beim Aufsetzen)
   feet_air_time_target: 0.3       # [s] Soll-Luftzeit je Schritt; darüber Bonus, darunter Malus
-  feet_air_cmd_threshold: 0.15    # [m/s] darunter kein Reward
+  feet_air_cmd_threshold: 0.05    # [m/s] darunter kein Reward
 
   # leg_symmetry (alternierender Gang: ein Fuß schwingt, der andere stützt; dann Wechsel)
   leg_symmetry_ds_allow_s: 0.15   # [s] erlaubte Doppelstütz-Dauer je Phase (natürl. (2·stance_ratio−1)·period/2 ≈ 0.11)
 
+  # style (feature-matching Style-Reward gegen eine NPZ-Referenzmotion, siehe K1_env._reward_style)
+  style_motion_file: walk/data/motions/k1_jogging_motion.npz  # relativ zur Repo-Root
+  style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); kleiner = strenger an der Referenz
 
   reward_scales:
     # task
-    tracking_lin_vel: 1.5   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
+    tracking_lin_vel: 1.7   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
     tracking_ang_vel: 0.5
-    survival: 0.5
-    lin_vel_z: -1.0
+    survival: 0.7
     action_rate: -0.5
 
 
@@ -127,6 +129,8 @@ reward_cfg:
     feet_slip: -1.0
     leg_symmetry: -1.0
 
+    # style: Belohnung für Bewegung im Stil der NPZ-Referenz (feature-matching, ∈[0,1])
+    style: 0.5
 
     # regularizer
     dof_vel: -2.0e-4
