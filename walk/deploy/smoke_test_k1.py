@@ -249,36 +249,30 @@ class RobotStateBuffer:
     returns.  Storing self._state = state and reading it later from the main
     thread is a use-after-free → segfault.  Instead we copy every value we
     need into plain Python floats inside update(), which is safe.
+
+    Joint layout: motor_state_serial has ALL 22 K1 joints in K1Ji order
+    (indices 0-21).  motor_state_parallel mirrors the same 22 slots but
+    provides different sensor data (not used for state here).  This matches
+    exactly what every working K1 deploy script does.
     """
 
-    # K1: 10 serial (head+arms) + 12 parallel (legs)
-    _N_SERIAL   = 10
-    _N_PARALLEL = 12
-
     def __init__(self) -> None:
-        self._ready     = False
-        self._sq  = [0.0] * self._N_SERIAL    # serial   q
-        self._sdq = [0.0] * self._N_SERIAL    # serial   dq
-        self._pq  = [0.0] * self._N_PARALLEL  # parallel q
-        self._pdq = [0.0] * self._N_PARALLEL  # parallel dq
-        self._gyro  = [0.0, 0.0, 0.0]
-        self._rpy   = [0.0, 0.0, 0.0]
-        # keep the raw lists for the debug dump (populated once inside update)
+        self._ready = False
+        self._q   = [0.0] * K1_JOINT_CNT   # q  for all K1Ji 0-21, from serial
+        self._dq  = [0.0] * K1_JOINT_CNT   # dq for all K1Ji 0-21, from serial
+        self._gyro = [0.0, 0.0, 0.0]
+        self._rpy  = [0.0, 0.0, 0.0]
         self._raw_serial_len   = 0
         self._raw_parallel_len = 0
 
     def update(self, state) -> None:
         """Called on the SDK background thread; copy everything out immediately."""
         ms = state.motor_state_serial
-        mp = state.motor_state_parallel
         self._raw_serial_len   = len(ms)
-        self._raw_parallel_len = len(mp)
-        for i in range(min(len(ms), self._N_SERIAL)):
-            self._sq[i]  = ms[i].q
-            self._sdq[i] = ms[i].dq
-        for i in range(min(len(mp), self._N_PARALLEL)):
-            self._pq[i]  = mp[i].q
-            self._pdq[i] = mp[i].dq
+        self._raw_parallel_len = len(state.motor_state_parallel)
+        for i in range(min(len(ms), K1_JOINT_CNT)):
+            self._q[i]  = ms[i].q
+            self._dq[i] = ms[i].dq
         imu = state.imu_state
         self._gyro[0] = imu.gyro[0]; self._gyro[1] = imu.gyro[1]; self._gyro[2] = imu.gyro[2]
         self._rpy[0]  = imu.rpy[0];  self._rpy[1]  = imu.rpy[1];  self._rpy[2]  = imu.rpy[2]
@@ -288,53 +282,46 @@ class RobotStateBuffer:
     def ready(self) -> bool:
         return self._ready
 
-    def _q(self, k1_idx: int) -> float:
-        if k1_idx < self._N_SERIAL:
-            return self._sq[k1_idx]
-        return self._pq[k1_idx - K1_LEG_OFFSET]
-
-    def _dq(self, k1_idx: int) -> float:
-        if k1_idx < self._N_SERIAL:
-            return self._sdq[k1_idx]
-        return self._pdq[k1_idx - K1_LEG_OFFSET]
-
     def get_dof_pos_vel(self) -> tuple[list[float], list[float]]:
         """Return (dof_pos, dof_vel) in URDF policy order (16 joints)."""
-        l_ap, l_ar     = crank_to_ankle(self._q(K1Ji.kCrankUpLeft),   self._q(K1Ji.kCrankDownLeft))
-        r_ap, r_ar     = crank_to_ankle(self._q(K1Ji.kCrankUpRight),  self._q(K1Ji.kCrankDownRight))
-        l_ap_v, l_ar_v = crank_to_ankle(self._dq(K1Ji.kCrankUpLeft),  self._dq(K1Ji.kCrankDownLeft))
-        r_ap_v, r_ar_v = crank_to_ankle(self._dq(K1Ji.kCrankUpRight), self._dq(K1Ji.kCrankDownRight))
+        q  = self._q
+        dq = self._dq
+
+        l_ap, l_ar     = crank_to_ankle(q[K1Ji.kCrankUpLeft],   q[K1Ji.kCrankDownLeft])
+        r_ap, r_ar     = crank_to_ankle(q[K1Ji.kCrankUpRight],  q[K1Ji.kCrankDownRight])
+        l_ap_v, l_ar_v = crank_to_ankle(dq[K1Ji.kCrankUpLeft],  dq[K1Ji.kCrankDownLeft])
+        r_ap_v, r_ar_v = crank_to_ankle(dq[K1Ji.kCrankUpRight], dq[K1Ji.kCrankDownRight])
 
         pos = [
-            self._q(K1Ji.kLeftShoulderPitch),
-            self._q(K1Ji.kLeftElbowYaw),
-            self._q(K1Ji.kRightShoulderPitch),
-            self._q(K1Ji.kRightElbowYaw),
-            self._q(K1Ji.kLeftHipPitch),
-            self._q(K1Ji.kLeftHipRoll),
-            self._q(K1Ji.kLeftHipYaw),
-            self._q(K1Ji.kLeftKneePitch),
+            q[K1Ji.kLeftShoulderPitch],
+            q[K1Ji.kLeftElbowYaw],
+            q[K1Ji.kRightShoulderPitch],
+            q[K1Ji.kRightElbowYaw],
+            q[K1Ji.kLeftHipPitch],
+            q[K1Ji.kLeftHipRoll],
+            q[K1Ji.kLeftHipYaw],
+            q[K1Ji.kLeftKneePitch],
             l_ap, l_ar,
-            self._q(K1Ji.kRightHipPitch),
-            self._q(K1Ji.kRightHipRoll),
-            self._q(K1Ji.kRightHipYaw),
-            self._q(K1Ji.kRightKneePitch),
+            q[K1Ji.kRightHipPitch],
+            q[K1Ji.kRightHipRoll],
+            q[K1Ji.kRightHipYaw],
+            q[K1Ji.kRightKneePitch],
             r_ap, r_ar,
         ]
         vel = [
-            self._dq(K1Ji.kLeftShoulderPitch),
-            self._dq(K1Ji.kLeftElbowYaw),
-            self._dq(K1Ji.kRightShoulderPitch),
-            self._dq(K1Ji.kRightElbowYaw),
-            self._dq(K1Ji.kLeftHipPitch),
-            self._dq(K1Ji.kLeftHipRoll),
-            self._dq(K1Ji.kLeftHipYaw),
-            self._dq(K1Ji.kLeftKneePitch),
+            dq[K1Ji.kLeftShoulderPitch],
+            dq[K1Ji.kLeftElbowYaw],
+            dq[K1Ji.kRightShoulderPitch],
+            dq[K1Ji.kRightElbowYaw],
+            dq[K1Ji.kLeftHipPitch],
+            dq[K1Ji.kLeftHipRoll],
+            dq[K1Ji.kLeftHipYaw],
+            dq[K1Ji.kLeftKneePitch],
             l_ap_v, l_ar_v,
-            self._dq(K1Ji.kRightHipPitch),
-            self._dq(K1Ji.kRightHipRoll),
-            self._dq(K1Ji.kRightHipYaw),
-            self._dq(K1Ji.kRightKneePitch),
+            dq[K1Ji.kRightHipPitch],
+            dq[K1Ji.kRightHipRoll],
+            dq[K1Ji.kRightHipYaw],
+            dq[K1Ji.kRightKneePitch],
             r_ap_v, r_ar_v,
         ]
         return pos, vel
@@ -347,10 +334,10 @@ class RobotStateBuffer:
 
     def get_crank_pos(self) -> tuple[float, float, float, float]:
         return (
-            self._pq[K1Ji.kCrankUpLeft    - K1_LEG_OFFSET],
-            self._pq[K1Ji.kCrankDownLeft  - K1_LEG_OFFSET],
-            self._pq[K1Ji.kCrankUpRight   - K1_LEG_OFFSET],
-            self._pq[K1Ji.kCrankDownRight - K1_LEG_OFFSET],
+            self._q[K1Ji.kCrankUpLeft],
+            self._q[K1Ji.kCrankDownLeft],
+            self._q[K1Ji.kCrankUpRight],
+            self._q[K1Ji.kCrankDownRight],
         )
 
 
@@ -407,24 +394,14 @@ def dump_debug(
     lines: list[str] = []
 
     lines.append("=" * 70)
-    lines.append("SECTION 1 — Copied motor_state_serial values")
+    lines.append("SECTION 1 — motor_state_serial (all 22 K1 joints)")
     lines.append(f"  raw len at last callback: serial={state_buf._raw_serial_len}"
                  f"  parallel={state_buf._raw_parallel_len}")
-    lines.append(f"  {'serial_idx':>10}  {'K1Ji_idx':>8}  {'K1Ji_name':<18}  {'q':>10}  {'dq':>10}")
-    for i in range(state_buf._N_SERIAL):
+    lines.append(f"  {'K1Ji_idx':>8}  {'K1Ji_name':<18}  {'q':>10}  {'dq':>10}")
+    for i in range(K1_JOINT_CNT):
         lines.append(
-            f"  serial[{i:2d}]    K1Ji[{i:2d}]   {_K1JI_NAMES.get(i,'???'):<18}"
-            f"  {state_buf._sq[i]:+10.4f}  {state_buf._sdq[i]:+10.4f}"
-        )
-
-    lines.append("")
-    lines.append("SECTION 1b — Copied motor_state_parallel values")
-    lines.append(f"  {'par_idx':>10}  {'K1Ji_idx':>8}  {'K1Ji_name':<18}  {'q':>10}  {'dq':>10}")
-    for i in range(state_buf._N_PARALLEL):
-        k1_idx = i + K1_LEG_OFFSET
-        lines.append(
-            f"  par[{i:2d}]      K1Ji[{k1_idx:2d}]   {_K1JI_NAMES.get(k1_idx,'???'):<18}"
-            f"  {state_buf._pq[i]:+10.4f}  {state_buf._pdq[i]:+10.4f}"
+            f"  K1Ji[{i:2d}]   {_K1JI_NAMES.get(i,'???'):<18}"
+            f"  {state_buf._q[i]:+10.4f}  {state_buf._dq[i]:+10.4f}"
         )
 
     lines.append("")
