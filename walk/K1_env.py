@@ -224,6 +224,18 @@ class K1Env:
         if self.style_enabled:
             self._setup_style_reference()
 
+        # Assist-Force-Curriculum: zieht den Trunk in Kommandorichtung; Stärke fällt linear auf 0 bei
+        # decay_end_iter. cur_iteration wird vom Runner je Lern-Iteration gesetzt; bleibt es None
+        # (Eval/Video), wird keine Kraft angewandt (s. _apply_assist_force).
+        self.cur_iteration = None
+        self.assist_force_cfg = env_cfg.get("assist_force")
+        if self.assist_force_cfg is not None:
+            self.assist_force_start = float(self.assist_force_cfg["start_n"])
+            self.assist_decay_end_iter = int(self.assist_force_cfg["decay_end_iter"])
+            self.trunk_link_idx = self.robot.get_link("Trunk").idx  # globaler Solver-Index
+            self._assist_force = torch.zeros((num_envs, 1, 3), dtype=gs.tc_float, device=gs.device)
+            self.assist_force_mag = 0.0  # aktuelle Zugkraft [N] (für wandb-Logging, s. step())
+
         # Obs nur aus deploy-fähigen Größen (IMU + Gelenke + commands + letzte Aktion). base_lin_vel_heading
         # (privilegiert, auf der Hardware nicht messbar) und feet_contact (Deploy liefert nur Fake) sind
         # bewusst NICHT in der Obs — sie bleiben aber als Reward-Eingang erhalten (tracking_lin_vel bzw.
@@ -327,6 +339,7 @@ class K1Env:
             self.fixed_target[:, self.fixed_actions_dof_idx],
             self.fixed_dof_idx,
         )
+        self._apply_assist_force()
         self.scene.step()
 
         self.episode_length_buf += 1
@@ -361,12 +374,40 @@ class K1Env:
         self.extras["time_outs"] = (self.episode_length_buf > self.max_episode_length).to(dtype=gs.tc_float)
 
         self._reset_idx(self.reset_buf)
+
+        # Assist-Force-Curriculum in wandb loggen (nach _reset_idx, das extras["episode"] neu aufbaut).
+        # Nur im Training (cur_iteration gesetzt); ep_extras wird je Step gemittelt → Kurve über Iterationen.
+        if self.assist_force_cfg is not None and self.cur_iteration is not None:
+            self.extras["episode"]["assist_force_n"] = torch.tensor(self.assist_force_mag, device=self.device)
+
         self._update_observation()
 
         self.last_actions.copy_(self.actions)
         self.last_dof_vel.copy_(self.dof_vel)
 
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
+
+    def _apply_assist_force(self):
+        """Curriculum-Hilfskraft: zieht den Trunk im Welt-Frame in Kommandorichtung. Magnitude fällt
+        linear von start_n (Iter 0) auf 0 (decay_end_iter); danach kein Aufruf. Nur im Training aktiv:
+        cur_iteration wird vom Runner gesetzt — bleibt es None (Eval/Video), passiert nichts. Die
+        Kraft muss je Step neu angewandt werden (Genesis löscht externe Kräfte nach scene.step()).
+        """
+        if self.assist_force_cfg is None or self.cur_iteration is None:
+            return
+        frac = max(0.0, 1.0 - self.cur_iteration / self.assist_decay_end_iter)
+        self.assist_force_mag = self.assist_force_start * frac  # für wandb-Logging (s. step())
+        if self.assist_force_mag <= 0.0:
+            return
+        # Kommandorichtung im Heading-Frame (horizontal, normiert) → Welt-Frame.
+        cmd_dir = torch.zeros((self.num_envs, 3), dtype=gs.tc_float, device=gs.device)
+        cmd_dir[:, :2] = self.commands[:, :2]
+        norm = torch.linalg.norm(cmd_dir, dim=1, keepdim=True).clamp(min=1e-6)
+        unit_world = transform_by_quat(cmd_dir / norm, inv_quat(self.inv_heading_quat))
+        self._assist_force[:, 0, :] = unit_world * self.assist_force_mag
+        self.scene.rigid_solver.apply_links_external_force(
+            force=self._assist_force, links_idx=[self.trunk_link_idx]
+        )
 
     def _set_heading_reference(self, envs_idx=None):
         """Spawn-Yaw je Episode fixieren → Heading-Frame für command_accuracy (Welt-xy ohne Drift).

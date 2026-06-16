@@ -92,6 +92,8 @@ class K1TrainRunner(OnPolicyRunner):
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
+            # Assist-Force-Curriculum: aktuelle Iteration an das Env geben (linear-decay der Hilfskraft).
+            self.env.cur_iteration = it
             start = time.time()
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):

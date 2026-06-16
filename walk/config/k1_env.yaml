@@ -92,6 +92,14 @@ env_cfg:
   simulate_action_latency: true
   clip_actions: 100.0
 
+  # Assist-Force-Curriculum: zieht den Rumpf (Trunk) im Welt-Frame in Kommandorichtung, damit die
+  # Policy den Stil/Vorwärtsgang früh erlebt. Stärke fällt linear von start_n (Iter 0) auf 0
+  # (decay_end_iter); danach kraftfrei. Nur im Training aktiv (cur_iteration wird vom Runner gesetzt);
+  # in Eval/Video bleibt cur_iteration None → keine Hilfskraft. Block entfernen zum Deaktivieren.
+  assist_force:
+    start_n: 70.0          # [N] Zugkraft am Trunk bei Iteration 0 (~0.3·mg bei 20 kg → mg≈196 N)
+    decay_end_iter: 1500   # linear auf 0 bei dieser Iteration
+
 obs_cfg:
   obs_scales:
     lin_vel: 2.0
@@ -100,7 +108,7 @@ obs_cfg:
     dof_vel: 0.05
 
 reward_cfg:
-  tracking_sigma: 0.25            # exp(-err/sigma) Breite (tracking_lin_vel/ang_vel)
+  tracking_sigma: 0.2            # exp(-err/sigma) Breite (tracking_lin_vel/ang_vel)
 
   # contact (net contact force on foot links, via RigidEntity.get_links_net_contact_force)
   foot_contact_force_threshold: 20.0  # [N] |F| on foot link above = in_contact
@@ -121,12 +129,12 @@ reward_cfg:
     tracking_lin_vel: 1.0   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
     tracking_ang_vel: 0.5
     survival: 1.0
-    action_rate: -0.02
+    action_rate: -0.1
 
 
 
     feet_air_time: 1.5   # reduziert: der style-Reward kodiert Schwunghöhe/Schrittlänge jetzt mit
-    #feet_slip: -1.0
+    feet_slip: -1.0
     #leg_symmetry: -1.0
 
     # style: Belohnung für Bewegung im Stil der NPZ-Referenz (feature-matching, ∈[0,1]).
