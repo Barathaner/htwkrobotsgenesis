@@ -35,12 +35,14 @@ import torch.nn as nn
 from booster_robotics_sdk_python import (
     B1JointCnt,
     B1JointIndex,
+    B1LocoClient,
     B1LowCmdPublisher,
     B1LowStateSubscriber,
     ChannelFactory,
     LowCmd,
     LowCmdType,
     MotorCmd,
+    RobotMode,
 )
 
 # ---------------------------------------------------------------------------
@@ -277,6 +279,11 @@ class RobotStateBuffer:
         imu = self._state.imu_state
         return list(imu.gyro), imu.rpy[0], imu.rpy[1]
 
+    def is_fallen(self, roll_limit: float = 1.0, pitch_limit: float = 1.0) -> bool:
+        """True wenn Roll oder Pitch den Sicherheitsgrenzwert überschreiten (Sturzerkennung)."""
+        imu = self._state.imu_state
+        return abs(imu.rpy[0]) > roll_limit or abs(imu.rpy[1]) > pitch_limit
+
 
 # ---------------------------------------------------------------------------
 # SDK command builder
@@ -430,6 +437,9 @@ def run(args: argparse.Namespace) -> None:
     publisher = B1LowCmdPublisher()
     publisher.InitChannel()
 
+    client = B1LocoClient()
+    client.Init()
+
     # Graceful shutdown on Ctrl+C
     running = True
     def _sigint_handler(sig, frame):
@@ -444,12 +454,21 @@ def run(args: argparse.Namespace) -> None:
             print("ERROR: no state received after 5 s. Check network interface.", file=sys.stderr)
             sys.exit(1)
         time.sleep(0.01)
-    print("State received. Starting smoke test.")
+    print("State received.")
+
+    # --- Roboter in Custom-Modus schalten (wie altes Script) ---
+    print("Switching to Custom mode…")
+    client.ChangeMode(RobotMode.kCustom)
+    time.sleep(0.5)
+    print("Custom mode active. Starting policy loop.")
 
     commands   = [args.vx, args.vy, args.wz]
     last_actions: list[float] = [0.0] * NUM_ACTIONS
+    # Glättungsfilter-Startwert: Standardposition des Roboters
+    filtered_dof_pos: list[float] = DEFAULT_DOF_POS.tolist()
     gait_phase = 0.0
     step = 0
+    fall_detected = False
     t_start = time.monotonic()
     t_next  = t_start
 
@@ -462,6 +481,16 @@ def run(args: argparse.Namespace) -> None:
         # --- read state ---
         gyro, roll, pitch = state_buf.get_imu()
         dof_pos, dof_vel  = state_buf.get_dof_pos_vel()
+
+        # --- Sturzdetektor (wie altes Script: |rpy| > 1.0 rad) ---
+        if state_buf.is_fallen():
+            print(
+                f"\nFALL DETECTED: roll={math.degrees(roll):+.1f}°  "
+                f"pitch={math.degrees(pitch):+.1f}° — Notabbruch!",
+                file=sys.stderr,
+            )
+            fall_detected = True
+            break
 
         # simple foot contact estimate: both feet always in contact during stand test
         foot_contact = [1.0, 1.0]
@@ -485,11 +514,16 @@ def run(args: argparse.Namespace) -> None:
         actions = torch.clamp(actions, -CLIP_ACTIONS, CLIP_ACTIONS)
 
         # --- action → target joint positions ---
-        target_dof_pos = (actions * ACTION_SCALE + DEFAULT_DOF_POS).tolist()
+        raw_dof_pos = (actions * ACTION_SCALE + DEFAULT_DOF_POS).tolist()
         last_actions = actions.tolist()
 
+        # --- Glättungsfilter: 80 % alt + 20 % neu (wie altes Script) ---
+        filtered_dof_pos = [
+            0.8 * f + 0.2 * r for f, r in zip(filtered_dof_pos, raw_dof_pos)
+        ]
+
         # --- send command ---
-        low_cmd = build_low_cmd(target_dof_pos, publisher)
+        low_cmd = build_low_cmd(filtered_dof_pos, publisher)
         publisher.Write(low_cmd)
 
         # --- advance phase clock ---
@@ -511,11 +545,14 @@ def run(args: argparse.Namespace) -> None:
             time.sleep(sleep_remaining)
 
     # --- safe stop ---
-    print("Sending damp command…")
+    print("Sending damp commands…")
     for _ in range(10):
         publisher.Write(damp_cmd())
         time.sleep(0.02)
-    print("Done.")
+
+    print("Switching to Damping mode…")
+    client.ChangeMode(RobotMode.kDamping)
+    print("Done." if not fall_detected else "Stopped due to fall detection.")
 
 
 def main() -> None:

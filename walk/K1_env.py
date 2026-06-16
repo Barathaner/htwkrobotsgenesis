@@ -201,6 +201,10 @@ class K1Env:
         self.feet_idx_local = [self.robot.get_link(n).idx_local for n in ("left_foot_link", "right_foot_link")]
         self.feet_link_idx = torch.tensor(self.feet_idx_local, dtype=gs.tc_int, device=gs.device)
         self.foot_contact_force_threshold = float(self.reward_cfg["foot_contact_force_threshold"])
+        self.foot_ground_clearance_margin = float(
+            self.reward_cfg.get("foot_ground_clearance_margin", 0.035)
+        )
+        self.stand_cmd_threshold = float(self.reward_cfg.get("stand_cmd_threshold", 0.2))
         self.foot_in_contact = torch.ones((num_envs, 2), dtype=gs.tc_bool, device=gs.device)
 
         # feet_air_time: Luftphase je Fuß [s]; phasen-gekoppelte Belohnung beim Aufsetzen.
@@ -285,6 +289,21 @@ class K1Env:
             self.episode_sums[name] = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
 
         self.reset()
+
+        # Referenz-Fußhöhe in Default-Pose (beide Sohlen flach auf dem Boden).
+        foot_pos = self.robot.get_links_pos(self.feet_idx_local)
+        self.foot_ground_z = foot_pos[0, :, 2].clone()  # (2,) links/rechts
+
+    def _foot_height_on_ground(self) -> torch.Tensor:
+        """True je Fuß, wenn der Link nahe der Referenz-Boden-h liegt (n, 2)."""
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
+        return foot_z <= (self.foot_ground_z.unsqueeze(0) + self.foot_ground_clearance_margin)
+
+    def _both_feet_on_ground(self) -> torch.Tensor:
+        """Kraft UND Höhe: beide Füße wirklich am Boden (n,)."""
+        force_ok = self._foot_in_contact_from_force()
+        height_ok = self._foot_height_on_ground()
+        return force_ok[:, 0] & force_ok[:, 1] & height_ok[:, 0] & height_ok[:, 1]
 
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
@@ -524,7 +543,8 @@ class K1Env:
         flat_excess = torch.clamp(self.foot_flat_time - self.reward_cfg["foot_flat_time"], min=0.0)
         self.foot_flat_penalty.copy_(flat_excess.sum(dim=1) * roll_active)
 
-        self.foot_in_contact.copy_(in_contact)
+        height_ok = self._foot_height_on_ground()
+        self.foot_in_contact.copy_(in_contact & height_ok)
 
     def _desired_stance(self):
         """Soll-Bodenkontakt je Fuß (n,2) aus der Phase-Clock: True = soll Stance, False = soll Swing.
@@ -832,27 +852,35 @@ class K1Env:
         lateral_dist = torch.abs(left_base[:, 1] - right_base[:, 1])
         sep_score = torch.clamp(lateral_dist / self.reward_cfg["close_feet_d_min"], max=1.0)
 
-        # height_score: Gauß auf Höhenunterschied beider Füße (Weltkoordinaten), nur bei beidseitigem Kontakt.
+        # height_score: Gauß auf Höhenunterschied — auch bei Ein-Fuß-Stand (sonst neutral → kein Anreiz).
         foot_z = foot_pos[:, :, 2]  # (n,2)
         height_diff = torch.abs(foot_z[:, 0] - foot_z[:, 1])
         height_sigma = self.reward_cfg.get("feet_height_diff_sigma", 0.02)
-        both_contact = self.foot_in_contact[:, 0] & self.foot_in_contact[:, 1]
-        height_score = torch.where(
-            both_contact,
-            torch.exp(-height_diff / height_sigma),
-            torch.ones_like(height_diff),  # neutral wenn nur ein Fuß in Kontakt
-        )
+        height_score = torch.exp(-height_diff / height_sigma)
 
         return 1.0 - sep_score * parallel_score * height_score
 
     def _reward_feet_not_both_contact(self):
-        """Strafe: mindestens ein Fuß hat keinen Bodenkontakt.
+        """Strafe: nicht beide Füße wirklich am Boden (Kraft + Fußhöhe).
 
-        Gibt 1.0 zurück sobald nicht beide Füße gleichzeitig am Boden sind.
-        Mit negativem Scale im YAML wird fehlender beidseitiger Kontakt bestraft.
+        Ein-Fuß-Balance scheitert oft nur an der Kraft-Schwelle, wenn der zweite Fuß leicht
+        mit schleift — daher zusätzlich Fuß-Link-h vs. Referenzpose prüfen.
         """
-        both_contact = self.foot_in_contact[:, 0] & self.foot_in_contact[:, 1]
-        return (~both_contact).to(gs.tc_float)
+        return (~self._both_feet_on_ground()).to(gs.tc_float)
+
+    def _reward_feet_grounded(self):
+        """Strafe: Fuß-Link zu weit über der Referenz-Boden-h (Stehen, cmd ≈ 0).
+
+        Bestraft jeden angehobenen Fuß linear in Metern; stärkerer Gradient als reine Kontakt-Flags.
+        """
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
+        excess = torch.clamp(
+            foot_z - (self.foot_ground_z.unsqueeze(0) + self.foot_ground_clearance_margin),
+            min=0.0,
+        )
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed < self.stand_cmd_threshold).to(gs.tc_float)
+        return excess.sum(dim=1) * active
 
     def _reward_feet_air_height(self):
         """Belohnung: Schwungfuß hält eine saubere Soll-Flughöhe (Gauß um feet_air_height_target).

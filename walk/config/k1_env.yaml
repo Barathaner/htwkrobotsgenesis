@@ -107,6 +107,8 @@ reward_cfg:
 
   # contact (net contact force on foot links, via RigidEntity.get_links_net_contact_force)
   foot_contact_force_threshold: 20.0  # [N] |F| on foot link above = in_contact
+  foot_ground_clearance_margin: 0.035  # [m] über Referenz-h = Fuß gilt als angehoben
+  stand_cmd_threshold: 0.2             # [m/s] darunter: Stehen-Rewards (feet_grounded) aktiv
 
   # feet_air_time (klassisch legged_gym: Bonus = air_time − target beim Aufsetzen)
   feet_air_time_target: 0.3       # [s] Soll-Luftzeit je Schritt; darüber Bonus, darunter Malus
@@ -163,8 +165,8 @@ reward_cfg:
     # task
     tracking_lin_vel: 1.5   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
     tracking_ang_vel: 0.5
-    survival: 0.5
     base_height: -10.0
+    survival: 1.5
     lin_vel_z: -1.5
     action_rate: -0.5
 
@@ -189,8 +191,9 @@ reward_cfg:
 
     # foot style — Stehen mit beiden Füßen flach am Boden
     #foot_roll: 1.5   # nur beim Gehen: Heel-to-Toe (widerspricht flachem Stand)
-    feet_stance: -2.5             # STRAFE: Füße nicht parallel / unterschiedliche Höhe
-    feet_not_both_contact: -4.0   # STRAFE: mindestens ein Fuß in der Luft
+    feet_stance: -3.0             # STRAFE: Füße nicht parallel / unterschiedliche Höhe
+    feet_not_both_contact: -6.0   # STRAFE: nicht beide Füße wirklich am Boden (Kraft + Höhe)
+    feet_grounded: -5.0          # STRAFE: Fuß zu weit über Boden beim Stehen
     #flat_foot: -0.6              # nur beim Gehen aktiv (cmd > threshold)
     support_pose: 2.0             # BELOHNUNG: stabile Kniebeugung beim Stehen
 
