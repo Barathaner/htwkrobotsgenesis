@@ -283,46 +283,53 @@ class RobotStateBuffer:
         return self._ready
 
     def get_dof_pos_vel(self) -> tuple[list[float], list[float]]:
-        """Return (dof_pos, dof_vel) in URDF policy order (16 joints)."""
+        """Return (dof_pos, dof_vel) in URDF policy order (16 joints).
+
+        Physical L/R swap: SDK kLeft* indices are wired to the robot's physical
+        RIGHT side and kRight* to the physical LEFT side.  So policy "left" slots
+        are fed from K1Ji.kRight* encoders and vice versa.
+        """
         q  = self._q
         dq = self._dq
 
-        l_ap, l_ar     = crank_to_ankle(q[K1Ji.kCrankUpLeft],   q[K1Ji.kCrankDownLeft])
-        r_ap, r_ar     = crank_to_ankle(q[K1Ji.kCrankUpRight],  q[K1Ji.kCrankDownRight])
-        l_ap_v, l_ar_v = crank_to_ankle(dq[K1Ji.kCrankUpLeft],  dq[K1Ji.kCrankDownLeft])
-        r_ap_v, r_ar_v = crank_to_ankle(dq[K1Ji.kCrankUpRight], dq[K1Ji.kCrankDownRight])
+        # SDK "left" cranks = physical RIGHT ankle
+        sdk_l_ap, sdk_l_ar     = crank_to_ankle(q[K1Ji.kCrankUpLeft],   q[K1Ji.kCrankDownLeft])
+        sdk_l_ap_v, sdk_l_ar_v = crank_to_ankle(dq[K1Ji.kCrankUpLeft],  dq[K1Ji.kCrankDownLeft])
+        # SDK "right" cranks = physical LEFT ankle
+        sdk_r_ap, sdk_r_ar     = crank_to_ankle(q[K1Ji.kCrankUpRight],  q[K1Ji.kCrankDownRight])
+        sdk_r_ap_v, sdk_r_ar_v = crank_to_ankle(dq[K1Ji.kCrankUpRight], dq[K1Ji.kCrankDownRight])
 
         pos = [
-            q[K1Ji.kLeftShoulderPitch],
-            q[K1Ji.kLeftElbowYaw],
-            q[K1Ji.kRightShoulderPitch],
-            q[K1Ji.kRightElbowYaw],
-            q[K1Ji.kLeftHipPitch],
-            q[K1Ji.kLeftHipRoll],
-            q[K1Ji.kLeftHipYaw],
-            q[K1Ji.kLeftKneePitch],
-            l_ap, l_ar,
-            q[K1Ji.kRightHipPitch],
-            q[K1Ji.kRightHipRoll],
-            q[K1Ji.kRightHipYaw],
-            q[K1Ji.kRightKneePitch],
-            r_ap, r_ar,
+            q[K1Ji.kRightShoulderPitch],  # policy: ALeft_Shoulder_Pitch
+            q[K1Ji.kRightElbowYaw],       # policy: Left_Elbow_Yaw
+            q[K1Ji.kLeftShoulderPitch],   # policy: ARight_Shoulder_Pitch
+            q[K1Ji.kLeftElbowYaw],        # policy: Right_Elbow_Yaw
+            q[K1Ji.kRightHipPitch],       # policy: Left_Hip_Pitch
+            q[K1Ji.kRightHipRoll],        # policy: Left_Hip_Roll
+            q[K1Ji.kRightHipYaw],         # policy: Left_Hip_Yaw
+            q[K1Ji.kRightKneePitch],      # policy: Left_Knee_Pitch
+            sdk_r_ap, sdk_r_ar,           # policy: Left_Ankle_Pitch/Roll ← physical left (SDK right)
+            q[K1Ji.kLeftHipPitch],        # policy: Right_Hip_Pitch
+            q[K1Ji.kLeftHipRoll],         # policy: Right_Hip_Roll
+            q[K1Ji.kLeftHipYaw],          # policy: Right_Hip_Yaw
+            q[K1Ji.kLeftKneePitch],       # policy: Right_Knee_Pitch
+            sdk_l_ap, sdk_l_ar,           # policy: Right_Ankle_Pitch/Roll ← physical right (SDK left)
         ]
         vel = [
-            dq[K1Ji.kLeftShoulderPitch],
-            dq[K1Ji.kLeftElbowYaw],
             dq[K1Ji.kRightShoulderPitch],
             dq[K1Ji.kRightElbowYaw],
-            dq[K1Ji.kLeftHipPitch],
-            dq[K1Ji.kLeftHipRoll],
-            dq[K1Ji.kLeftHipYaw],
-            dq[K1Ji.kLeftKneePitch],
-            l_ap_v, l_ar_v,
+            dq[K1Ji.kLeftShoulderPitch],
+            dq[K1Ji.kLeftElbowYaw],
             dq[K1Ji.kRightHipPitch],
             dq[K1Ji.kRightHipRoll],
             dq[K1Ji.kRightHipYaw],
             dq[K1Ji.kRightKneePitch],
-            r_ap_v, r_ar_v,
+            sdk_r_ap_v, sdk_r_ar_v,
+            dq[K1Ji.kLeftHipPitch],
+            dq[K1Ji.kLeftHipRoll],
+            dq[K1Ji.kLeftHipYaw],
+            dq[K1Ji.kLeftKneePitch],
+            sdk_l_ap_v, sdk_l_ar_v,
         ]
         return pos, vel
 
@@ -473,36 +480,39 @@ def update_low_cmd(
 
     mc = low_cmd.motor_cmd
 
-    # Position-controlled joints
+    # Position-controlled joints.
+    # Physical L/R swap: send policy "left" outputs to SDK right motors and vice versa.
     mc[K1Ji.kHeadYaw].q           = FIXED_JOINT_DEFAULTS["AAHead_yaw"]
     mc[K1Ji.kHeadPitch].q         = FIXED_JOINT_DEFAULTS["Head_pitch"]
-    mc[K1Ji.kLeftShoulderPitch].q  = l_sh_pitch
-    mc[K1Ji.kLeftShoulderRoll].q   = FIXED_JOINT_DEFAULTS["Left_Shoulder_Roll"]
-    mc[K1Ji.kLeftElbowPitch].q     = FIXED_JOINT_DEFAULTS["Left_Elbow_Pitch"]
-    mc[K1Ji.kLeftElbowYaw].q       = l_el_yaw
-    mc[K1Ji.kRightShoulderPitch].q = r_sh_pitch
-    mc[K1Ji.kRightShoulderRoll].q  = FIXED_JOINT_DEFAULTS["Right_Shoulder_Roll"]
-    mc[K1Ji.kRightElbowPitch].q    = FIXED_JOINT_DEFAULTS["Right_Elbow_Pitch"]
-    mc[K1Ji.kRightElbowYaw].q      = r_el_yaw
-    mc[K1Ji.kLeftHipPitch].q       = l_hip_p
-    mc[K1Ji.kLeftHipRoll].q        = l_hip_r
-    mc[K1Ji.kLeftHipYaw].q         = l_hip_y
-    mc[K1Ji.kLeftKneePitch].q      = l_knee
-    mc[K1Ji.kRightHipPitch].q      = r_hip_p
-    mc[K1Ji.kRightHipRoll].q       = r_hip_r
-    mc[K1Ji.kRightHipYaw].q        = r_hip_y
-    mc[K1Ji.kRightKneePitch].q     = r_knee
+    mc[K1Ji.kRightShoulderPitch].q = l_sh_pitch                              # policy left → SDK right (physical left)
+    mc[K1Ji.kRightShoulderRoll].q  = FIXED_JOINT_DEFAULTS["Left_Shoulder_Roll"]
+    mc[K1Ji.kRightElbowPitch].q    = FIXED_JOINT_DEFAULTS["Left_Elbow_Pitch"]
+    mc[K1Ji.kRightElbowYaw].q      = l_el_yaw
+    mc[K1Ji.kLeftShoulderPitch].q  = r_sh_pitch                              # policy right → SDK left (physical right)
+    mc[K1Ji.kLeftShoulderRoll].q   = FIXED_JOINT_DEFAULTS["Right_Shoulder_Roll"]
+    mc[K1Ji.kLeftElbowPitch].q     = FIXED_JOINT_DEFAULTS["Right_Elbow_Pitch"]
+    mc[K1Ji.kLeftElbowYaw].q       = r_el_yaw
+    mc[K1Ji.kRightHipPitch].q      = l_hip_p                                 # policy left leg → SDK right (physical left)
+    mc[K1Ji.kRightHipRoll].q       = l_hip_r
+    mc[K1Ji.kRightHipYaw].q        = l_hip_y
+    mc[K1Ji.kRightKneePitch].q     = l_knee
+    mc[K1Ji.kLeftHipPitch].q       = r_hip_p                                 # policy right leg → SDK left (physical right)
+    mc[K1Ji.kLeftHipRoll].q        = r_hip_r
+    mc[K1Ji.kLeftHipYaw].q         = r_hip_y
+    mc[K1Ji.kLeftKneePitch].q      = r_knee
 
-    # Torque-controlled crank joints
+    # Torque-controlled crank joints (same L/R swap).
     def _crank(idx: int, tgt: float, cur: float) -> None:
         _, _, limit = SDK_JOINT_GAINS[idx]
         mc[idx].q   = cur   # hold current position; no position-mode jump
         mc[idx].tau = max(-limit, min(limit, (tgt - cur) * CRANK_STIFFNESS[idx]))
 
-    _crank(K1Ji.kCrankUpLeft,    l_crank_up_tgt, crank_cur_ul)
-    _crank(K1Ji.kCrankDownLeft,  l_crank_dn_tgt, crank_cur_dl)
-    _crank(K1Ji.kCrankUpRight,   r_crank_up_tgt, crank_cur_ur)
-    _crank(K1Ji.kCrankDownRight, r_crank_dn_tgt, crank_cur_dr)
+    # policy left ankle → SDK right cranks (physical left ankle)
+    _crank(K1Ji.kCrankUpRight,   l_crank_up_tgt, crank_cur_ur)
+    _crank(K1Ji.kCrankDownRight, l_crank_dn_tgt, crank_cur_dr)
+    # policy right ankle → SDK left cranks (physical right ankle)
+    _crank(K1Ji.kCrankUpLeft,    r_crank_up_tgt, crank_cur_ul)
+    _crank(K1Ji.kCrankDownLeft,  r_crank_dn_tgt, crank_cur_dl)
 
 
 def damp_cmd() -> LowCmd:

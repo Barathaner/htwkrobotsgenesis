@@ -13,7 +13,7 @@ Keys:
   + or =       increase selected joint target by step
   - or _       decrease selected joint target by step
   [ / ]        halve / double step size
-  r            reset targets back to startup positions (current at launch)
+r            reset targets back to startup positions (current at launch)
   g            go to DEFAULT_POS (standing pose)
   q or ESC     quit — sends damp + kDamping mode
 
