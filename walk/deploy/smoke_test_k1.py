@@ -707,10 +707,17 @@ def run(args: argparse.Namespace) -> None:
 
         if step % 50 == 0:
             elapsed = now - t_start
+            act_max  = float(actions.abs().max())
+            act_mean = float(actions.abs().mean())
+            # delta between current filtered target and default pose (key leg joints)
+            d = [filtered_dof_pos[i] - DEFAULT_DOF_POS[i].item() for i in range(NUM_ACTIONS)]
             print(
                 f"[{elapsed:6.1f}s] step={step:5d} "
                 f"roll={math.degrees(roll):+.1f}° pitch={math.degrees(pitch):+.1f}° "
-                f"phase={gait_phase:.2f}"
+                f"phase={gait_phase:.2f} | "
+                f"act max={act_max:.3f} mean={act_mean:.3f} | "
+                f"Δhip_L={d[4]:+.3f} Δknee_L={d[7]:+.3f} "
+                f"Δhip_R={d[10]:+.3f} Δknee_R={d[13]:+.3f}"
             )
 
         # --- pace to 50 Hz ---
