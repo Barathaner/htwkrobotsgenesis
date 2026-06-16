@@ -3,7 +3,6 @@
 Usage:
   .venv/bin/python walk/test_k1_env.py --test a
   .venv/bin/python walk/test_k1_env.py --test b
-  .venv/bin/python walk/test_k1_env.py --test c --reward base_height
   .venv/bin/python walk/test_k1_env.py --test c --reward action_rate
   .venv/bin/python walk/test_k1_env.py --test d --num-envs 64
   .venv/bin/python walk/test_k1_env.py --test all
@@ -24,23 +23,21 @@ from K1_env import K1Env
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "k1_env.yaml")
 ALL_REWARDS = [
-    "base_height",
-    "similar_to_default",
     "lin_vel_z",
     "action_rate",
     "tracking_lin_vel",
     "tracking_ang_vel",
     "feet_air_time",
+    "feet_slip",
     "leg_symmetry",
 ]
 REWARD_SCALE_DEFAULTS = {
-    "base_height": -50.0,
-    "similar_to_default": -0.1,
     "lin_vel_z": -1.0,
     "action_rate": -0.005,
     "tracking_lin_vel": 1.0,
     "tracking_ang_vel": 0.2,
     "feet_air_time": 0.5,
+    "feet_slip": -1.0,
     "leg_symmetry": -2.0,
 }
 
@@ -99,10 +96,9 @@ def print_reward_breakdown(env: K1Env, step_i: int, rew_total: float) -> None:
     vz = float(env.base_lin_vel[0, 2])
     vx, vy = float(env.base_lin_vel[0, 0]), float(env.base_lin_vel[0, 1])
     roll, pitch = float(env.base_euler[0, 0]), float(env.base_euler[0, 1])
-    pose_dev = float(env._reward_similar_to_default()[0])
     lines.append(
         f"    state: z={z:.4f}  vz={vz:.4f}  vx={vx:.4f}  vy={vy:.4f}  "
-        f"roll={roll:.1f}° pitch={pitch:.1f}°  pose_dev={pose_dev:.4f}"
+        f"roll={roll:.1f}° pitch={pitch:.1f}°"
     )
     print("\n".join(lines))
 
@@ -137,10 +133,10 @@ def test_a(steps: int = 500) -> bool:
 
     z_min, z_max = min(z_history), max(z_history)
     z_final = z_history[-1]
-    target = env.reward_cfg["base_height_target"]
+    target = env.env_cfg["base_init_pos"][2]
 
     print("\nErgebnis:")
-    print(f"  z: min={z_min:.4f}  max={z_max:.4f}  final={z_final:.4f}  target={target}")
+    print(f"  z: min={z_min:.4f}  max={z_max:.4f}  final={z_final:.4f}  init={target}")
     print(f"  Episode-Ende (Umfallen/Timeout): step {done_at if done_at is not None else 'keins'}")
     print("  NaNs: keine")
 
@@ -213,13 +209,12 @@ def test_c(reward_name: str | None = None, steps: int = 200) -> bool:
     print("Was passiert: Nur EIN Reward aktiv, wir prüfen ob contrib sinnvoll reagiert.\n")
 
     action_plan = {
-        "base_height": ("zero", "z nahe 0.53 → contrib≈0; z weit weg → contrib negativer"),
-        "similar_to_default": ("zero", "pose_dev≈0 → contrib≈0; beim Kippen pose_dev steigt"),
         "lin_vel_z": ("zero", "vz≈0 → contrib≈0; beim Fallen vz groß → contrib negativ"),
         "action_rate": ("random", "jeder Step neue Random-Aktion → contrib < 0; bei zero = 0"),
         "tracking_lin_vel": ("zero", "cmd=[0.5,0], Heading-vx≈0 → raw≈exp(-0.25)≈0.37; Heading-vx=0.5 → raw≈1.0"),
         "tracking_ang_vel": ("zero", "cmd=0, yaw_rate≈0 → raw≈1.0"),
         "feet_air_time": ("random", "Bonus = (air_time − target) beim Aufsetzen; >0 bei langen Schritten, 0 bei cmd≈0"),
+        "feet_slip": ("random", "raw>0 wenn Stützfuß im Kontakt horizontal rutscht; 0 bei stillem Stützfuß"),
         "leg_symmetry": ("random", "raw>0 bei both_air/zu langer Doppelstütze; 0 bei sauberer Alternation/cmd≈0"),
     }
 

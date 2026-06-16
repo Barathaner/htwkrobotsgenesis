@@ -1,6 +1,6 @@
 # Booster K1 locomotion — 16-DOF (12 legs + 4 arms).
 # Unbenutzte DOFs (Shoulder_Roll, Elbow_Yaw, Kopf) per PD fix gehalten (fixed_joint_names).
-# Obs dim = 9 + 3*16 + 2 + 2 + 2 = 63 (auto in K1_env.py).
+# Obs dim = 9 + 3*16 = 57 (auto in K1_env.py). Nur deploy-fähige Größen (IMU + Gelenke + commands + Aktion).
 
 env_cfg:
   num_actions: 16
@@ -101,8 +101,6 @@ obs_cfg:
 
 reward_cfg:
   tracking_sigma: 0.25            # exp(-err/sigma) Breite (tracking_lin_vel/ang_vel)
-  base_height_target: 0.53        # [m]
-  feet_height_target: 0.0
 
   # contact (net contact force on foot links, via RigidEntity.get_links_net_contact_force)
   foot_contact_force_threshold: 20.0  # [N] |F| on foot link above = in_contact
@@ -114,89 +112,27 @@ reward_cfg:
   # leg_symmetry (alternierender Gang: ein Fuß schwingt, der andere stützt; dann Wechsel)
   leg_symmetry_ds_allow_s: 0.15   # [s] erlaubte Doppelstütz-Dauer je Phase (natürl. (2·stance_ratio−1)·period/2 ≈ 0.11)
 
-  # foot_roll (kontinuierliches Heel-to-Toe via Ankle_Pitch, stance-phasen-gekoppelt)
-  ankle_heel_target: -0.15        # [rad] Stance-Start (Touchdown)
-  ankle_toe_target: 0.10          # [rad] Stance-Ende (Liftoff)
-  foot_roll_sigma: 0.05
-  foot_roll_cmd_threshold: 0.2    # [m/s] darunter kein Reward
-
-  # flat_foot
-  foot_flat_threshold: 0.03       # [rad] |Ankle_Pitch| darunter = flach
-  foot_flat_time: 0.4             # [s] flach-in-Kontakt-Dauer ab Strafe
-
-  # support_pose (Kniebeugung)
-  support_knee_min: 0.4           # [rad]
-  support_knee_max: 0.8           # [rad]
-  support_pose_sigma: 0.05
-  support_pose_cmd_speed: 0.6     # [m/s] nur darunter belohnen
-
-  # SPRINT-Stil Fuß-Terme
-  close_feet_d_min: 0.15          # [m] seitl. Mindestabstand (Basis-Frame)
-  feet_air_height_target: 0.12    # [m] Soll-z Schwungfuß-Link (~5-6 cm über Sohle)
-  feet_air_height_sigma: 0.03
-  feet_guidance_t_target: 0.16    # [s] Mindest-Flugzeit
-  feet_parallel_sigma: 0.1        # Gauß-Breite der Fuß-Parallelität (Heading-Differenz)
-
-  # push (Robustheit; Soll-Δv [m/s])
-  push_enabled: false
-  push_interval_min_s: 2.0
-  push_interval_max_s: 5.0
-  push_vel_min: 0.3
-  push_vel_max: 0.8
-
-  # gait phase-clock
-  gait_period_s: 1.1              # [s] voller Schrittzyklus
-  gait_stance_ratio: 0.6          # Stance-Anteil je Fuß
-  gait_phase_offset: 0.5          # L/R-Versatz (0.5 = alternierend)
-  gait_cmd_threshold: 0.2         # [m/s] darunter kein Penalty
-
-  # swing_quality (Strafe: koppelt Schwung-Clearance feet_air_height_target + Kniebeugung)
-  swing_knee_flex_target: 0.15    # [rad] Soll-Flex über Default-Knie während Swing+Luft
-
-  # torso_pitch (SPRINT r_reg: Vorne-Neigung via projected_gravity gx, aktiv Richtung gf)
-  torso_pitch_target: 0.1         # gf: Soll-Vorne-Neigung (fix, nicht speed-abhängig)
-  torso_pitch_backward: 0.0       # gb: extra Strafe bei Rück-Neigung (gx < gb)
 
   reward_scales:
     # task
     tracking_lin_vel: 1.5   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
     tracking_ang_vel: 0.5
     survival: 0.5
-    #base_height: -30.0
     lin_vel_z: -1.0
     action_rate: -0.5
 
-    # gait
+
+
     feet_air_time: 3.0
-    #feet_slip: -1.0
-    gait_phase: -3.0
-    # leg_symmetry = STRAFE für nicht-alternierenden Gang: both_air (Flugphase) sofort, Doppelstütze
-    # nur über das natürliche Fenster hinaus. Bündelt die früher in feet_air_time/foot_roll/swing_quality
-    # verteilte L/R-Kopplung in EINEN Term.
-    #leg_symmetry: -1.0
-    # swing_quality = BELOHNUNG clear_score·flex_score: koppelt Schwung-Clearance UND Kniebeugung
-    # in EINER Metrik (ersetzt swing_clearance + swing_knee_flex). Magnitude ∈[0,1] je Fuß.
-    #swing_quality: 3.5
+    feet_slip: -1.0
+    leg_symmetry: -1.0
 
-    # SPRINT-Stil Fuß-Design
-    # feet_stance = STRAFE 1 − sep_score·parallel_score: koppelt Mindestabstand UND Parallelität in
-    # EINER Metrik (ersetzt close_feet + feet_parallel). Magnitude ∈[0,1], negativer Scale.
-    #feet_air_height: 5.0
-    #feet_guidance: -15.0
-
-    # foot style
-    #foot_roll: 1.5   # BELOHNUNG: aktives Heel-to-Toe-Abrollen (Roll-Güte) je Stance-Step, gegen steifen Pflock-Fuß
-    #feet_stance: -3.5
-    #flat_foot: -0.6
-    #support_pose: 1.5
 
     # regularizer
     dof_vel: -2.0e-4
     ang_vel_xy: -0.05
     ang_vel_z: -0.0
     orientation: -2.0 
-    #torso_pitch: -3.0             # Roll² + Pitch² (Rumpf aufrecht; ersetzt deaktiviertes torso_pitch)
-    #similar_to_default: -0.03
 
 command_cfg:
   num_commands: 3
