@@ -82,8 +82,8 @@ env_cfg:
     Left_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
     Right_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
 
-  termination_if_roll_greater_than: 30
-  termination_if_pitch_greater_than: 30
+  termination_if_roll_greater_than: 40
+  termination_if_pitch_greater_than: 40
   base_init_pos: [0.0, 0.0, 0.56]
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
   episode_length_s: 20.0
@@ -118,25 +118,27 @@ reward_cfg:
 
   reward_scales:
     # task
-    tracking_lin_vel: 1.7   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
+    tracking_lin_vel: 1.0   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
     tracking_ang_vel: 0.5
-    survival: 0.7
-    action_rate: -0.5
+    survival: 1.0
+    action_rate: -0.02
 
 
 
-    feet_air_time: 3.0
-    feet_slip: -1.0
-    leg_symmetry: -1.0
+    feet_air_time: 1.5   # reduziert: der style-Reward kodiert Schwunghöhe/Schrittlänge jetzt mit
+    #feet_slip: -1.0
+    #leg_symmetry: -1.0
 
-    # style: Belohnung für Bewegung im Stil der NPZ-Referenz (feature-matching, ∈[0,1])
-    style: 0.5
+    # style: Belohnung für Bewegung im Stil der NPZ-Referenz (feature-matching, ∈[0,1]).
+    # ~co-primär mit tracking_lin_vel (0.03/Step). Höher = stärkere Imitation (Risiko: Task/Robustheit
+    # leiden, floatiger Retarget wird kopiert); niedriger = nur leichter Stil-Prior.
+    style: 2.0
 
     # regularizer
     dof_vel: -2.0e-4
     ang_vel_xy: -0.05
-    ang_vel_z: -0.0
-    orientation: -2.0 
+    #ang_vel_z: -0.0
+    orientation: -1.0 
 
 command_cfg:
   num_commands: 3

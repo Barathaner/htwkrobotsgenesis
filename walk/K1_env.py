@@ -282,11 +282,29 @@ class K1Env:
 
         mean = ref.mean(0)
         std = ref.std(0) + 1e-6  # per-Feature standardisieren → Distanz nicht von dof_vel dominiert
+
+        # Pro-Gruppe-Gewichte in der Distanz (nach Standardisierung): ohne sie zählen die 16 dof_vel-
+        # Dims ~42% der Distanz und die Orientierung nur ~8% — umgekehrt zur IL-Praxis. Gewichte →
+        # Gelenkwinkel primär, Orientierung ~20%, Gelenkgeschw. runter, Füße hoch (vgl. DeepMimic-Ratios).
+        n = len(self.env_cfg["joint_names"])
+        w = np.concatenate([
+            np.full(1, 0.5, np.float32),    # root_height
+            np.full(3, 2.0, np.float32),    # projected_gravity (Rumpf-Orientierung) — hochgewichtet
+            np.full(n, 1.0, np.float32),    # dof_pos (Gelenkwinkel) — Hauptfaktor
+            np.full(n, 0.25, np.float32),   # dof_vel — runtergewichtet (sonst geschw.-dominiert)
+            np.full(2, 2.0, np.float32),    # foot_clear (Füße) — hochgewichtet
+        ])
+        sqrt_w = np.sqrt(w)  # in die Features falten → torch.cdist liefert die gewichtete Distanz
+
         self.style_feat_dim = ref.shape[1]
         self.style_sigma = float(self.reward_cfg.get("style_sigma", 1.0))
+        self.style_w_sum = float(w.sum())
         self.style_mean = torch.tensor(mean, dtype=gs.tc_float, device=gs.device)
         self.style_std = torch.tensor(std, dtype=gs.tc_float, device=gs.device)
+        self.style_sqrt_w = torch.tensor(sqrt_w, dtype=gs.tc_float, device=gs.device)
+        # Referenz vorab standardisiert UND gewichtet ablegen (Live-Feature wird gleich behandelt).
         self.style_ref_feat = torch.tensor((ref - mean) / std, dtype=gs.tc_float, device=gs.device)
+        self.style_ref_feat = self.style_ref_feat * self.style_sqrt_w
 
         # Steh-Fußhöhe (FK auf Default-Pose) als Live-Clearance-Nulllinie — passt zur per-Fuß-Ground
         # der Referenz (foot_clear = z − Steh-z), siehe build_motion_reference.
@@ -510,7 +528,7 @@ class K1Env:
         terminate = self.episode_length_buf > self.max_episode_length
         terminate = terminate | (torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
         terminate = terminate | (torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
-        terminate = terminate | (self.base_pos[:, 2] < 0.35)
+        terminate = terminate | (self.base_pos[:, 2] < 0.50)
         terminate = terminate | self.scene.rigid_solver.get_error_envs_mask()
         return terminate
 
@@ -623,10 +641,10 @@ class K1Env:
         feat = torch.cat(
             [self.base_pos[:, 2:3], self.projected_gravity, self.dof_pos, self.dof_vel, foot_clear], dim=1
         )
-        feat = (feat - self.style_mean) / self.style_std
-        # nächster Referenz-Frame je Env: min ||feat − ref_k||² (in Std-Einheiten), gemittelt über Features
+        feat = (feat - self.style_mean) / self.style_std * self.style_sqrt_w  # standardisiert + gewichtet
+        # nächster Referenz-Frame je Env: min gewichtete ||feat − ref_k||² (Std-Einheiten), normiert auf Σw
         min_sq = torch.cdist(feat, self.style_ref_feat).pow(2).min(dim=1).values
-        mean_sq = min_sq / self.style_feat_dim
+        mean_sq = min_sq / self.style_w_sum
         return torch.exp(-mean_sq / (2.0 * self.style_sigma**2))
 
     def _reward_leg_symmetry(self):
