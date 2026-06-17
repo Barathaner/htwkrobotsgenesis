@@ -112,7 +112,8 @@ def main():
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--project", default="k1-locomotion")
     parser.add_argument("--name", default="hero-agent-test")
-    parser.add_argument("--max-frames", type=int, default=0, help="0 = ganze Motion")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="Gesamt-Replay-Schritte (0 = episode_length_s, Referenz wird dabei geloopt)")
     parser.add_argument("--cmd-mode", choices=["instant", "mean"], default="instant",
                         help="instant: Command folgt je Frame der Referenz (tracking≈1, Formel-Validierung); "
                              "mean: ein konstantes Command wie im Training (tracking oszilliert)")
@@ -124,6 +125,10 @@ def main():
     parser.add_argument("--cam-lookat", type=float, nargs=3, default=[0.0, 0.0, 0.5], help="Kamera-Blickpunkt")
     parser.add_argument("--cam-fov", type=float, default=32.0, help="Kamera-FOV (kleiner = stärker gezoomt)")
     parser.add_argument("--follow-smoothing", type=float, default=0.9, help="Verfolgungskamera-Glättung (0..1)")
+    parser.add_argument("--contact-height", type=float, default=0.06,
+                        help="Fuß gilt als Bodenkontakt, wenn foot_clear < diesem Wert [m]. KINEMATISCHE "
+                             "Kontakterkennung für den Replay: ohne scene.step() liefert get_links_net_contact_force() "
+                             "immer 0 → feet_air_time/feet_slip/leg_symmetry sonst dauerhaft 0.")
     args = parser.parse_args()
 
     if WALK_DIR not in sys.path:
@@ -159,16 +164,35 @@ def main():
     assert env.cam is not None, "record_camera=True hat keine Kamera erzeugt"
     dev = gs.device
 
+    # Replay läuft OHNE scene.step() → get_links_net_contact_force() ist konstant 0, daher wären
+    # feet_air_time/feet_slip/leg_symmetry sonst dauerhaft 0. Kontakt stattdessen kinematisch aus der
+    # Fußhöhe ableiten (foot_clear < contact_height) und in dieselbe Env-Buchhaltung einspeisen, die
+    # auch das Training nutzt (env._update_foot_contact ruft _foot_in_contact_from_force).
+    if getattr(env, "style_ground_z", None) is not None:
+        _foot_ground_z = env.style_ground_z  # Steh-Fußhöhe (FK auf Default-Pose), wie im style-Reward
+    else:
+        _q0 = env.init_qpos.unsqueeze(0).expand(env.num_envs, -1).contiguous()
+        _links_pos, _ = env.robot.forward_kinematics(_q0)
+        _foot_ground_z = _links_pos[0, env.feet_link_idx, 2].clone()
+
+    def _kinematic_foot_contact():
+        foot_z = env.robot.get_links_pos(env.feet_idx_local)[:, :, 2]  # (1, 2) Welt-z
+        return (foot_z - _foot_ground_z) < args.contact_height          # (1, 2) bool
+
+    env._foot_in_contact_from_force = _kinematic_foot_contact
+
     # ---- Motion laden + auf Roboter-/Policy-Gelenkreihenfolge mappen ----
     motion_path = args.motion or reward_cfg["style_motion_file"]
     if not os.path.isabs(motion_path):
         motion_path = os.path.join(REPO_ROOT, motion_path)
     m = np.load(motion_path, allow_pickle=True)
     npz_jn = [str(x) for x in m["joint_names"]]
-    T = int(m["root_pos"].shape[0])
-    if args.max_frames:
-        T = min(T, args.max_frames)
+    T = int(m["root_pos"].shape[0])  # volle Referenzlänge = Loop-Quelle
     fps = float(m["fps"])
+    # Wie im Training: die Referenz endlos loopen, die "Episode" aber bei episode_length_s kappen.
+    # n_steps = Gesamt-Replay-Länge; --max-frames überschreibt (für schnelle Tests).
+    episode_length_s = float(env_cfg["episode_length_s"])
+    n_steps = args.max_frames if args.max_frames else round(episode_length_s * fps)
 
     robot_joint_names = [j.name for j in env.robot.joints[1:]]  # 22 DOF in Roboter-Reihenfolge (wie init_dof_pos)
     col_full = [npz_jn.index(n) for n in robot_joint_names]      # → NPZ-Spalten (22)
@@ -181,8 +205,14 @@ def main():
     dof_pos_npz = torch.tensor(m["dof_pos"], dtype=gs.tc_float, device=dev)
     dof_vel_npz = torch.tensor(m["dof_vel"], dtype=gs.tc_float, device=dev)
 
+    # Netto-Vorwärtsversatz je komplettem Motion-Zyklus (nur x/y), damit der geloopte Replay
+    # vorwärts weiterläuft statt zum Startpunkt zurückzuspringen. z bleibt periodisch → kein Höhendrift.
+    loop_disp = (root_pos[T - 1] - root_pos[0]).clone()
+    loop_disp[2] = 0.0
+
     reward_names = sorted(n[len("_reward_"):] for n in dir(env) if n.startswith("_reward_"))
-    print(f"[hero] motion={os.path.basename(motion_path)} frames={T} fps={fps}  rewards={reward_names}")
+    print(f"[hero] motion={os.path.basename(motion_path)} frames={T} steps={n_steps} "
+          f"(~{n_steps / fps:.1f}s) fps={fps}  rewards={reward_names}")
 
     use_wandb = not args.no_wandb
     if use_wandb:
@@ -193,7 +223,8 @@ def main():
             name=args.name,
             config={
                 "motion": os.path.basename(motion_path),
-                "frames": T,
+                "frames": n_steps,
+                "motion_frames": T,
                 "fps": fps,
                 "reward_scales": dict(reward_cfg["reward_scales"]),
             },
@@ -241,13 +272,15 @@ def main():
                              "cmd_yaw": cmd_yaw, "cmd_speed": speed})
 
     with torch.no_grad():
-        for t in range(T):
+        for step in range(n_steps):
+            t = step % T                          # Referenz endlos loopen
+            pos_offset = (step // T) * loop_disp  # je Zyklus um den Netto-Vorlauf versetzen
             bq = root_quat[t].unsqueeze(0)  # (1,4) wxyz
             inv_bq = inv_quat(bq)
 
             # 1) Roboter-Pose setzen (FK an → Fußpositionen + Render). KEINE Physik.
             dof_full = dof_pos_npz[t, col_full]
-            qpos = torch.cat([root_pos[t], root_quat[t], dof_full]).unsqueeze(0)  # (1,29)
+            qpos = torch.cat([root_pos[t] + pos_offset, root_quat[t], dof_full]).unsqueeze(0)  # (1,29)
             env.robot.set_qpos(qpos, zero_velocity=False, skip_forward=False)
             # Geschwindigkeiten für feet_slip/get_links_vel: [lin_world(3), ang_world(3), joints(22)]
             ang_world = transform_by_quat(root_ang_vel_body[t].unsqueeze(0), bq)[0]
@@ -259,7 +292,7 @@ def main():
 
             # 2) K1Env-Buffer direkt aus NPZ befüllen (wie env.step() nach scene.step(), aber aus Referenz)
             wlv = root_lin_vel[t].unsqueeze(0)
-            env.base_pos.copy_(root_pos[t].unsqueeze(0))
+            env.base_pos.copy_((root_pos[t] + pos_offset).unsqueeze(0))
             env.base_quat.copy_(bq)
             env.base_euler = quat_to_xyz(transform_quat_by_quat(inv_base_init_quat, bq), rpy=True, degrees=True)
             env.base_lin_vel.copy_(transform_by_quat(wlv, inv_bq))
@@ -269,12 +302,14 @@ def main():
             env.dof_pos.copy_(env.robot.get_dofs_position(env.motors_dof_idx))
             env.dof_vel.copy_(dof_vel_npz[t, col_motor].unsqueeze(0))
 
-            # Command setzen: instant → folgt je Frame der momentanen Referenz-Geschwindigkeit
-            # (tracking_* = exp(0) = 1.0). mean → bereits vor der Schleife konstant gesetzt.
+            env._update_command_tracking_ema()  # EMA-Geschw. für das (zeitgemittelte) Command-Tracking
+
+            # Command setzen: instant → folgt der EMA-Geschwindigkeit (tracking_* = exp(0) = 1.0,
+            # validiert das Formel-Maximum). mean → bereits vor der Schleife konstant gesetzt.
             if args.cmd_mode == "instant":
-                env.commands[:, 0] = env.base_lin_vel_heading[:, 0]
-                env.commands[:, 1] = env.base_lin_vel_heading[:, 1]
-                env.commands[:, 2] = env.base_ang_vel[:, 2]
+                env.commands[:, 0] = env.lin_vel_ema[:, 0]
+                env.commands[:, 1] = env.lin_vel_ema[:, 1]
+                env.commands[:, 2] = env.ang_vel_z_ema
                 cmd_vx = float(env.commands[0, 0])
                 cmd_vy = float(env.commands[0, 1])
                 cmd_yaw = float(env.commands[0, 2])
@@ -310,22 +345,22 @@ def main():
             frames.append(render_frame(env, cmd_unit_world, cmd_vx, cmd_vy, speed))
 
             if use_wandb:
-                wandb.log(row, step=t)
+                wandb.log(row, step=step)
 
     # ---- Video schreiben + zu wandb ----
     imageio.mimsave(args.out, frames, fps=int(round(fps)))
     print(f"[hero] Video geschrieben: {args.out}  ({len(frames)} Frames)")
 
-    duration_s = T / fps
+    duration_s = n_steps / fps
     summary = {f"episode/rew_{n}": s / duration_s for n, s in episode_sums.items()}
     summary["episode/return_total"] = sum(episode_sums.values())
     # ROHE Mittel ∈[0,1]: das ist der "Hero"-Wert je Term (1.0 = perfekt). Nicht mit reward_step
     # (raw*scale*dt, daher winzig) oder reward_raw-Kurven verwechseln.
-    raw_mean = {f"episode/raw_mean_{n}": s / T for n, s in raw_sums.items()}
+    raw_mean = {f"episode/raw_mean_{n}": s / n_steps for n, s in raw_sums.items()}
     summary.update(raw_mean)
     print("\n[hero] ROHE Reward-Mittel (∈[0,1], 1.0=perfekt) — der eigentliche Hero-Maßstab:")
     for n in reward_names:
-        print(f"  raw_mean/{n:18s} {raw_sums[n] / T:6.3f}")
+        print(f"  raw_mean/{n:18s} {raw_sums[n] / n_steps:6.3f}")
     print("[hero] skalierte (raw*scale*dt) Episodenmittel:")
     for k, v in summary.items():
         if k.startswith("episode/rew_") or k == "episode/return_total":
@@ -334,8 +369,8 @@ def main():
     if use_wandb:
         import wandb
 
-        wandb.log({"hero_video": wandb.Video(args.out, fps=int(round(fps)), format="mp4")}, step=T)
-        wandb.log(summary, step=T)
+        wandb.log({"hero_video": wandb.Video(args.out, fps=int(round(fps)), format="mp4")}, step=n_steps)
+        wandb.log(summary, step=n_steps)
         wandb.finish()
 
 

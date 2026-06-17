@@ -167,6 +167,16 @@ class K1Env:
         spawn_rpy[0, 2] = spawn_yaw
         self.inv_heading_quat = inv_quat(xyz_to_quat(spawn_rpy)).expand(num_envs, -1).clone()
 
+        # Command-Tracking auf der ZEITGEMITTELTEN (EMA-)Geschwindigkeit statt der momentanen: eine
+        # natürliche Gangart pendelt innerhalb jedes Schritts → gegen ein konstantes Command kann der
+        # Momentanwert nie ≈1 erreichen. Über ein Schrittzyklus-Fenster gemittelt fällt die Oszillation
+        # raus → die perfekte Referenz (korrektes MITTEL) wird zum Reward-Optimum. tracking misst das
+        # "Was" (mittlere Sollgeschw.), style das "Wie" (Dynamik je Frame) — kein Konflikt mehr.
+        self.tracking_ema_window_s = float(reward_cfg.get("tracking_ema_window_s", 0.5))
+        self.vel_ema_alpha = math.exp(-self.dt / self.tracking_ema_window_s)
+        self.lin_vel_ema = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        self.ang_vel_z_ema = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+
         self.projected_gravity = torch.empty_like(self.base_ang_vel)
         self.commands = torch.empty((num_envs, self.num_commands), dtype=gs.tc_float, device=gs.device)
         self.commands_scale = torch.tensor(
@@ -209,14 +219,17 @@ class K1Env:
         self.foot_air_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
         self.feet_air_time_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
 
-        # leg_symmetry: Strafe für nicht-alternierenden Gang (siehe _reward_leg_symmetry). Beide Füße
-        # gleichzeitig in der Luft (Flugphase, im Gehen nie gültig) → sofort bestraft; beide gleichzeitig
-        # am Boden (Doppelstütze) → nur die Überdauer über das natürliche Doppelstütz-Fenster hinaus.
+        # leg_symmetry: Strafe für nicht-alternierenden Gang (siehe _reward_leg_symmetry). Sowohl die
+        # Doppelstütze (beide am Boden) als auch die Flugphase (beide in der Luft) sind als kurze
+        # Übergänge natürlich (Doppelstütze beim Gehen, Flugphase beim Laufen/Jog) → es wird jeweils
+        # nur die ÜBERDAUER über ein erlaubtes Fenster bestraft, nicht das Auftreten an sich.
         self.both_stance_time = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        self.both_air_time = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
         self.leg_symmetry_penalty = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
-        # leg_symmetry: erlaubte Doppelstütz-Dauer [s]. Der Timer (both_stance_time) zählt eine
-        # zusammenhängende Doppelstütze; Gemeinsames Stehen darüber hinaus wird bestraft.
+        # leg_symmetry: erlaubte Doppelstütz-/Flugdauer [s]. Die Timer zählen je eine
+        # zusammenhängende Doppelstütze bzw. Flugphase; nur die Überdauer darüber hinaus wird bestraft.
         self.ds_allow_time = float(self.reward_cfg["leg_symmetry_ds_allow_s"])
+        self.flight_allow_time = float(self.reward_cfg.get("leg_symmetry_flight_allow_s", 0.20))
 
         # style (feature-matching Style-Reward): belohnt Nähe der Live-Bewegung zur NPZ-Referenz im
         # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
@@ -345,6 +358,7 @@ class K1Env:
         self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
         self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
         self._update_foot_contact()
+        self._update_command_tracking_ema()
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
@@ -408,6 +422,8 @@ class K1Env:
             self.base_lin_vel.zero_()
             self.base_lin_vel_heading.zero_()
             self.base_ang_vel.zero_()
+            self.lin_vel_ema.zero_()
+            self.ang_vel_z_ema.zero_()
             self._set_heading_reference()
             self.dof_vel.zero_()
             self.actions.zero_()
@@ -419,6 +435,7 @@ class K1Env:
             self.foot_air_time.zero_()
             self.feet_air_time_reward.zero_()
             self.both_stance_time.zero_()
+            self.both_air_time.zero_()
             self.leg_symmetry_penalty.zero_()
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
@@ -430,6 +447,8 @@ class K1Env:
             self.base_lin_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.base_lin_vel_heading.masked_fill_(envs_idx[:, None], 0.0)
             self.base_ang_vel.masked_fill_(envs_idx[:, None], 0.0)
+            self.lin_vel_ema.masked_fill_(envs_idx[:, None], 0.0)
+            self.ang_vel_z_ema.masked_fill_(envs_idx, 0.0)
             self._set_heading_reference(envs_idx)
             self.dof_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.actions.masked_fill_(envs_idx[:, None], 0.0)
@@ -441,6 +460,7 @@ class K1Env:
             self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
             self.both_stance_time.masked_fill_(envs_idx, 0.0)
+            self.both_air_time.masked_fill_(envs_idx, 0.0)
             self.leg_symmetry_penalty.masked_fill_(envs_idx, 0.0)
 
         # fill extras
@@ -495,17 +515,33 @@ class K1Env:
         self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
 
         # leg_symmetry: alternierender Gang = genau ein Fuß schwingt, der andere stützt; dann Wechsel.
-        # both_air (beide in der Luft) ist im Gehen nie gültig → sofort als Flag bestrafen. both_stance
-        # (Doppelstütze) ist nur kurz natürlich → Dauer akkumulieren und die Überdauer über ds_allow_time
-        # hinaus bestrafen. Beides nur bei cmd_speed > feet_air_cmd_threshold (im Stand kein Wechselzwang).
+        # both_stance (Doppelstütze) und both_air (Flugphase) sind als KURZE Übergänge natürlich
+        # (Doppelstütze beim Gehen, Flugphase beim Laufen/Jog). Daher je einen Timer akkumulieren und
+        # nur die Überdauer über das erlaubte Fenster (ds_allow_time / flight_allow_time) bestrafen —
+        # sonst würde jeder saubere Laufschritt für seine Flugphase bestraft. Nur bei cmd_speed >
+        # feet_air_cmd_threshold (im Stand kein Wechselzwang).
         both_air = (~in_contact[:, 0]) & (~in_contact[:, 1])
         both_stance = in_contact[:, 0] & in_contact[:, 1]
         self.both_stance_time += self.dt
         self.both_stance_time *= both_stance.to(gs.tc_float)  # nur bei Doppelstütze weiterzählen, sonst 0
         ds_excess = torch.clamp(self.both_stance_time - self.ds_allow_time, min=0.0)
-        self.leg_symmetry_penalty.copy_((both_air.to(gs.tc_float) + ds_excess) * active)
+        self.both_air_time += self.dt
+        self.both_air_time *= both_air.to(gs.tc_float)  # nur bei Flugphase weiterzählen, sonst 0
+        air_excess = torch.clamp(self.both_air_time - self.flight_allow_time, min=0.0)
+        self.leg_symmetry_penalty.copy_((air_excess + ds_excess) * active)
 
         self.foot_in_contact.copy_(in_contact)
+
+    def _update_command_tracking_ema(self):
+        """EMA-Tiefpass der Heading-Lineargeschw. (xy) und Yaw-Rate für das Command-Tracking.
+
+        v_ema = α·v_ema + (1−α)·v, mit α = exp(−dt / tracking_ema_window_s). Glättet die
+        natürliche Innerhalb-des-Schritts-Oszillation heraus, sodass tracking_* die mittlere
+        Sollgeschwindigkeit misst (siehe __init__). Inference-mode-kompatibel (in-place).
+        """
+        a = self.vel_ema_alpha
+        self.lin_vel_ema.mul_(a).add_(self.base_lin_vel_heading[:, :2], alpha=1.0 - a)
+        self.ang_vel_z_ema.mul_(a).add_(self.base_ang_vel[:, 2], alpha=1.0 - a)
 
     def _update_observation(self):
         obs_parts = [
@@ -540,31 +576,34 @@ class K1Env:
     def _reward_tracking_lin_vel(self):
         """Belohnung: vorwärts/seitwärts wie commands [vx, vy] in Spawn-Heading fahren.
 
-        Misst quadrierten Fehler zwischen Ziel- und Ist-Geschwindigkeit im Heading-Frame
-        (base_lin_vel_heading, fixiert bei Episode-Start) — nicht im rotierenden Körper-Frame.
-        Verhindert den Spin-Hack: Körper-vx kann hoch bleiben, während die Welt-Bahn driftet.
-        exp(-fehler / sigma) → 1.0 bei perfektem Treffer, sinkt bei Abweichung.
+        Misst den quadrierten Fehler zwischen Ziel und der ZEITGEMITTELTEN (EMA, ~tracking_ema_window_s)
+        Ist-Geschwindigkeit im Heading-Frame (lin_vel_ema) — nicht der momentanen und nicht im
+        rotierenden Körper-Frame. Die EMA glättet die natürliche Innerhalb-des-Schritts-Oszillation,
+        sodass eine perfekte Gangart mit korrektem Geschwindigkeits-MITTEL ≈1.0 erreicht (sonst zieht
+        die Stride-Oszillation den Momentanwert dauerhaft unter 1). Verhindert weiter den Spin-Hack
+        (Heading-Frame statt Körper-Frame). exp(-fehler / sigma) → 1.0 bei perfektem Treffer.
 
-        Beispiel (sigma=0.25, scale=1.0, dt=0.02):
-          command [0.5, 0.0], Heading-Ist [0.5, 0.0]  → fehler=0      → return 1.0   → +0.02/Step
-          command [0.5, 0.0], Heading-Ist [0.3, 0.0]  → fehler=0.04   → return≈0.85  → +0.017/Step
-          Spin: Körper-vx=0.5, Heading-vx=0.0         → fehler=0.25   → return≈0.37  → +0.007/Step
+        Beispiel (sigma=0.2, scale=2.0, dt=0.02):
+          command [0.5, 0.0], EMA-Ist [0.5, 0.0]  → fehler=0      → return 1.0
+          command [0.5, 0.0], EMA-Ist [0.3, 0.0]  → fehler=0.04   → return≈0.82
         """
         lin_vel_error = torch.sum(
-            torch.square(self.commands[:, :2] - self.base_lin_vel_heading[:, :2]), dim=1
+            torch.square(self.commands[:, :2] - self.lin_vel_ema), dim=1
         )
         return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
 
     def _reward_tracking_ang_vel(self):
         """Belohnung: Drehgeschwindigkeit wie command [yaw] einhalten.
 
-        Wie tracking_lin_vel, aber nur die z-Achse (Drehen um Hochachse).
+        Wie tracking_lin_vel, aber nur die z-Achse (Drehen um Hochachse) und auf der ZEITGEMITTELTEN
+        Yaw-Rate (ang_vel_z_ema). Die EMA mittelt die starke Yaw-Oszillation je Schritt (Hüft-/Schulter-
+        rotation beim Gehen) heraus → perfekte Gangart mit Soll-Drehrate erreicht ≈1.0.
 
-        Beispiel (sigma=0.25, scale=0.2, dt=0.02):
-          command 0.0 rad/s, Ist 0.0  → return 1.0  → +0.002/Step
-          command 0.0 rad/s, Ist 0.5  → fehler=0.25 → return≈0.37 → +0.0007/Step
+        Beispiel (sigma=0.2):
+          command 0.0 rad/s, EMA-Ist 0.0  → return 1.0
+          command 0.0 rad/s, EMA-Ist 0.2  → fehler=0.04 → return≈0.82
         """
-        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        ang_vel_error = torch.square(self.commands[:, 2] - self.ang_vel_z_ema)
         return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
 
     def _reward_survival(self):
@@ -644,13 +683,15 @@ class K1Env:
         """Strafe: Beine laufen nicht alternierend (anti-phasig: ein Fuß schwingt, der andere stützt).
 
         Bündelt die Links/Rechts-Symmetrie in EINEM Term. In _update_foot_contact je Step verbucht
-        (leg_symmetry_penalty), nur bei cmd_speed > feet_air_cmd_threshold:
-          - both_air (beide Füße in der Luft): Flugphase, im Gehen nie gültig → Flag 1.0 sofort bestraft.
-          - both_stance (Doppelstütze): nur kurz natürlich → Dauer akkumuliert, bestraft wird die Überdauer
-            max(0, both_stance_time − ds_allow_time).
+        (leg_symmetry_penalty), nur bei cmd_speed > feet_air_cmd_threshold. Sowohl Doppelstütze als
+        auch Flugphase sind als KURZE Übergänge natürlich (Doppelstütze beim Gehen, Flugphase beim
+        Laufen/Jog); bestraft wird je nur die Überdauer über das erlaubte Fenster:
+          - both_air (Flugphase):   max(0, both_air_time   − flight_allow_time)
+          - both_stance (Doppelstütze): max(0, both_stance_time − ds_allow_time)
 
-        Ausgabe gebunden ∈[0,1): tanh(leg_symmetry_penalty / leg_symmetry_sigma). 0 sauberer
-        Wechselschritt (Einzelstütze), →1 bei Flugphase/zu langer Doppelstütze. Stehen (cmd≈0) → 0.
+        Ausgabe gebunden ∈[0,1): tanh(leg_symmetry_penalty / leg_symmetry_sigma). 0 bei sauberem
+        Wechselschritt (inkl. normaler Lauf-Flugphase), →1 bei zu langer Flug-/Doppelstützphase
+        (Hüpfen, Stillstand auf beiden Beinen). Stehen (cmd≈0) → 0.
         """
         return torch.tanh(self.leg_symmetry_penalty / self.reward_cfg["leg_symmetry_sigma"])
 

@@ -37,6 +37,7 @@ import argparse
 import os
 
 import numpy as np
+import yaml
 
 # CSV dof-column order = Booster K1_22dof joint order (== GMR/robocup cfg order).
 # Used only to label the CSV columns; mapping to the Genesis robot is by NAME.
@@ -55,20 +56,12 @@ FOOT_LINKS = ("left_foot_link", "right_foot_link")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_URDF = os.path.join(REPO_ROOT, "models", "K1", "K1_22dof.urdf")
 DEFAULT_OUT = os.path.join(REPO_ROOT, "walk", "data", "motions", "k1_jogging_motion.npz")
+DEFAULT_CONFIG = os.path.join(REPO_ROOT, "walk", "config", "k1_env.yaml")
 
 AMP_OBS_DIM = 1 + 3 + 3 + N_DOF + N_DOF + 2  # root_h, proj_g, ang_b, dof, dof_vel, foot_clear = 53
 
 
 # ─── inlined math helpers (no external deps) ─────────────────────────────────
-
-
-def projected_gravity(quat_wxyz: np.ndarray) -> np.ndarray:
-    """Gravity (0,0,-1) in body frame from (w,x,y,z) world→body quats. (N,3)."""
-    w, x, y, z = quat_wxyz[:, 0], quat_wxyz[:, 1], quat_wxyz[:, 2], quat_wxyz[:, 3]
-    gx = -2.0 * (x * z + w * y)
-    gy = -2.0 * (y * z - w * x)
-    gz = -(1.0 - 2.0 * (x * x + y * y))
-    return np.stack([gx, gy, gz], axis=-1).astype(np.float32)
 
 
 def body_frame_velocity(quat_wxyz: np.ndarray, vel_world: np.ndarray) -> np.ndarray:
@@ -139,6 +132,8 @@ def main() -> None:
     ap.add_argument("--csv", required=True, help="GMR beyondmimic CSV (root_pos3, root_rot xyzw4, dof22)")
     ap.add_argument("--out", default=DEFAULT_OUT, help=f"output NPZ (default {DEFAULT_OUT})")
     ap.add_argument("--urdf", default=DEFAULT_URDF, help="K1 URDF for Genesis FK")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help="k1_env.yaml — liefert default_joint_angles/base_init_pos für die Steh-Boden-Referenz")
     ap.add_argument("--src-fps", type=float, default=30.0)
     ap.add_argument("--out-fps", type=float, default=50.0)
     ap.add_argument("--start", type=int, default=0)
@@ -181,10 +176,12 @@ def main() -> None:
     ang_world = np.zeros((M, 3))
     ang_world[:-1] = quat_ang_vel_world(quat[:-1], quat[1:], dt); ang_world[-1] = ang_world[-2]
     root_ang_vel_body = body_frame_velocity(quat.astype(np.float32), ang_world.astype(np.float32))
-    proj_g = projected_gravity(quat.astype(np.float32))
 
     # ── 4. Genesis forward kinematics ──
     import genesis as gs
+    import torch
+    from genesis.utils.geom import inv_quat, transform_by_quat
+
     gs.init(backend=getattr(gs, args.backend), logging_level="warning")
     scene = gs.Scene(show_viewer=False)
     robot = scene.add_entity(gs.morphs.URDF(file=os.path.abspath(args.urdf)))
@@ -199,7 +196,22 @@ def main() -> None:
     link_names = [l.name for l in robot.links]
     foot_idx = [robot.get_link(n).idx_local for n in FOOT_LINKS]
 
-    import torch
+    # projected_gravity EXAKT wie in K1Env (genesis transform_by_quat), nicht per Numpy-Formel — sonst
+    # weicht das Style-Feature der Referenz von der Live-Berechnung ab (~0.025) und cappt den Style-Reward.
+    gg = torch.tensor([0.0, 0.0, -1.0], dtype=gs.tc_float, device=gs.device).expand(M, 3)
+    gq = torch.as_tensor(quat, dtype=gs.tc_float, device=gs.device)
+    proj_g = transform_by_quat(gg, inv_quat(gq)).detach().cpu().numpy().astype(np.float32)
+
+    # Steh-Boden-Referenz: Fuß-z in der Default-Steh-Pose aus k1_env.yaml (== K1Env.style_ground_z). So
+    # ist foot_clear der Referenz auf dieselbe Nulllinie bezogen wie die Live-Berechnung im Style-Reward.
+    ecfg = yaml.safe_load(open(args.config))["env_cfg"]
+    base_init_pos = ecfg["base_init_pos"]
+    base_init_quat = ecfg.get("base_init_quat", [1.0, 0.0, 0.0, 0.0])
+    stand_dof = np.array([ecfg["default_joint_angles"].get(n, 0.0) for n in gen_joint_names], dtype=np.float64)
+    stand_qpos = np.concatenate([base_init_pos, base_init_quat, stand_dof])
+    lp_stand, _ = robot.forward_kinematics(torch.as_tensor(stand_qpos, dtype=gs.tc_float, device=gs.device))
+    ground = lp_stand.detach().cpu().numpy()[foot_idx, 2]    # (2,) Steh-Fuß-z je Fuß
+
     qpos = np.concatenate([root_pos, quat, dof_gen], axis=1)  # (M, 7+22) wxyz base
     body_pos_w = np.zeros((M, len(link_names), 3), dtype=np.float32)
     body_quat_w = np.zeros((M, len(link_names), 4), dtype=np.float32)
@@ -208,11 +220,17 @@ def main() -> None:
         body_pos_w[i] = lp.detach().cpu().numpy()
         body_quat_w[i] = lq.detach().cpu().numpy()
 
-    foot_z = body_pos_w[:, foot_idx, 2]                       # (M,2)
-    ground = foot_z.min(0)
-    foot_clear = np.clip(foot_z - ground, 0.0, 0.5).astype(np.float32)
+    # Vertikal ausrichten: tiefsten Fuß der Motion auf die Steh-Boden-Höhe heben (kein Schweben/Eintauchen
+    # beim Replay). Reine z-Translation der Wurzel → verschiebt alle Link-z gleich; Geschwindigkeiten
+    # (Finite-Differenz) bleiben unverändert.
+    foot_z_raw = body_pos_w[:, foot_idx, 2]
+    shift = float(ground.min() - foot_z_raw.min())
+    root_pos[:, 2] += shift
+    body_pos_w[:, :, 2] += shift
+    foot_z = foot_z_raw + shift                              # (M,2)
+    foot_clear = np.clip(foot_z - ground[None, :], 0.0, 0.5).astype(np.float32)
     swing = (foot_clear > 0.03).mean(0)
-    print(f"[fk] {len(link_names)} links | foot ground z={np.round(ground, 3)} "
+    print(f"[fk] {len(link_names)} links | steh-ground z={np.round(ground, 4)} | z-shift={shift:+.4f} "
           f"clearance max={np.round(foot_clear.max(0), 3)} swing frac(>0.03)={np.round(swing, 2)}")
 
     # ── 5. save per-frame NPZ ──
