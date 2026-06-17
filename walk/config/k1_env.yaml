@@ -1,6 +1,6 @@
 # Booster K1 locomotion — 16-DOF (12 legs + 4 arms).
 # Unbenutzte DOFs (Shoulder_Roll, Elbow_Yaw, Kopf) per PD fix gehalten (fixed_joint_names).
-# Obs dim = 9 + 3*16 = 57 (auto in K1_env.py). Nur deploy-fähige Größen (IMU + Gelenke + commands + Aktion).
+# Obs dim = 9 + 3*16 + 2 = 59 (auto in K1_env.py). Enthält base_lin_vel_heading (privilegiert, sim-only).
 
 env_cfg:
   num_actions: 16
@@ -150,9 +150,9 @@ reward_cfg:
     # ── Task (Hero-Ziel: raw_mean ≈ 0.9–1.0) ─────────────────────────────────────
     # Hero 2025-06: tracking_lin 0.91, tracking_ang 0.91, style 1.0, survival 1.0
     # → zusammen ~5.3/s Beitrag; dominieren das Return klar.
-    tracking_lin_vel: 2.0   # primär: Command-Geschwindigkeit (EMA-geglättet)
+    tracking_lin_vel: 2.5   # primär: Command-Geschwindigkeit (EMA-geglättet)
     tracking_ang_vel: 0.75  # 0.5→0.75: yaw-Tracking wichtiger, Hero raw≈0.91 wie lin_vel
-    survival: 1.0
+    #survival: 1.0
     style: 2.0              # co-primär mit tracking: perfekter Gang = 1.0
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────

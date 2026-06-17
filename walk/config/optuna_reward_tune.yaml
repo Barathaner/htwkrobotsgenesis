@@ -27,7 +27,6 @@ search_space:
   tracking_lin_vel: {low: 0.5,  high: 5.0,  log: true}   # (2.0)  primär
   tracking_ang_vel: {low: 0.2,  high: 2.0,  log: true}   # (0.75) kleiner als lin
   style:            {low: 0.5,  high: 5.0,  log: true}   # (2.0)  co-primär
-  survival:         {low: 0.25, high: 2.0,  log: true}   # (1.0)
   feet_air_time:    {low: 1.0,  high: 12.0, log: true}   # (4.0)  Impuls-Reward → hohe Scales nötig
 
   # ── Kontakt / Schritt (negativ = Strafe) ───────────────────────────────────
@@ -45,7 +44,6 @@ objective:
     tracking_lin_vel: 2.0
     tracking_ang_vel: 1.5
     style: 2.0
-    survival: 1.0
     feet_air_time: 0.5
     feet_slip: -0.3
     orientation: -0.2
