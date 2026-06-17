@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 
+import imageio.v2 as imageio
 import torch
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import check_nan
+
+from k1_video_overlay import render_annotated_frame
 
 
 class K1TrainRunner(OnPolicyRunner):
@@ -39,9 +43,10 @@ class K1TrainRunner(OnPolicyRunner):
             from K1_env import K1Env
 
             env_cfg, obs_cfg, reward_cfg, command_cfg = self.video_env_cfgs
+            # Video-Env mit eigener Scene; env_cfg enthält video-Block (seitliche Hero-Kamera).
             self._video_env = K1Env(
                 num_envs=1,
-                env_cfg=env_cfg,
+                env_cfg=copy.deepcopy(env_cfg),
                 obs_cfg=obs_cfg,
                 reward_cfg=reward_cfg,
                 command_cfg=command_cfg,
@@ -59,7 +64,7 @@ class K1TrainRunner(OnPolicyRunner):
         path = os.path.join(video_dir, f"train_{it}.mp4")
 
         policy = self.get_inference_policy(device=self.device)
-        video_env.cam.start_recording()
+        frames = []
 
         with torch.inference_mode():
             obs = video_env.reset()
@@ -67,10 +72,10 @@ class K1TrainRunner(OnPolicyRunner):
                 actions = policy(obs)
                 obs, _, _, _ = video_env.step(actions)
                 if video_env.cam._followed_entity is not None:
-                    video_env.cam.update_following()  # Kamera dem Roboter nachführen
-                video_env.cam.render()
+                    video_env.cam.update_following()
+                frames.append(render_annotated_frame(video_env))
 
-        video_env.cam.stop_recording(save_to_filename=path, fps=self.video_fps)
+        imageio.mimsave(path, frames, fps=self.video_fps)
         print(f"Recorded rollout video: {path}")
         return path
 

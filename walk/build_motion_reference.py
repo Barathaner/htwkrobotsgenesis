@@ -124,6 +124,33 @@ def build_amp_obs(root_h, proj_g, ang_b, dof_pos, dof_vel, foot_clear) -> np.nda
     ], axis=1).astype(np.float32)
 
 
+def find_lead_in_trim(foot_clear: np.ndarray, contact_height: float = 0.06) -> int:
+    """Ersten Frame finden, an dem mindestens ein Fuß Bodenkontakt hat.
+
+    GMR-Retargets starten oft mit beiden Füßen in der Luft (Lead-in). Diese Frames
+    erzeugen Style-Dips am Zyklusstart (Hero-Loop) und passen nicht zum Trainings-Reset
+    (stehend). Rückgabe: Anzahl abzuschneidender Anfangsframes (0 = nichts tun).
+    """
+    in_contact = foot_clear < contact_height
+    grounded = in_contact[:, 0] | in_contact[:, 1]
+    if not np.any(grounded):
+        return 0
+    return int(np.argmax(grounded))
+
+
+def trim_motion_arrays(trim: int, **arrays: np.ndarray) -> dict[str, np.ndarray]:
+    """Schneidet die ersten ``trim`` Frames von allen per-Frame-Arrays ab."""
+    if trim <= 0:
+        return arrays
+    out = {}
+    for key, arr in arrays.items():
+        if arr.ndim >= 1 and arr.shape[0] > trim:
+            out[key] = arr[trim:]
+        else:
+            out[key] = arr
+    return out
+
+
 # ─── main ────────────────────────────────────────────────────────────────────
 
 
@@ -141,6 +168,10 @@ def main() -> None:
     ap.add_argument("--backend", choices=["gpu", "cpu"], default="gpu")
     ap.add_argument("--emit-transitions", action="store_true",
                     help="also write 53-dim AMP transitions (M-1,106) next to --out")
+    ap.add_argument("--no-trim-lead-in", action="store_true",
+                    help="Lead-in nicht abschneiden (beide Füße in der Luft am Anfang behalten)")
+    ap.add_argument("--lead-in-contact-height", type=float, default=0.06,
+                    help="Fuß gilt als am Boden wenn foot_clear < diesem Wert [m] (wie Hero/K1Env)")
     args = ap.parse_args()
 
     # ── 1. load + crop ──
@@ -232,6 +263,35 @@ def main() -> None:
     swing = (foot_clear > 0.03).mean(0)
     print(f"[fk] {len(link_names)} links | steh-ground z={np.round(ground, 4)} | z-shift={shift:+.4f} "
           f"clearance max={np.round(foot_clear.max(0), 3)} swing frac(>0.03)={np.round(swing, 2)}")
+
+    # Lead-in abschneiden: erste Frames mit beiden Füßen in der Luft (Retarget-Artefakt).
+    trim = 0 if args.no_trim_lead_in else find_lead_in_trim(foot_clear, args.lead_in_contact_height)
+    if trim > 0:
+        trimmed = trim_motion_arrays(
+            trim,
+            root_pos=root_pos,
+            quat=quat,
+            root_lin_vel=root_lin_vel,
+            root_ang_vel_body=root_ang_vel_body,
+            dof=dof,
+            dof_vel=dof_vel,
+            body_pos_w=body_pos_w,
+            body_quat_w=body_quat_w,
+            foot_clear=foot_clear,
+            proj_g=proj_g,
+        )
+        root_pos = trimmed["root_pos"]
+        quat = trimmed["quat"]
+        root_lin_vel = trimmed["root_lin_vel"]
+        root_ang_vel_body = trimmed["root_ang_vel_body"]
+        dof = trimmed["dof"]
+        dof_vel = trimmed["dof_vel"]
+        body_pos_w = trimmed["body_pos_w"]
+        body_quat_w = trimmed["body_quat_w"]
+        foot_clear = trimmed["foot_clear"]
+        proj_g = trimmed["proj_g"]
+        M = root_pos.shape[0]
+        print(f"[trim] lead-in: dropped first {trim} frames (both-air) → {M} frames remain")
 
     # ── 5. save per-frame NPZ ──
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
