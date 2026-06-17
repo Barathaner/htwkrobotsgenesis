@@ -255,6 +255,11 @@ class K1Env:
         self.ds_allow_time = float(self.reward_cfg["leg_symmetry_ds_allow_s"])
         self.flight_allow_time = float(self.reward_cfg.get("leg_symmetry_flight_allow_s", 0.20))
 
+        # gait_clock: continuous phase oscillator ∈ [0, 2π); drives phase-matched foot contact reward.
+        self.gait_phase = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        self.gait_freq_base  = float(reward_cfg.get("gait_freq_base",  0.5))   # [Hz] at zero speed
+        self.gait_freq_scale = float(reward_cfg.get("gait_freq_scale", 0.8))   # [Hz / (m/s)]
+
         # Random push state (always allocated; only used when push_enabled=True)
         self.push_force_buf = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
         self.push_steps_remaining = torch.zeros((num_envs,), dtype=gs.tc_int, device=gs.device)
@@ -292,6 +297,7 @@ class K1Env:
             "base_height": 1,            # Rumpfhöhe [m]
             "base_lin_vel_z": 1,         # vertikale Geschw. [m/s] (Fallen/Hüpfen)
             "foot_contact": 2,           # Bodenkontakt je Fuß (0/1)
+            "gait_clock": 2,             # Phasen-Uhr [sin φ, cos φ] für Schritt-Synchronisierung
             # ── deploy-fähig ──────────────────────────────────────────────────
             "dof_pos": self.dof_pos.shape[-1],
             "dof_vel": self.dof_vel.shape[-1],
@@ -412,6 +418,7 @@ class K1Env:
         self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
         self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
         self._update_foot_contact()
+        self._update_gait_phase()
         self._update_command_tracking_ema()
 
         self.rew_buf.zero_()
@@ -506,6 +513,7 @@ class K1Env:
             self.both_stance_time.zero_()
             self.both_air_time.zero_()
             self.leg_symmetry_penalty.zero_()
+            self.gait_phase.uniform_(0, 2 * math.pi)
             self.push_force_buf.zero_()
             self.push_steps_remaining.zero_()
         else:
@@ -533,6 +541,8 @@ class K1Env:
             self.both_stance_time.masked_fill_(envs_idx, 0.0)
             self.both_air_time.masked_fill_(envs_idx, 0.0)
             self.leg_symmetry_penalty.masked_fill_(envs_idx, 0.0)
+            rand_phase = torch.rand_like(self.gait_phase) * (2 * math.pi)
+            torch.where(envs_idx, rand_phase, self.gait_phase, out=self.gait_phase)
             self.push_force_buf.masked_fill_(envs_idx[:, None], 0.0)
             self.push_steps_remaining.masked_fill_(envs_idx, 0)
 
@@ -630,6 +640,7 @@ class K1Env:
             self.base_pos[:, 2:3],
             self.base_lin_vel[:, 2:3] * self.obs_scales["lin_vel"],
             self.foot_in_contact.to(gs.tc_float),
+            torch.stack([torch.sin(self.gait_phase), torch.cos(self.gait_phase)], dim=1),
             # deploy-fähig
             (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
             self.dof_vel * self.obs_scales["dof_vel"],
@@ -777,6 +788,30 @@ class K1Env:
         (Hüpfen, Stillstand auf beiden Beinen). Stehen (cmd≈0) → 0.
         """
         return torch.tanh(self.leg_symmetry_penalty / self.reward_cfg["leg_symmetry_sigma"])
+
+    def _update_gait_phase(self):
+        """Advance gait phase clock based on commanded speed (speed-adaptive frequency)."""
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        freq = self.gait_freq_base + self.gait_freq_scale * cmd_speed
+        self.gait_phase = (self.gait_phase + 2 * math.pi * freq * self.dt) % (2 * math.pi)
+
+    def _reward_gait_clock(self):
+        """Belohnung ∈[−1,1]: Fuß-Kontaktmuster stimmt mit Phasen-Uhr überein.
+
+        Linker Fuß soll in der Kontaktphase (sin φ > 0) am Boden sein, rechter Fuß
+        anti-phasig (sin(φ+π) = −sin φ > 0 in der zweiten Hälfte). Gibt +1 wenn
+        beide Füße perfekt synchron mit der Uhr sind, −1 wenn beide falsch liegen.
+        Wie andere Kontakt-Rewards auf cmd_speed > feet_air_cmd_threshold gegated.
+        """
+        c = self.foot_in_contact.to(gs.tc_float)   # (n, 2)
+        state = 2.0 * c - 1.0                      # ±1: +1 = Kontakt, −1 = Schwung
+        expect = torch.stack([
+            torch.sin(self.gait_phase),
+            torch.sin(self.gait_phase + math.pi),  # = −sin(phase): rechter Fuß anti-phasig
+        ], dim=1)                                   # (n, 2) ∈ [−1, 1]
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
+        return (state * expect).mean(dim=1) * active
 
     def _reward_dof_vel(self):
         """Strafe (gebunden ∈[0,1)): hohe Gelenkgeschwindigkeiten dämpfen (Energie/Vibration).

@@ -1,6 +1,6 @@
 # Booster K1 locomotion — 16-DOF (12 legs + 4 arms).
 # Unbenutzte DOFs (Shoulder_Roll, Elbow_Yaw, Kopf) per PD fix gehalten (fixed_joint_names).
-# Obs dim = 3+3+3 + 2+2+1+1+1+2 + 16+16+16 = 66 (auto in K1_env.py). Privilegiert (sim-only): lin_vel_heading(2), lin_vel_ema(2), ang_vel_z_ema(1), base_height(1), lin_vel_z(1), foot_contact(2).
+# Obs dim = 3+3+3 + 2+2+1+1+1+2+2 + 16+16+16 = 68 (auto in K1_env.py). Privilegiert (sim-only): lin_vel_heading(2), lin_vel_ema(2), ang_vel_z_ema(1), base_height(1), lin_vel_z(1), foot_contact(2), gait_clock(2).
 
 env_cfg:
   num_actions: 16
@@ -158,6 +158,10 @@ reward_cfg:
   feet_air_time_target: 0.25      # [s] Hero-Jog ~0.15–0.20 s Luftzeit/Schritt; 0.25 → Touchdown-Bonus ~0.6–0.8
   feet_air_cmd_threshold: 0.05    # [m/s] darunter kein Reward
 
+  # gait_clock: speed-adaptive phase oscillator for foot-contact synchronization
+  gait_freq_base:  0.5    # [Hz] step frequency at zero command speed
+  gait_freq_scale: 0.8    # [Hz per m/s] → at 1.5 m/s jog: 0.5 + 0.8×1.5 = 1.7 Hz
+
   # leg_symmetry (alternierender Gang: ein Fuß schwingt, der andere stützt; dann Wechsel)
   leg_symmetry_ds_allow_s: 0.15      # [s] erlaubte Doppelstütz-Dauer je Phase (natürl. (2·stance_ratio−1)·period/2 ≈ 0.11)
   leg_symmetry_flight_allow_s: 0.20  # [s] erlaubte Flugphase je Schritt (Lauf/Jog hat natürliche Flugphasen ~0.1–0.2s); nur Überdauer bestraft
@@ -196,6 +200,7 @@ reward_cfg:
     feet_air_time: 4.0       # 1.5→4.0: Hero +0.04/s→~+0.10/s; style deckt Schwung mit ab
     feet_slip: -0.5         # -1.0→-0.35: Hero war -0.44/s (dominierte alle Strafen); σ=1.5 mildert tanh
     leg_symmetry: -0.25      # aktiviert: Hero ~0.10 → ~-0.025/s; sanfter Wechselschritt-Nudge
+    gait_clock: 1.0          # ∈[−1,1]×scale×dt; +1 = beide Füße perfekt mit Uhr, −1 = beide falsch
 
     # ── Regularizer (Hero-Ziel: raw_mean ≈ 0.05–0.12, klein vs. Task) ─────────
     action_rate: -0.15        # Hero ~0.09

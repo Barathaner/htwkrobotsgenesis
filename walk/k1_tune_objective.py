@@ -13,6 +13,7 @@ DEFAULT_OBJECTIVE_WEIGHTS: dict[str, float] = {
     "feet_air_time": 0.5,
     "feet_slip": -0.3,
     "leg_symmetry": -0.15,
+    "gait_clock": 0.5,
     "orientation": -0.2,
     "base_height": -0.1,
 }
