@@ -39,8 +39,6 @@ def build_train_cfg(
     exp_name: str,
     *,
     wandb_project: str | None = None,
-    wandb_group: str | None = None,
-    wandb_tags: list[str] | None = None,
     logger_class: str = "WandbLogWriter",
 ) -> tuple[dict, dict]:
     cfg = copy.deepcopy(train_cfg)
@@ -49,10 +47,6 @@ def build_train_cfg(
     cfg["logger"]["class_name"] = logger_class
     if wandb_project is not None:
         cfg["logger"]["project_name"] = wandb_project
-    if wandb_group is not None:
-        cfg["logger"]["group"] = wandb_group
-    if wandb_tags is not None:
-        cfg["logger"]["tags"] = wandb_tags
 
     video_opts = {
         "video_interval": cfg.pop("video_interval", 250),

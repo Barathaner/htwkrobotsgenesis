@@ -7,13 +7,20 @@ import torch
 from k1_reward_log import build_step_reward_row, reward_names
 
 DEFAULT_OBJECTIVE_WEIGHTS: dict[str, float] = {
-    "tracking_lin_vel": 2.0,
+    # Task
+    "tracking_lin_vel": 3.0,
     "tracking_ang_vel": 1.5,
     "style": 2.0,
-    "survival": 1.0,
+    # Gait quality (penalty terms: higher raw = worse → negative weight)
     "feet_air_time": 0.5,
-    "feet_slip": -0.3,
-    "orientation": -0.2,
+    "foot_clearance": 1.0,
+    "swing_clearance": -1.0,
+    "foot_air_excess": -0.5,
+    # Penalties
+    "feet_slip": -0.5,
+    "orientation": -0.3,
+    "base_height": -0.3,
+    "lin_vel_z": -0.2,
 }
 
 
@@ -46,9 +53,13 @@ def hero_composite_score(
 
 
 def intermediate_training_metric(runner) -> float:
-    """Proxy for pruning: mean completed episode length from logger or env."""
+    """Pruning proxy: mean episode reward if available, else episode length."""
     logger = runner.logger
-    for attr in ("episode_length_buffer", "lenbuffer", "episode_lengths"):
+    for attr in ("rewbuffer", "rew_buffer", "reward_buffer", "episode_reward_buffer"):
+        buf = getattr(logger, attr, None)
+        if buf is not None and len(buf) > 0:
+            return float(sum(buf) / len(buf))
+    for attr in ("lenbuffer", "episode_length_buffer", "episode_lengths"):
         buf = getattr(logger, attr, None)
         if buf is not None and len(buf) > 0:
             return float(sum(buf) / len(buf))

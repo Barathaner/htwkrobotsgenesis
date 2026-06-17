@@ -815,9 +815,32 @@ class K1Env:
           Beide in der Luft → cmd_speed gate beachten, leg_symmetry bestraft die Flugphase
         """
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]  # (n, 2)
-        clearance = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.3)  # (n, 2)
-        swing = (~self.foot_in_contact).to(gs.tc_float)                   # 1 = Schwungphase
+        # normiert auf [0,1]: clamp auf target, dann durch target dividieren → kein Flamingo-Anreiz
+        target = self.reward_cfg["foot_clearance_target"]
+        clearance = torch.clamp(foot_z - self.style_ground_z, 0.0, target) / target  # (n, 2) ∈ [0,1]
+        swing = (~self.foot_in_contact).to(gs.tc_float)                               # 1 = Schwungphase
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
-        return (clearance * swing).mean(dim=1) * active
+        return (clearance * swing).mean(dim=1) * active  # ∈ [0, 1]
+
+    def _reward_foot_air_excess(self):
+        """Strafe: Fuß bleibt zu lange in der Luft (Flamingo-Lokal-Optimum brechen).
+
+        foot_air_time akkumuliert solange der Fuß nicht aufgesetzt hat (reset beim Touchdown).
+        Überschreitet die Luftzeit das Doppelte des Zielwerts (feet_air_time_target × 2),
+        wächst die Strafe linear weiter → zwingt den Schwungfuß zum Aufsetzen und erzwingt
+        damit den Wechsel auf das andere Bein.
+
+        Beispiel (target=0.25 s, Grenze=0.50 s, scale=-4.0):
+          Fuß 0.3 s in Luft  → excess=0         → 0
+          Fuß 0.6 s in Luft  → excess=0.1 s     → -0.4/s Beitrag
+          Fuß 1.0 s in Luft  → excess=0.5 s     → -2.0/s Beitrag (nicht ignorierbar)
+        """
+        limit = self.reward_cfg["feet_air_time_target"] * 2.0
+        excess = torch.clamp(self.foot_air_time - limit, min=0.0)  # (n, 2) [s]
+        # tanh normiert auf [0,1): bei 1× limit Überschuss → tanh(1)≈0.76, sättigt danach
+        normalized = torch.tanh(excess / limit)
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
+        return normalized.mean(dim=1) * active  # ∈ [0, 1)
 
