@@ -781,3 +781,43 @@ class K1Env:
         sq = torch.square(self.base_lin_vel[:, 2])
         return torch.tanh(sq / self.reward_cfg["lin_vel_z_sigma"])
 
+    def _reward_swing_clearance(self):
+        """Strafe (gebunden ∈[0,1)): Schwungfuß schleppt zu nah am Boden (Schlurfen).
+
+        Für jeden Fuß in der Schwungphase: shortage = clamp(target − clearance, 0) → wird bestraft.
+        tanh(shortage / sigma): 0 wenn Fuß hoch genug, →1 wenn Fuß am Boden schleift.
+        Negativer Scale → harte Strafe. Viel aggressiver als foot_clearance (Reward-Form),
+        da -10.0 nicht durch tracking_reward aufgewogen werden kann → bricht Schlur-Lokal-Optimum.
+
+        Beispiel (target=0.05 m, sigma=0.05):
+          Fuß 8 cm hoch (swing)  → shortage=0    → 0
+          Fuß 2 cm hoch (swing)  → shortage=0.03 → tanh(0.6)≈0.54
+          Fuß schlurft (swing)   → shortage=0.05 → tanh(1.0)≈0.76
+        """
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]  # (n, 2)
+        clearance = foot_z - self.style_ground_z                          # (n, 2)
+        shortage = torch.clamp(self.reward_cfg["swing_clearance_target"] - clearance, min=0.0)
+        swing = (~self.foot_in_contact).to(gs.tc_float)
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
+        return torch.tanh(shortage / self.reward_cfg["swing_clearance_sigma"]).mul(swing).mean(dim=1) * active
+
+    def _reward_foot_clearance(self):
+        """Belohnung: Schwungfuß hebt vom Boden ab (Knie heben, kein Schlurfen).
+
+        Für jeden Fuß in der Schwungphase (nicht in Kontakt): Clearance = z − Steh-z, geclippt auf
+        [0, 0.3]. Gemittelt über beide Füße, nur bei cmd_speed > feet_air_cmd_threshold aktiv.
+        Zieht die Policy direkt in Richtung alternierendes Heben — unabhängig vom Style-Signal.
+
+        Beispiel (target=0.05 m, scale=3.0):
+          Schwungfuß 8 cm hoch  → clamp(0.08,0,0.3)=0.08 → mean=0.04 (ein Fuß)
+          Schlurfen (beide am Boden) → swing=0 → return 0
+          Beide in der Luft → cmd_speed gate beachten, leg_symmetry bestraft die Flugphase
+        """
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]  # (n, 2)
+        clearance = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.3)  # (n, 2)
+        swing = (~self.foot_in_contact).to(gs.tc_float)                   # 1 = Schwungphase
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
+        return (clearance * swing).mean(dim=1) * active
+

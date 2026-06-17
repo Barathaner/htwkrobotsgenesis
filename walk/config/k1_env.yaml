@@ -148,6 +148,8 @@ reward_cfg:
   base_height_target: 0.56   # [m] Ziel-Rumpfhöhe = Spawn-Höhe; hält den Roboter aufrecht
   base_height_sigma: 0.01    # tanh(Δz²/σ): bei 10cm Abweichung → ~0.76; bei 5cm → ~0.24
   lin_vel_z_sigma: 0.5       # tanh(vz²/σ): bei 0.5 m/s → ~0.46; bei 1.0 m/s → ~0.96
+  swing_clearance_target: 0.05  # [m] Mindestschwunghöhe über Standposition; Hero-Jog ~0.08–0.12 m
+  swing_clearance_sigma: 0.05   # tanh(shortage/σ): bei vollem 5cm-Defizit → ~0.76
 
   reward_scales:
     # ── Task (Hero-Ziel: raw_mean ≈ 0.9–1.0) ─────────────────────────────────────
@@ -162,8 +164,10 @@ reward_cfg:
     # feet_air_time: Impuls-Reward (nur Touchdown-Frames) → raw_mean immer klein (~0.03–0.08).
     # Scale hoch, damit der Beitrag trotzdem spürbar ist (Hero-Ziel ~0.1/s).
     feet_air_time: 4.0       # 1.5→4.0: Hero +0.04/s→~+0.10/s; style deckt Schwung mit ab
-    feet_slip: -0.35         # -1.0→-0.35: Hero war -0.44/s (dominierte alle Strafen); σ=1.5 mildert tanh
-    leg_symmetry: -0.25      # aktiviert: Hero ~0.10 → ~-0.025/s; sanfter Wechselschritt-Nudge
+    foot_clearance: 3.0      # Reward: Schwungfuß hebt ab → Pull-Signal (weiches Heben)
+    swing_clearance: -10.0   # Penalty: Schwungfuß schleppt → Push-Signal (hartes Nicht-Schlurfen)
+    feet_slip: -1.5          # -0.35→-1.5: Schlurfen erzeugt konstanten Slip → harte Strafe nötig
+    leg_symmetry: -0.5       # -0.25→-0.5: Alterniergang stärker erzwingen
 
     # ── Regularizer (Hero-Ziel: raw_mean ≈ 0.05–0.12, klein vs. Task) ─────────
     action_rate: -0.05        # Hero ~0.09
