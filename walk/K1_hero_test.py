@@ -113,7 +113,10 @@ def main():
     parser.add_argument("--project", default="k1-locomotion")
     parser.add_argument("--name", default="hero-agent-test")
     parser.add_argument("--max-frames", type=int, default=0, help="0 = ganze Motion")
-    parser.add_argument("--cmd-vx", type=float, default=None, help="konst. vx [m/s]; Default = Ref-Mittel")
+    parser.add_argument("--cmd-mode", choices=["instant", "mean"], default="instant",
+                        help="instant: Command folgt je Frame der Referenz (tracking≈1, Formel-Validierung); "
+                             "mean: ein konstantes Command wie im Training (tracking oszilliert)")
+    parser.add_argument("--cmd-vx", type=float, default=None, help="konst. vx [m/s] (cmd-mode=mean); Def=Ref-Mittel")
     parser.add_argument("--cmd-vy", type=float, default=None, help="konst. vy [m/s]; Default = Ref-Mittel")
     parser.add_argument("--cmd-yaw", type=float, default=None, help="konst. yaw [rad/s]; Default = Ref-Mittel")
     # Kamera (seitlicher, etwas weiter weg als die Trainings-Defaults für bessere Sicht auf den Roboter).
@@ -206,27 +209,36 @@ def main():
     inv_heading_quat = env.inv_heading_quat  # (1,4), Heading = Spawn-Yaw (hier Identität)
     heading_quat = inv_quat(inv_heading_quat)
 
-    # KONSTANTES Command für die ganze Episode (wie im Training, das nur alle resampling_time_s neu zieht).
-    # Default = Mittel der Referenz-Geschwindigkeit im Heading-Frame → fair erreichbares Ziel für den
-    # perfekten Imitator. tracking_* misst dann die Abweichung der momentanen Jog-Geschwindigkeit von
-    # diesem festen Ziel (oszilliert pro Schritt) — NICHT mehr per-Frame nachgezogen.
+    def unit_world_from_cmd(vx: float, vy: float, sp: float) -> torch.Tensor:
+        """Command-Richtung (Heading → Welt) als Einheitsvektor für den 3D-Pfeil."""
+        cmd_dir = torch.tensor([vx, vy, 0.0], dtype=gs.tc_float, device=dev)
+        return transform_by_quat((cmd_dir / max(sp, 1e-6)).unsqueeze(0), heading_quat)[0]
+
+    # Command-Modus:
+    #  instant (Default): Command = MOMENTANE Referenz-Geschwindigkeit je Frame → tracking_lin/ang_vel
+    #    werden exakt exp(0)=1.0. Validiert, dass die Reward-FORMEL ihr Maximum für perfektes Folgen
+    #    erreicht (echter Mimic-Test). Der Pfeil/HUD wackelt mit dem Gang — das ist hier korrekt.
+    #  mean: EIN konstantes Command (Mittel der Referenz) für die ganze Episode, wie im Training. Dann
+    #    misst tracking_* die Abweichung der natürlich oszillierenden Jog-Geschwindigkeit vom festen
+    #    Ziel → schwankt (kein Bug, das ist das reale Trainingssignal).
     hv = transform_by_quat(root_lin_vel[:T], inv_heading_quat.expand(T, -1))  # (T,3) Heading-Frame
     mean_vx, mean_vy = float(hv[:, 0].mean()), float(hv[:, 1].mean())
     mean_yaw = float(root_ang_vel_body[:T, 2].mean())
     cmd_vx = args.cmd_vx if args.cmd_vx is not None else mean_vx
     cmd_vy = args.cmd_vy if args.cmd_vy is not None else mean_vy
     cmd_yaw = args.cmd_yaw if args.cmd_yaw is not None else mean_yaw
-    env.commands[:, 0] = cmd_vx
-    env.commands[:, 1] = cmd_vy
-    env.commands[:, 2] = cmd_yaw
     speed = float((cmd_vx**2 + cmd_vy**2) ** 0.5)
-    # Command-Richtung (Heading → Welt) für den 3D-Pfeil — konstant über die Episode.
-    cmd_dir = torch.tensor([cmd_vx, cmd_vy, 0.0], dtype=gs.tc_float, device=dev)
-    cmd_unit_world = transform_by_quat((cmd_dir / max(speed, 1e-6)).unsqueeze(0), heading_quat)[0]
-    print(f"[hero] konstantes Command: vx={cmd_vx:+.3f} vy={cmd_vy:+.3f} yaw={cmd_yaw:+.3f}  |v|={speed:.3f} m/s")
+    cmd_unit_world = unit_world_from_cmd(cmd_vx, cmd_vy, speed)
+    if args.cmd_mode == "mean":
+        env.commands[:, 0], env.commands[:, 1], env.commands[:, 2] = cmd_vx, cmd_vy, cmd_yaw
+        print(f"[hero] cmd-mode=mean (konstant): vx={cmd_vx:+.3f} vy={cmd_vy:+.3f} yaw={cmd_yaw:+.3f} |v|={speed:.3f}")
+    else:
+        print(f"[hero] cmd-mode=instant: Command folgt je Frame der Referenz → tracking_* sollte ≈1.0 sein "
+              f"(Ref-Mittel |v|≈{(mean_vx**2 + mean_vy**2) ** 0.5:.3f})")
 
     if use_wandb:
-        wandb.config.update({"cmd_vx": cmd_vx, "cmd_vy": cmd_vy, "cmd_yaw": cmd_yaw, "cmd_speed": speed})
+        wandb.config.update({"cmd_mode": args.cmd_mode, "cmd_vx": cmd_vx, "cmd_vy": cmd_vy,
+                             "cmd_yaw": cmd_yaw, "cmd_speed": speed})
 
     with torch.no_grad():
         for t in range(T):
@@ -257,8 +269,18 @@ def main():
             env.dof_pos.copy_(env.robot.get_dofs_position(env.motors_dof_idx))
             env.dof_vel.copy_(dof_vel_npz[t, col_motor].unsqueeze(0))
 
-            # Command ist konstant (vor der Schleife gesetzt); tracking_* misst die Abweichung der
-            # momentanen Referenz-Geschwindigkeit (base_lin_vel_heading/base_ang_vel) vom festen Ziel.
+            # Command setzen: instant → folgt je Frame der momentanen Referenz-Geschwindigkeit
+            # (tracking_* = exp(0) = 1.0). mean → bereits vor der Schleife konstant gesetzt.
+            if args.cmd_mode == "instant":
+                env.commands[:, 0] = env.base_lin_vel_heading[:, 0]
+                env.commands[:, 1] = env.base_lin_vel_heading[:, 1]
+                env.commands[:, 2] = env.base_ang_vel[:, 2]
+                cmd_vx = float(env.commands[0, 0])
+                cmd_vy = float(env.commands[0, 1])
+                cmd_yaw = float(env.commands[0, 2])
+                speed = float(torch.norm(env.commands[0, :2]).item())
+                cmd_unit_world = unit_world_from_cmd(cmd_vx, cmd_vy, speed)
+
             env._update_foot_contact()  # füllt foot_in_contact, feet_air_time_reward, leg_symmetry_penalty
 
             # 4) Rewards: rohen Output (gebunden ∈[0,1]) und skalierten Beitrag je Term
