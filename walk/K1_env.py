@@ -485,12 +485,13 @@ class K1Env:
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
 
-        # feet_air_time (klassisch, legged_gym-Stil): Luftzeit je Fuß akkumulieren und beim Aufsetzen
-        # (touchdown) die Luftzeit über feet_air_time_target hinaus gutschreiben → belohnt lange, klare
-        # Schritte statt hektischem Trippeln. Danach Timer in Kontakt nullen.
+        # feet_air_time (gebunden ∈[0,1]): Luftzeit je Fuß akkumulieren und beim Aufsetzen (touchdown)
+        # min(air_time/target, 1) gutschreiben, gemittelt über beide Füße → ∈[0,1], immer ≥0 (keine
+        # Strafe für kurze Schritte), Deckel bei target (kein Hüpf-Anreiz). Danach Timer in Kontakt nullen.
         self.foot_air_time += self.dt
-        landing = (self.foot_air_time - self.reward_cfg["feet_air_time_target"]) * touchdown.to(gs.tc_float)
-        self.feet_air_time_reward.copy_(landing.sum(dim=1) * active)
+        swing_frac = torch.clamp(self.foot_air_time / self.reward_cfg["feet_air_time_target"], max=1.0)
+        landing = swing_frac * touchdown.to(gs.tc_float)
+        self.feet_air_time_reward.copy_(landing.mean(dim=1) * active)
         self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
 
         # leg_symmetry: alternierender Gang = genau ein Fuß schwingt, der andere stützt; dann Wechsel.
@@ -578,47 +579,39 @@ class K1Env:
         return (~self._termination_mask()).to(gs.tc_float)
 
     def _reward_action_rate(self):
-        """Strafe: Aktionen sollen sich nicht ruckartig ändern (glatte Bewegung).
+        """Strafe (gebunden ∈[0,1)): ruckartige Aktionsänderungen (glatte Bewegung).
 
-        Summiert (letzte_aktion - aktuelle_aktion)² über alle 22 Gelenke.
-
-        Beispiel (scale=-0.005, dt=0.02):
-          alle 22 Gelenke ändern sich um 0.1 → sum=22*0.01=0.22 → return 0.22 → -0.000022/Step
-          keine Änderung                    → return 0          → 0/Step
+        tanh(Σ(Δaction)² / action_rate_sigma): 0 bei glatter Bewegung, →1 bei großen Sprüngen.
+        Vorzeichen via negative Scale. Kleineres σ = strenger.
         """
-        return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+        sq = torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+        return torch.tanh(sq / self.reward_cfg["action_rate_sigma"])
 
 
 
     def _reward_feet_air_time(self):
-        """Belohnung: lange, klare Schritte (klassisch legged_gym, Event beim Aufsetzen).
+        """Belohnung (gebunden ∈[0,1]): klare Schritte (Event beim Aufsetzen).
 
-        In _update_foot_contact berechnet: je Fuß die Luftzeit akkumulieren und beim Touchdown die
-        Luftzeit über feet_air_time_target hinaus gutschreiben → (air_time − target) als einmaliger
-        Bonus beim Aufsetzen. Belohnt längere Flugzeiten (weniger Trippeln); zu kurze Schritte
-        (air_time < target) geben einen kleinen Malus. Keine Phase-Clock, kein Gauß. Gate:
-        cmd_speed > feet_air_cmd_threshold (im Stand kein Reward).
+        In _update_foot_contact: je Fuß min(air_time/target, 1) beim Touchdown, gemittelt über beide Füße
+        → ∈[0,1], immer ≥0 (keine Strafe für kurze Schritte), Deckel bei target (kein Hüpf-Anreiz).
+        Gate: cmd_speed > feet_air_cmd_threshold (im Stand kein Reward).
 
-        Beispiel (target=0.3, scale=5 → *dt=0.1):
-          Schritt mit air=0.45 → (0.45−0.3)=0.15 → +0.015 beim Touchdown je Fuß
-          Schritt mit air=0.20 → (0.20−0.3)=−0.10 → −0.010 beim Touchdown je Fuß
-          Stehen (cmd≈0)        → 0
+        Beispiel (target=0.3):
+          Touchdown mit air=0.45 → min(1.5,1)=1.0, ein Fuß → mean=0.5
+          Touchdown mit air=0.15 → min(0.5,1)=0.5, ein Fuß → mean=0.25
+          Stehen (cmd≈0)         → 0
         """
         return self.feet_air_time_reward
 
     def _reward_feet_slip(self):
-        """Strafe: Fuß rutscht/schlurft am Boden — Horizontalgeschwindigkeit des Fußes im Kontakt.
+        """Strafe (gebunden ∈[0,1)): Fuß rutscht/schlurft am Boden (Horizontalgeschw. im Kontakt).
 
-        Echtes Anti-Schlurf-Signal: ein sauber geplanter Stützfuß hat ~0 Horizontalgeschwindigkeit
-        → keine Strafe; ein schleifender Fuß wird quadratisch bestraft.
-
-        Beispiel (scale=-0.2, dt=0.02):
-          Stützfuß still (v_xy≈0)        → 0           → 0/Step
-          Fuß rutscht 0.3 m/s im Kontakt → 0.09        → -0.00036/Step je Fuß
+        tanh(Σ v_xy² der Füße im Kontakt / feet_slip_sigma): 0 bei stillem Stützfuß, →1 bei Schlurfen.
         """
         foot_vel_xy = self.robot.get_links_vel(self.feet_idx_local)[:, :, :2]  # (n,2,2) Welt-xy
         slip = torch.sum(torch.square(foot_vel_xy), dim=2)  # (n,2)
-        return (slip * self.foot_in_contact.to(gs.tc_float)).sum(dim=1)
+        s = (slip * self.foot_in_contact.to(gs.tc_float)).sum(dim=1)
+        return torch.tanh(s / self.reward_cfg["feet_slip_sigma"])
 
 
     def _reward_style(self):
@@ -656,64 +649,46 @@ class K1Env:
           - both_stance (Doppelstütze): nur kurz natürlich → Dauer akkumuliert, bestraft wird die Überdauer
             max(0, both_stance_time − ds_allow_time).
 
-        Beispiel (ds_allow=0.15, scale=-2 → *dt=-0.04):
-          sauberer Wechselschritt (Einzelstütze) → 0          → 0/Step
-          beide Füße in der Luft (Hüpfen)         → 1.0        → -0.04/Step
-          Doppelstütze 0.30 s (zu lang stehend)   → excess 0.15 → -0.006/Step
-          Stehen (cmd≈0)                          → 0
+        Ausgabe gebunden ∈[0,1): tanh(leg_symmetry_penalty / leg_symmetry_sigma). 0 sauberer
+        Wechselschritt (Einzelstütze), →1 bei Flugphase/zu langer Doppelstütze. Stehen (cmd≈0) → 0.
         """
-        return self.leg_symmetry_penalty
+        return torch.tanh(self.leg_symmetry_penalty / self.reward_cfg["leg_symmetry_sigma"])
 
     def _reward_dof_vel(self):
-        """Strafe: hohe Gelenkgeschwindigkeiten dämpfen (Energie/Vibration), ergänzt action_rate.
+        """Strafe (gebunden ∈[0,1)): hohe Gelenkgeschwindigkeiten dämpfen (Energie/Vibration).
 
-        action_rate bestraft nur Aktions-Differenzen; dieser Term greift die tatsächlichen
-        Gelenkgeschwindigkeiten ab → unterdrückt hochfrequentes Zittern bei konstanter Aktion.
-
-        Beispiel (scale=-2e-4, dt=0.02):
-          alle 20 Gelenke ~1 rad/s → sum≈20 → -0.00008/Step
-          ruhiger Stand            → sum≈0  → 0/Step
+        tanh(Σ dof_vel² / dof_vel_sigma): 0 bei ruhigem Stand, →1 bei schnellem/zitterndem
+        Gelenkverlauf. Ergänzt action_rate (das nur Aktions-Differenzen abgreift).
         """
-        return torch.sum(torch.square(self.dof_vel), dim=1)
+        sq = torch.sum(torch.square(self.dof_vel), dim=1)
+        return torch.tanh(sq / self.reward_cfg["dof_vel_sigma"])
 
 
 
     def _reward_orientation(self):
-        """Strafe: Rumpf aufrecht halten — Roll UND Pitch dämpfen (gegen Kippen/Nicken).
+        """Strafe (gebunden ∈[0,1)): Rumpf aufrecht halten — Roll/Pitch dämpfen (gegen Kippen/Nicken).
 
-        Regelt Roll UND Pitch: roll² + pitch² zieht den Rumpf gegen senkrecht (0°/0°). base_euler
-        liegt in Grad vor → in Radian umrechnen, damit die Skala physikalisch sinnvoll ist.
-
-        Beispiel (scale=-5.0, dt=0.02):
-          roll=0°,  pitch=0°  → 0                  → 0/Step
-          roll=10°, pitch=0°  → 0.0305 rad²        → -0.0030/Step
-          roll=0°,  pitch=10° → 0.0305 rad²        → -0.0030/Step
-          roll=10°, pitch=10° → 0.0610 rad²        → -0.0061/Step
+        tanh((roll²+pitch²)[rad²] / orientation_sigma): 0 aufrecht, →1 bei starker Neigung.
+        base_euler liegt in Grad vor → in Radian umrechnen.
         """
         roll_pitch = torch.deg2rad(self.base_euler[:, :2])
-        return torch.sum(torch.square(roll_pitch), dim=1)
+        sq = torch.sum(torch.square(roll_pitch), dim=1)
+        return torch.tanh(sq / self.reward_cfg["orientation_sigma"])
 
     def _reward_ang_vel_xy(self):
-        """Strafe: Roll-/Pitch-Raten des Rumpfes dämpfen (kein Kippeln/Schwanken).
+        """Strafe (gebunden ∈[0,1)): Roll-/Pitch-Raten des Rumpfes dämpfen (kein Kippeln/Schwanken).
 
-        Summiert (ω_x² + ω_y²) der Körper-Winkelgeschwindigkeit.
-
-        Beispiel (scale=-0.05, dt=0.02):
-          ω_xy=0           → 0      → 0/Step
-          ω_x=0.5 rad/s    → 0.25   → -0.00025/Step
+        tanh((ω_x²+ω_y²) / ang_vel_xy_sigma): 0 bei ruhigem Rumpf, →1 bei starkem Schwanken.
         """
-        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+        sq = torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+        return torch.tanh(sq / self.reward_cfg["ang_vel_xy_sigma"])
 
     def _reward_ang_vel_z(self):
-        """Strafe: Yaw-Rate vom Kommando abweichen (direkte ω_z-Dämpfung, ergänzt tracking_ang_vel).
+        """Strafe (gebunden ∈[0,1)): Yaw-Rate vom Kommando abweichen (ergänzt tracking_ang_vel).
 
-        tracking_ang_vel belohnt nur exp(-err/sigma) und bleibt bei cmd=0 bei ω_z>0 noch leicht positiv.
-        Dieser Term bestraft (ω_z − cmd_yaw)² quadratisch → Spin-Hacks werden teuer.
-
-        Beispiel (scale=-1.0, dt=0.02, cmd_yaw=0):
-          ω_z=0     → 0    → 0/Step
-          ω_z=0.5   → 0.25 → -0.005/Step
-          ω_z=1.0   → 1.0  → -0.02/Step
+        tanh((ω_z − cmd_yaw)² / ang_vel_z_sigma): 0 bei Soll-Drehrate, →1 bei Spin. Macht Spin-Hacks
+        teuer, ohne wie der quadratische Term unbeschränkt zu wachsen.
         """
-        return torch.square(self.base_ang_vel[:, 2] - self.commands[:, 2])
+        sq = torch.square(self.base_ang_vel[:, 2] - self.commands[:, 2])
+        return torch.tanh(sq / self.reward_cfg["ang_vel_z_sigma"])
 

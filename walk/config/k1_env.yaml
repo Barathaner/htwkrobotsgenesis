@@ -100,7 +100,9 @@ obs_cfg:
     dof_vel: 0.05
 
 reward_cfg:
-  tracking_sigma: 0.25            # exp(-err/sigma) Breite (tracking_lin_vel/ang_vel)
+  tracking_sigma: 0.5            # exp(-err/sigma) Breite. Der Jog oszilliert pro Schritt real um ~±1 m/s
+                                 # (CoM-Dynamik, kein Rauschen); bei 0.2 bekäme selbst die perfekte
+                                 # Referenz nur ~0.57 tracking und der Term kämpft gegen style. 0.5 → Hero ~0.77.
 
   # contact (net contact force on foot links, via RigidEntity.get_links_net_contact_force)
   foot_contact_force_threshold: 20.0  # [N] |F| on foot link above = in_contact
@@ -116,17 +118,28 @@ reward_cfg:
   style_motion_file: walk/data/motions/k1_jogging_motion.npz  # relativ zur Repo-Root
   style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); kleiner = strenger an der Referenz
 
+  # Gebundene Strafterme: jeder gibt tanh(quantity / σ) ∈ [0,1) zurück (0 = sauber, →1 = starke
+  # Verletzung); Vorzeichen kommt aus reward_scales (negativ = Strafe). Kleineres σ = strenger
+  # (sättigt früher gegen 1), größeres σ = milder/linearer nahe 0. Startwerte — bei Bedarf tunen.
+  action_rate_sigma: 1.0
+  feet_slip_sigma: 0.5
+  leg_symmetry_sigma: 0.5
+  dof_vel_sigma: 50.0
+  orientation_sigma: 0.2
+  ang_vel_xy_sigma: 1.0
+  ang_vel_z_sigma: 1.0
+
   reward_scales:
     # task
-    tracking_lin_vel: 1.0   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
+    tracking_lin_vel: 2.0   # Heading-Frame (Spawn-Richtung), siehe K1_env._reward_tracking_lin_vel
     tracking_ang_vel: 0.5
     survival: 1.0
-    action_rate: -0.02
+    action_rate: -0.05
 
 
 
     feet_air_time: 1.5   # reduziert: der style-Reward kodiert Schwunghöhe/Schrittlänge jetzt mit
-    #feet_slip: -1.0
+    feet_slip: -1.0
     #leg_symmetry: -1.0
 
     # style: Belohnung für Bewegung im Stil der NPZ-Referenz (feature-matching, ∈[0,1]).
@@ -134,8 +147,8 @@ reward_cfg:
     # leiden, floatiger Retarget wird kopiert); niedriger = nur leichter Stil-Prior.
     style: 2.0
 
-    # regularizer
-    dof_vel: -2.0e-4
+    # regularizer (Outputs jetzt gebunden ∈[0,1) via tanh → Scales neu im [0,1]-Regime, nicht mehr O(1e-4))
+    dof_vel: -0.05
     ang_vel_xy: -0.05
     #ang_vel_z: -0.0
     orientation: -1.0 
