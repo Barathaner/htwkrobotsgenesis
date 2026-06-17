@@ -17,7 +17,10 @@ trial:
   report_interval: 100
   save_interval: 10000   # effectively no checkpoints during tuning
   wandb_project: k1-optuna-tune
-  video_interval: 250     # rollout videos → wandb (iter 0, 250, 500, …)
+  # Video recording requires a second Genesis scene (render env) which is unsupported in the same
+  # process as the training env. Keep false unless you have verified multi-scene support.
+  enable_video: true
+  video_interval: 250
 
 # Scales listed here are NOT tuned (baseline from k1_env.yaml kept).
 fixed_scales: []
@@ -46,4 +49,6 @@ objective:
     style: 2.0
     feet_air_time: 0.5
     feet_slip: -0.3
+    leg_symmetry: -0.15   # in search_space → must be in objective or it drifts toward 0
     orientation: -0.2
+    base_height: -0.1     # penalise crouching / falling posture

@@ -48,6 +48,7 @@ class K1Env:
         self.dt = 0.02
         self.simulate_action_latency = env_cfg.get("simulate_action_latency", True)
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
+        self.rand_cfg = env_cfg.get("randomization", {})
 
         scene_kwargs: dict = {
             "sim_options": gs.options.SimOptions(dt=self.dt, substeps=2),
@@ -55,6 +56,8 @@ class K1Env:
                 enable_self_collision=True,
                 max_collision_pairs=40,
                 tolerance=1e-5,
+                batch_dofs_info=bool(self.rand_cfg),
+                batch_links_info=bool(self.rand_cfg),
             ),
             "viewer_options": gs.options.ViewerOptions(
                 camera_pos=(3, -1, 1.5),
@@ -96,6 +99,7 @@ class K1Env:
             )
 
         self.scene.build(n_envs=num_envs)
+        self.base_link_idx_local = self.robot.links[0].idx_local
 
         # Verfolgungskamera: hält den anfänglichen Versatz Kamera→Rumpf und schwenkt mit dem
         # Roboter mit (lookat folgt dem Rumpf), statt starr zu stehen. update_following() muss
@@ -128,6 +132,8 @@ class K1Env:
         self.robot.set_dofs_kp(kp, self.motors_dof_idx)
         self.robot.set_dofs_kv(kd, self.motors_dof_idx)
         self.robot.set_dofs_force_range([-e for e in effort], effort, self.motors_dof_idx)
+        self.nom_kp = torch.tensor(kp, dtype=gs.tc_float, device=gs.device)
+        self.nom_kd = torch.tensor(kd, dtype=gs.tc_float, device=gs.device)
 
         # Fixierte Gelenke (Kopf + fürs Laufen unnötige Arm-/Bein-DOFs): nicht policy-gesteuert, aber
         # per PD auf fester Default-Pose gehalten (sonst schlackern sie lose). Eigene kp/kd setzen
@@ -235,6 +241,22 @@ class K1Env:
         # zusammenhängende Doppelstütze bzw. Flugphase; nur die Überdauer darüber hinaus wird bestraft.
         self.ds_allow_time = float(self.reward_cfg["leg_symmetry_ds_allow_s"])
         self.flight_allow_time = float(self.reward_cfg.get("leg_symmetry_flight_allow_s", 0.20))
+
+        # Random push state (always allocated; only used when push_enabled=True)
+        self.push_force_buf = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
+        self.push_steps_remaining = torch.zeros((num_envs,), dtype=gs.tc_int, device=gs.device)
+
+        # Domain randomization state buffers (per-env; updated each episode reset)
+        if self.rand_cfg:
+            n_links = self.robot.n_links
+            self.curr_friction_ratios = torch.ones((num_envs, n_links), dtype=gs.tc_float, device=gs.device)
+            self.curr_mass_shifts = torch.zeros((num_envs, n_links), dtype=gs.tc_float, device=gs.device)
+            self.curr_com_shifts = torch.zeros((num_envs, n_links, 3), dtype=gs.tc_float, device=gs.device)
+            self.curr_motor_strength = torch.ones((num_envs, self.num_actions), dtype=gs.tc_float, device=gs.device)
+            # Original link masses for ratio-based mass randomization (shape: n_links)
+            self.orig_link_masses = torch.tensor(
+                [link.inertial_mass for link in self.robot.links], dtype=gs.tc_float, device=gs.device
+            )
 
         # style (feature-matching Style-Reward): belohnt Nähe der Live-Bewegung zur NPZ-Referenz im
         # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
@@ -357,6 +379,8 @@ class K1Env:
             self.fixed_target[:, self.fixed_actions_dof_idx],
             self.fixed_dof_idx,
         )
+        if self.rand_cfg.get("push_enabled", False):
+            self._maybe_apply_push()
         self.scene.step()
 
         self.episode_length_buf += 1
@@ -382,6 +406,7 @@ class K1Env:
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
+        self.rew_buf.nan_to_num_(0.0)  # physics NaN (e.g. sim explosion) must not crash training
 
         self._resample_commands(
             self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0
@@ -399,20 +424,33 @@ class K1Env:
 
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
-    def _set_heading_reference(self, envs_idx=None):
-        """Spawn-Yaw je Episode fixieren → Heading-Frame für command_accuracy (Welt-xy ohne Drift).
+    def _set_heading_reference(self, envs_idx=None, quats=None):
+        """Spawn-Yaw je Episode fixieren → Heading-Frame für Command-Tracking (Welt-xy ohne Drift).
 
-        Aktuell identisches init_base_quat für alle Envs; bei Random-Yaw-Spawn später base_quat nach Reset lesen.
+        quats: (num_envs, 4) per-env spawn quats from _build_noisy_init_qpos; if None falls back to
+        init_base_quat (legacy, used when randomization is off).
         """
-        quat = self.init_base_quat.unsqueeze(0)
-        yaw = quat_to_xyz(quat, rpy=True)[0, 2]
-        spawn_rpy = torch.zeros(1, 3, dtype=gs.tc_float, device=gs.device)
-        spawn_rpy[0, 2] = yaw
-        inv_h = inv_quat(xyz_to_quat(spawn_rpy))
-        if envs_idx is None:
-            self.inv_heading_quat.copy_(inv_h.expand(self.num_envs, -1))
+        if quats is None:
+            quat = self.init_base_quat.unsqueeze(0)
+            yaw = quat_to_xyz(quat, rpy=True)[0, 2]
+            spawn_rpy = torch.zeros(1, 3, dtype=gs.tc_float, device=gs.device)
+            spawn_rpy[0, 2] = yaw
+            inv_h = inv_quat(xyz_to_quat(spawn_rpy))
+            if envs_idx is None:
+                self.inv_heading_quat.copy_(inv_h.expand(self.num_envs, -1))
+            else:
+                self.inv_heading_quat.index_copy_(0, envs_idx.nonzero(as_tuple=True)[0], inv_h.expand(envs_idx.sum(), -1))
         else:
-            self.inv_heading_quat.index_copy_(0, envs_idx.nonzero(as_tuple=True)[0], inv_h.expand(envs_idx.sum(), -1))
+            # quats is (num_envs, 4) — extract yaw per env and compute per-env inv_heading_quat
+            yaw = quat_to_xyz(quats, rpy=True)[:, 2]  # (num_envs,)
+            spawn_rpy = torch.zeros(self.num_envs, 3, dtype=gs.tc_float, device=gs.device)
+            spawn_rpy[:, 2] = yaw
+            inv_h = inv_quat(xyz_to_quat(spawn_rpy))  # (num_envs, 4)
+            if envs_idx is None:
+                self.inv_heading_quat.copy_(inv_h)
+            else:
+                reset_indices = envs_idx.nonzero(as_tuple=True)[0]
+                self.inv_heading_quat[reset_indices] = inv_h[reset_indices]
 
     def _resample_commands(self, envs_idx):
         commands = gs_rand(*self.commands_limits, (self.num_envs,))
@@ -427,13 +465,14 @@ class K1Env:
         return self.get_observations()
 
     def _reset_idx(self, envs_idx=None):
-        # reset state
-        self.robot.set_qpos(self.init_qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=True)
+        # reset state with init-state noise + random yaw
+        noisy_qpos, init_quats_batch = self._build_noisy_init_qpos(envs_idx)
+        self.robot.set_qpos(noisy_qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=True)
 
         # reset buffers
         if envs_idx is None:
             self.base_pos[:] = self.init_base_pos
-            self.base_quat[:] = self.init_base_quat
+            self.base_quat.copy_(init_quats_batch)
             self.projected_gravity[:] = self.init_projected_gravity
             self.dof_pos[:] = self.default_dof_pos
             self.base_lin_vel.zero_()
@@ -441,7 +480,7 @@ class K1Env:
             self.base_ang_vel.zero_()
             self.lin_vel_ema.zero_()
             self.ang_vel_z_ema.zero_()
-            self._set_heading_reference()
+            self._set_heading_reference(quats=init_quats_batch)
             self.dof_vel.zero_()
             self.actions.zero_()
             self.last_actions.zero_()
@@ -454,9 +493,11 @@ class K1Env:
             self.both_stance_time.zero_()
             self.both_air_time.zero_()
             self.leg_symmetry_penalty.zero_()
+            self.push_force_buf.zero_()
+            self.push_steps_remaining.zero_()
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
-            torch.where(envs_idx[:, None], self.init_base_quat, self.base_quat, out=self.base_quat)
+            torch.where(envs_idx[:, None], init_quats_batch, self.base_quat, out=self.base_quat)
             torch.where(
                 envs_idx[:, None], self.init_projected_gravity, self.projected_gravity, out=self.projected_gravity
             )
@@ -466,7 +507,7 @@ class K1Env:
             self.base_ang_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.lin_vel_ema.masked_fill_(envs_idx[:, None], 0.0)
             self.ang_vel_z_ema.masked_fill_(envs_idx, 0.0)
-            self._set_heading_reference(envs_idx)
+            self._set_heading_reference(envs_idx, quats=init_quats_batch)
             self.dof_vel.masked_fill_(envs_idx[:, None], 0.0)
             self.actions.masked_fill_(envs_idx[:, None], 0.0)
             self.last_actions.masked_fill_(envs_idx[:, None], 0.0)
@@ -479,6 +520,8 @@ class K1Env:
             self.both_stance_time.masked_fill_(envs_idx, 0.0)
             self.both_air_time.masked_fill_(envs_idx, 0.0)
             self.leg_symmetry_penalty.masked_fill_(envs_idx, 0.0)
+            self.push_force_buf.masked_fill_(envs_idx[:, None], 0.0)
+            self.push_steps_remaining.masked_fill_(envs_idx, 0)
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -496,6 +539,8 @@ class K1Env:
 
         # random sample command upon reset
         self._resample_commands(envs_idx)
+        # domain randomization: re-sample physics per episode
+        self._randomize_domain(envs_idx)
 
     def _read_foot_contact_forces(self):
         """Net contact force on foot links (n_envs, 2, 3) [N], world frame.
@@ -780,4 +825,124 @@ class K1Env:
         """
         sq = torch.square(self.base_lin_vel[:, 2])
         return torch.tanh(sq / self.reward_cfg["lin_vel_z_sigma"])
+
+    # ------------ randomization helpers ----------------
+
+    def _build_noisy_init_qpos(self, envs_idx):
+        """Build (num_envs, qpos_dim) init qpos with random yaw + optional dof/height noise.
+
+        Returns (qpos_batch, quats_batch), both (num_envs, ...).
+        Non-reset envs' rows also get noise — Genesis ignores them via the envs_idx mask.
+        When rand_cfg is empty all noise values default to 0 → identical to fixed init_qpos.
+        """
+        # Base position with optional height noise
+        pos = self.init_base_pos.unsqueeze(0).expand(self.num_envs, -1).clone()
+        h_noise = float(self.rand_cfg.get("init_base_height_noise", 0.0))
+        if h_noise > 0:
+            pos[:, 2] = pos[:, 2] + (2 * torch.rand(self.num_envs, device=gs.device) - 1) * h_noise
+
+        # Random yaw
+        yaw_range = self.rand_cfg.get("init_yaw_range", [0.0, 0.0])
+        yaw_lo, yaw_hi = float(yaw_range[0]), float(yaw_range[1])
+        if yaw_lo != yaw_hi:
+            yaw = yaw_lo + (yaw_hi - yaw_lo) * torch.rand(self.num_envs, device=gs.device)
+        else:
+            yaw = torch.full((self.num_envs,), yaw_lo, dtype=gs.tc_float, device=gs.device)
+        spawn_rpy = torch.zeros(self.num_envs, 3, dtype=gs.tc_float, device=gs.device)
+        spawn_rpy[:, 2] = yaw
+        quats = xyz_to_quat(spawn_rpy)  # (num_envs, 4)
+
+        # DOF position noise applied to all URDF joints
+        n_urdf_dofs = self.init_dof_pos.shape[0]
+        dof_noise = float(self.rand_cfg.get("init_dof_pos_noise", 0.0))
+        if dof_noise > 0:
+            noise = (2 * torch.rand(self.num_envs, n_urdf_dofs, device=gs.device) - 1) * dof_noise
+            dof_pos = self.init_dof_pos.unsqueeze(0) + noise
+        else:
+            dof_pos = self.init_dof_pos.unsqueeze(0).expand(self.num_envs, -1)
+
+        qpos_batch = torch.cat([pos, quats, dof_pos], dim=1)  # (num_envs, 3+4+n_urdf_dofs)
+        return qpos_batch, quats
+
+    def _randomize_domain(self, envs_idx):
+        """Re-sample physics parameters for reset envs. Called at the end of every _reset_idx."""
+        if not self.rand_cfg:
+            return
+        if envs_idx is None:
+            reset_idx = torch.arange(self.num_envs, device=gs.device)
+        else:
+            reset_idx = envs_idx.nonzero(as_tuple=True)[0]
+        n = len(reset_idx)
+        if n == 0:
+            return
+
+        if self.rand_cfg.get("randomize_friction", False):
+            lo, hi = self.rand_cfg["friction_range"]
+            self.curr_friction_ratios[reset_idx] = (
+                lo + (hi - lo) * torch.rand(n, self.robot.n_links, device=gs.device)
+            )
+            self.robot.set_friction_ratio(
+                self.curr_friction_ratios, links_idx_local=list(range(self.robot.n_links))
+            )
+
+        if self.rand_cfg.get("randomize_mass", False):
+            lo, hi = self.rand_cfg["mass_ratio_range"]
+            ratios = lo + (hi - lo) * torch.rand(n, self.robot.n_links, device=gs.device)
+            # Convert ratio to additive shift: shift = (ratio - 1) * original_mass.
+            # We store (ratio - 1) scaled by orig_link_masses so set_mass_shift receives kg.
+            self.curr_mass_shifts[reset_idx] = (ratios - 1.0) * self.orig_link_masses
+            self.robot.set_mass_shift(
+                self.curr_mass_shifts, links_idx_local=list(range(self.robot.n_links))
+            )
+
+        if self.rand_cfg.get("randomize_com", False):
+            lo, hi = self.rand_cfg["com_shift_range"]
+            self.curr_com_shifts[reset_idx] = (
+                lo + (hi - lo) * torch.rand(n, self.robot.n_links, 3, device=gs.device)
+            )
+            self.robot.set_COM_shift(
+                self.curr_com_shifts, links_idx_local=list(range(self.robot.n_links))
+            )
+
+        if self.rand_cfg.get("randomize_motor_strength", False):
+            lo, hi = self.rand_cfg["motor_strength_range"]
+            self.curr_motor_strength[reset_idx] = (
+                lo + (hi - lo) * torch.rand(n, self.num_actions, device=gs.device)
+            )
+            kp = self.nom_kp.unsqueeze(0) * self.curr_motor_strength  # (num_envs, num_actions)
+            kd = self.nom_kd.unsqueeze(0) * self.curr_motor_strength
+            self.robot.set_dofs_kp(kp, self.motors_dof_idx)
+            self.robot.set_dofs_kv(kd, self.motors_dof_idx)
+
+    def _maybe_apply_push(self):
+        """Stochastically apply random horizontal impulse forces to the robot base link."""
+        interval_s = float(self.rand_cfg.get("push_interval_s", 5.0))
+        fmax = float(self.rand_cfg.get("push_force_xy_max", 150.0))
+        tmax = float(self.rand_cfg.get("push_torque_z_max", 30.0))
+        dur = int(self.rand_cfg.get("push_duration_steps", 5))
+
+        # Poisson trigger: probability p = dt / interval per step
+        trigger = torch.rand(self.num_envs, device=gs.device) < (self.dt / interval_s)
+
+        # New push force (random horizontal direction + magnitude)
+        new_force = torch.zeros(self.num_envs, 3, dtype=gs.tc_float, device=gs.device)
+        new_force[:, :2] = (2 * torch.rand(self.num_envs, 2, device=gs.device) - 1) * fmax
+
+        # Start new push (overwrite) on triggered envs; decrement counter on ongoing ones
+        self.push_force_buf = torch.where(trigger[:, None], new_force, self.push_force_buf)
+        new_remaining = torch.full((self.num_envs,), dur, dtype=gs.tc_int, device=gs.device)
+        decremented = torch.clamp(self.push_steps_remaining - 1, min=0)
+        self.push_steps_remaining = torch.where(trigger, new_remaining, decremented)
+
+        # Apply force and torque to base link only where steps_remaining > 0
+        active = (self.push_steps_remaining > 0).to(gs.tc_float)
+        force_3d = (self.push_force_buf * active[:, None]).unsqueeze(1)  # (n_envs, 1, 3)
+        self.scene.sim.rigid_solver.apply_links_external_force(
+            force=force_3d, links_idx=[self.base_link_idx_local]
+        )
+        torque_3d = torch.zeros_like(force_3d)
+        torque_3d[:, 0, 2] = (2 * torch.rand(self.num_envs, device=gs.device) - 1) * tmax * active
+        self.scene.sim.rigid_solver.apply_links_external_torque(
+            torque=torque_3d, links_idx=[self.base_link_idx_local]
+        )
 

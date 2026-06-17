@@ -164,10 +164,15 @@ def main() -> None:
     storage_url = f"sqlite:///{storage_path.resolve()}"
 
     sampler_name = study_cfg.get("sampler", "TPE").upper()
+    seed = trial_cfg.get("seed", 1)
     if sampler_name == "TPE":
-        sampler = optuna.samplers.TPESampler(seed=trial_cfg.get("seed", 1))
+        sampler = optuna.samplers.TPESampler(seed=seed)
+    elif sampler_name == "CMA":
+        sampler = optuna.samplers.CmaEsSampler(seed=seed)
+    elif sampler_name == "RANDOM":
+        sampler = optuna.samplers.RandomSampler(seed=seed)
     else:
-        sampler = optuna.samplers.TPESampler(seed=trial_cfg.get("seed", 1))
+        raise ValueError(f"Unknown sampler '{sampler_name}'. Supported: TPE, CMA, RANDOM")
 
     pruner = None
     if study_cfg.get("pruner", "").lower() == "median":
@@ -177,16 +182,24 @@ def main() -> None:
         study = optuna.load_study(
             study_name=args.study_name,
             storage=storage_url,
+            sampler=sampler,
         )
     else:
-        study = optuna.create_study(
-            study_name=args.study_name,
-            storage=storage_url,
-            direction="maximize",
-            sampler=sampler,
-            pruner=pruner,
-            load_if_exists=False,
-        )
+        try:
+            study = optuna.create_study(
+                study_name=args.study_name,
+                storage=storage_url,
+                direction="maximize",
+                sampler=sampler,
+                pruner=pruner,
+                load_if_exists=False,
+            )
+        except optuna.exceptions.DuplicatedStudyError:
+            raise SystemExit(
+                f"Study '{args.study_name}' already exists in {storage_path}.\n"
+                f"  • Resume it:      --resume\n"
+                f"  • Start fresh:    delete {storage_path} or use a different --study_name"
+            )
 
     max_iterations = trial_cfg["max_iterations"]
     num_envs = trial_cfg["num_envs"]
@@ -216,6 +229,9 @@ def main() -> None:
         train_cfg["save_interval"] = trial_cfg.get("save_interval", 10000)
         if "video_interval" in trial_cfg:
             video_opts["video_interval"] = int(trial_cfg["video_interval"])
+        # Disable video recording by default: each trial's K1Env already uses one Genesis scene;
+        # recording would create a second scene in the same process which is unsupported.
+        enable_video = bool(trial_cfg.get("enable_video", False))
 
         save_session_cfgs(
             log_dir, env_cfg, obs_cfg, trial_reward_cfg, command_cfg, train_cfg, video_opts
@@ -245,13 +261,23 @@ def main() -> None:
             log_dir,
             (env_cfg, obs_cfg, trial_reward_cfg, command_cfg),
             video_opts,
-            enable_video=True,
+            enable_video=enable_video,
             on_iteration_end=on_iteration_end,
         )
 
         try:
             print(f"\n[optuna] trial {trial.number}: wandb run '{run_name}'  project={wandb_project}")
-            run_training(runner, max_iterations)
+            try:
+                run_training(runner, max_iterations)
+            except optuna.TrialPruned:
+                # Finalize the wandb/logger run before re-raising — runner.learn() exits early
+                # on TrialPruned and never reaches its own stop_logging_writer() call.
+                try:
+                    if runner.logger.writer is not None:
+                        runner.logger.stop_logging_writer()
+                except Exception:
+                    pass
+                raise
             policy = runner.get_inference_policy(device=runner.device)
             raw_means = eval_raw_means(env, policy, n_steps=eval_steps)
             score = hero_composite_score(raw_means, objective_weights)

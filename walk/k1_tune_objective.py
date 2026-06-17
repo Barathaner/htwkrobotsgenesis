@@ -10,10 +10,11 @@ DEFAULT_OBJECTIVE_WEIGHTS: dict[str, float] = {
     "tracking_lin_vel": 2.0,
     "tracking_ang_vel": 1.5,
     "style": 2.0,
-    "survival": 1.0,
     "feet_air_time": 0.5,
     "feet_slip": -0.3,
+    "leg_symmetry": -0.15,
     "orientation": -0.2,
+    "base_height": -0.1,
 }
 
 
