@@ -250,7 +250,14 @@ class K1Env:
             "base_ang_vel": self.base_ang_vel.shape[-1],
             "projected_gravity": self.projected_gravity.shape[-1],
             "commands": self.commands.shape[-1],
-            "base_lin_vel_heading": 2,  # privileged: vx/vy in heading frame (sim-only)
+            # ── privileged (sim-only) ──────────────────────────────────────────
+            "base_lin_vel_heading": 2,   # vx/vy im Heading-Frame
+            "lin_vel_ema": 2,            # geglättete Ist-Geschw. (= was tracking_lin_vel misst)
+            "ang_vel_z_ema": 1,          # geglättete Yaw-Rate   (= was tracking_ang_vel misst)
+            "base_height": 1,            # Rumpfhöhe [m]
+            "base_lin_vel_z": 1,         # vertikale Geschw. [m/s] (Fallen/Hüpfen)
+            "foot_contact": 2,           # Bodenkontakt je Fuß (0/1)
+            # ── deploy-fähig ──────────────────────────────────────────────────
             "dof_pos": self.dof_pos.shape[-1],
             "dof_vel": self.dof_vel.shape[-1],
             "actions": self.actions.shape[-1],
@@ -558,7 +565,14 @@ class K1Env:
             self.base_ang_vel * self.obs_scales["ang_vel"],
             self.projected_gravity,
             self.commands * self.commands_scale,
+            # privileged
             self.base_lin_vel_heading[:, :2] * self.obs_scales["lin_vel"],
+            self.lin_vel_ema * self.obs_scales["lin_vel"],
+            self.ang_vel_z_ema.unsqueeze(1) * self.obs_scales["ang_vel"],
+            self.base_pos[:, 2:3],
+            self.base_lin_vel[:, 2:3] * self.obs_scales["lin_vel"],
+            self.foot_in_contact.to(gs.tc_float),
+            # deploy-fähig
             (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
             self.dof_vel * self.obs_scales["dof_vel"],
             self.actions,
@@ -744,4 +758,26 @@ class K1Env:
         """
         sq = torch.square(self.ang_vel_z_ema - self.commands[:, 2])
         return torch.tanh(sq / self.reward_cfg["ang_vel_z_sigma"])
+
+    def _reward_base_height(self):
+        """Strafe (gebunden ∈[0,1)): Rumpfhöhe vom Zielwert abweichen (Hocken/Aufbäumen).
+
+        tanh((z − z_target)² / base_height_sigma): 0 bei Zielshöhe, →1 bei starker Abweichung.
+        Typischer Walking-Regularizer: hält den Roboter in aufrechter Gehhöhe statt zu hocken.
+        Beispiel (target=0.56, sigma=0.01):
+          z=0.56 → 0         z=0.46 → tanh(0.01/0.01)≈0.76     z=0.36 → tanh(0.04/0.01)≈1.0
+        """
+        sq = torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
+        return torch.tanh(sq / self.reward_cfg["base_height_sigma"])
+
+    def _reward_lin_vel_z(self):
+        """Strafe (gebunden ∈[0,1)): vertikale Rumpfgeschwindigkeit dämpfen (kein Hüpfen/Bouncing).
+
+        tanh(vz² / lin_vel_z_sigma): 0 bei ruhigem Gehen, →1 bei starkem Auf/Ab-Schwingen.
+        Ergänzt base_height (die nur die Position sieht): reagiert früher auf Bounce-Dynamik.
+        Beispiel (sigma=0.5):
+          vz=0.0 → 0     vz=0.5 m/s → tanh(0.5)≈0.46     vz=1.0 m/s → tanh(2.0)≈0.96
+        """
+        sq = torch.square(self.base_lin_vel[:, 2])
+        return torch.tanh(sq / self.reward_cfg["lin_vel_z_sigma"])
 

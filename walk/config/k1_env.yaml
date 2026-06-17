@@ -1,6 +1,6 @@
 # Booster K1 locomotion — 16-DOF (12 legs + 4 arms).
 # Unbenutzte DOFs (Shoulder_Roll, Elbow_Yaw, Kopf) per PD fix gehalten (fixed_joint_names).
-# Obs dim = 9 + 3*16 + 2 = 59 (auto in K1_env.py). Enthält base_lin_vel_heading (privilegiert, sim-only).
+# Obs dim = 3+3+3 + 2+2+1+1+1+2 + 16+16+16 = 66 (auto in K1_env.py). Privilegiert (sim-only): lin_vel_heading(2), lin_vel_ema(2), ang_vel_z_ema(1), base_height(1), lin_vel_z(1), foot_contact(2).
 
 env_cfg:
   num_actions: 16
@@ -145,6 +145,9 @@ reward_cfg:
   orientation_sigma: 0.2
   ang_vel_xy_sigma: 6.0   # an Referenz kalibriert (Σω_xy²≈0.64 beim Jog) → Hero-Strafe ~0.10 statt 0.46.
   ang_vel_z_sigma: 1.0
+  base_height_target: 0.56   # [m] Ziel-Rumpfhöhe = Spawn-Höhe; hält den Roboter aufrecht
+  base_height_sigma: 0.01    # tanh(Δz²/σ): bei 10cm Abweichung → ~0.76; bei 5cm → ~0.24
+  lin_vel_z_sigma: 0.5       # tanh(vz²/σ): bei 0.5 m/s → ~0.46; bei 1.0 m/s → ~0.96
 
   reward_scales:
     # ── Task (Hero-Ziel: raw_mean ≈ 0.9–1.0) ─────────────────────────────────────
@@ -168,6 +171,8 @@ reward_cfg:
     ang_vel_xy: -0.05         # Hero ~0.11
     # ang_vel_z: deaktiviert — redundant zu tracking_ang_vel (EMA)
     orientation: -0.5         # -1.0→-0.5: Hero ~0.03, style deckt Rumpf-Orientierung ab
+    base_height: -1.0         # Hocken/Aufbäumen bestrafen; raw ≈0 bei gutem Gehen, steigt bei Sturz
+    lin_vel_z: -0.5           # Bouncing/Hüpfen dämpfen; reagiert früher als base_height
 
 command_cfg:
   num_commands: 3
