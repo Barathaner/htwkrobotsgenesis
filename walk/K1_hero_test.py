@@ -8,6 +8,8 @@ Reward (Feature-Definition, Skalen, Vorzeichen) oder im Retarget nicht.
 Replay-Prinzip: pro Frame wird der Roboter via set_qpos auf die Referenz-Pose gesetzt (FK an →
 Fußpositionen + Rendering korrekt) und die internen K1Env-Buffer werden direkt aus der NPZ befüllt
 (zuverlässiger als get_vel nach Teleport). Es läuft KEINE Physik — die Bewegung ist exakt die NPZ.
+Policy-Actions werden kinematisch approximiert (action = (dof_pos − default) / action_scale), damit
+action_rate und andere action-abhängige Terme im Replay sinnvoll geloggt werden.
 
 Das Command wird je Frame auf die Referenz-Geschwindigkeit (Heading-Frame) gesetzt → tracking ≈ 1.
 Im Video werden Command-Richtung (3D-Pfeil + 2D-HUD) und -Geschwindigkeit eingeblendet.
@@ -271,6 +273,18 @@ def main():
         wandb.config.update({"cmd_mode": args.cmd_mode, "cmd_vx": cmd_vx, "cmd_vy": cmd_vy,
                              "cmd_yaw": cmd_yaw, "cmd_speed": speed})
 
+    action_clip = env.env_cfg["clip_actions"]
+    action_scale = env.env_cfg["action_scale"]
+
+    def kinematic_action(dof_row: torch.Tensor) -> torch.Tensor:
+        """Policy-Action aus Gelenkwinkel (Inverse von K1Env.step: target = action*scale + default)."""
+        return torch.clip((dof_row - env.default_dof_pos) / action_scale, -action_clip, action_clip)
+
+    # Warm-start: actions/last_actions auf Frame 0 → kein künstlicher action_rate-Spike (last=0).
+    a0 = kinematic_action(dof_pos_npz[0, col_motor].unsqueeze(0))
+    env.actions.copy_(a0)
+    env.last_actions.copy_(a0)
+
     with torch.no_grad():
         for step in range(n_steps):
             t = step % T                          # Referenz endlos loopen
@@ -301,6 +315,11 @@ def main():
             env.projected_gravity.copy_(transform_by_quat(global_gravity, inv_bq))
             env.dof_pos.copy_(env.robot.get_dofs_position(env.motors_dof_idx))
             env.dof_vel.copy_(dof_vel_npz[t, col_motor].unsqueeze(0))
+
+            # Kinematische Policy-Actions approximieren (Inverse von step(): target = action*scale + default).
+            kin_action = kinematic_action(env.dof_pos)
+            env.last_actions.copy_(env.actions)
+            env.actions.copy_(kin_action)
 
             env._update_command_tracking_ema()  # EMA-Geschw. für das (zeitgemittelte) Command-Tracking
 

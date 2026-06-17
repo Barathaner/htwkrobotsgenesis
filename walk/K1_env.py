@@ -727,9 +727,10 @@ class K1Env:
     def _reward_ang_vel_z(self):
         """Strafe (gebunden ∈[0,1)): Yaw-Rate vom Kommando abweichen (ergänzt tracking_ang_vel).
 
-        tanh((ω_z − cmd_yaw)² / ang_vel_z_sigma): 0 bei Soll-Drehrate, →1 bei Spin. Macht Spin-Hacks
-        teuer, ohne wie der quadratische Term unbeschränkt zu wachsen.
+        Wie tracking_ang_vel auf der ZEITGEMITTELTEN Yaw-Rate (ang_vel_z_ema), nicht der momentanen —
+        die oszilliert je Schritt und würde sonst eine perfekte Referenz fälschlich bestrafen.
+        tanh((ω_z_ema − cmd_yaw)² / ang_vel_z_sigma): 0 bei Soll-Drehrate, →1 bei Spin.
         """
-        sq = torch.square(self.base_ang_vel[:, 2] - self.commands[:, 2])
+        sq = torch.square(self.ang_vel_z_ema - self.commands[:, 2])
         return torch.tanh(sq / self.reward_cfg["ang_vel_z_sigma"])
 

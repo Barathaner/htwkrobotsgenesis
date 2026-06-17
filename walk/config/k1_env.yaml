@@ -125,7 +125,7 @@ reward_cfg:
   # Gebundene Strafterme: jeder gibt tanh(quantity / σ) ∈ [0,1) zurück (0 = sauber, →1 = starke
   # Verletzung); Vorzeichen kommt aus reward_scales (negativ = Strafe). Kleineres σ = strenger
   # (sättigt früher gegen 1), größeres σ = milder/linearer nahe 0. Startwerte — bei Bedarf tunen.
-  action_rate_sigma: 1.0
+  action_rate_sigma: 15.0   # an Referenz kalibriert (ΣΔaction²≈1.4 beim Jog) → Hero-Strafe ~0.09 statt 0.84.
   feet_slip_sigma: 0.5
   leg_symmetry_sigma: 0.5
   dof_vel_sigma: 2000.0   # an Referenz kalibriert (Σdof_vel²≈212 beim Jog) → Hero-Strafe ~0.10 statt 0.99.
