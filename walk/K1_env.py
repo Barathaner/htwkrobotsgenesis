@@ -67,7 +67,7 @@ class K1Env:
             "show_viewer": show_viewer,
         }
         if record_camera:
-            scene_kwargs["vis_options"] = gs.options.VisOptions(rendered_envs_idx=[0])
+            scene_kwargs["vis_options"] = gs.options.VisOptions(rendered_envs_idx=list(range(num_envs)))
         self.scene = gs.Scene(**scene_kwargs)
         self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
         self.robot = self.scene.add_entity(
@@ -90,22 +90,35 @@ class K1Env:
         self.cam = None
         if record_camera:
             vcfg = env_cfg.get("video", {})
+            if num_envs > 1:
+                cam_pos = tuple(vcfg.get("multi_camera_pos", [0.0, -9.0, 5.0]))
+                cam_lookat = tuple(vcfg.get("multi_camera_lookat", [0.0, 0.0, 0.5]))
+                cam_fov = vcfg.get("multi_camera_fov", 55)
+            else:
+                cam_pos = tuple(vcfg.get("camera_pos", [3.0, -1.0, 1.5]))
+                cam_lookat = tuple(vcfg.get("camera_lookat", [0.0, 0.0, 0.5]))
+                cam_fov = vcfg.get("camera_fov", 30)
             self.cam = self.scene.add_camera(
                 res=tuple(vcfg.get("res", [640, 480])),
-                pos=tuple(vcfg.get("camera_pos", [3.0, -1.0, 1.5])),
-                lookat=tuple(vcfg.get("camera_lookat", [0.0, 0.0, 0.5])),
-                fov=vcfg.get("camera_fov", 30),
+                pos=cam_pos,
+                lookat=cam_lookat,
+                fov=cam_fov,
                 GUI=False,
             )
 
-        self.scene.build(n_envs=num_envs)
+        build_kwargs: dict = {"n_envs": num_envs}
+        if record_camera and num_envs > 1:
+            vcfg = env_cfg.get("video", {})
+            build_kwargs["env_spacing"] = tuple(vcfg.get("env_spacing", [3.0, 3.0]))
+            build_kwargs["n_envs_per_row"] = 2
+        self.scene.build(**build_kwargs)
         self.base_link_idx_local = self.robot.links[0].idx_local
 
         # Verfolgungskamera: hält den anfänglichen Versatz Kamera→Rumpf und schwenkt mit dem
         # Roboter mit (lookat folgt dem Rumpf), statt starr zu stehen. update_following() muss
         # je Frame VOR cam.render() aufgerufen werden (siehe k1_train_runner._record_video).
         # smoothing ∈ (0,1): EMA-Glättung (höher = weicher/träger); None = exaktes Tracking.
-        if self.cam is not None:
+        if self.cam is not None and num_envs == 1:
             vcfg = env_cfg.get("video", {})
             if vcfg.get("follow", True):
                 self.cam.follow_entity(self.robot, smoothing=vcfg.get("follow_smoothing", 0.9))

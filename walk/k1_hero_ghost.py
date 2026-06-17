@@ -93,8 +93,21 @@ class HeroGhost:
         spawn_rpy[0, 2] = yaw_delta
         return xyz_to_quat(spawn_rpy)[0]
 
-    def _align_pos(self, pos_rel: torch.Tensor) -> torch.Tensor:
-        return transform_by_quat(pos_rel.unsqueeze(0), self.yaw_align_quat.unsqueeze(0))[0]
+    def _command_align_quat(self, env) -> torch.Tensor:
+        """Yaw-align rotated toward the current command direction (heading frame).
+
+        yaw_align_quat maps NPZ forward → spawn-heading +x in world space.
+        For non-trivial commands, additionally rotate by the command heading angle
+        so the ghost faces and advances in the commanded direction.
+        """
+        speed = torch.norm(env.commands[0, :2]).item()
+        if speed < 0.05:
+            return self.yaw_align_quat
+        cmd_angle = torch.atan2(env.commands[0, 1], env.commands[0, 0])
+        cmd_rpy = torch.zeros(1, 3, dtype=gs.tc_float, device=gs.device)
+        cmd_rpy[0, 2] = cmd_angle
+        cmd_rot = xyz_to_quat(cmd_rpy)[0]
+        return transform_quat_by_quat(cmd_rot.unsqueeze(0), self.yaw_align_quat.unsqueeze(0))[0]
 
     def set_frame(self, step: int, env) -> None:
         """Referenzpose + Geschwindigkeit im Trainings-Heading, Start = env.init_base_pos."""
@@ -103,12 +116,13 @@ class HeroGhost:
 
         t = step % self.T
         cycle = step // self.T
+        align = self._command_align_quat(env)
         pos_ref = self.root_pos[t] + cycle * self.loop_disp
         pos_rel = pos_ref - self.root_pos[0]
-        ghost_pos = env.init_base_pos + self._align_pos(pos_rel)
+        ghost_pos = env.init_base_pos + transform_by_quat(pos_rel.unsqueeze(0), align.unsqueeze(0))[0]
 
         ghost_quat = transform_quat_by_quat(
-            self.yaw_align_quat.unsqueeze(0),
+            align.unsqueeze(0),
             self.root_quat[t].unsqueeze(0),
         )[0]
 
@@ -117,7 +131,7 @@ class HeroGhost:
 
         wlv = transform_by_quat(
             self.root_lin_vel[t].unsqueeze(0),
-            self.yaw_align_quat.unsqueeze(0),
+            align.unsqueeze(0),
         )[0]
         ang_world = transform_by_quat(
             self.root_ang_vel_body[t].unsqueeze(0),

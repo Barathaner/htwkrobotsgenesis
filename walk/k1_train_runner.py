@@ -78,8 +78,9 @@ class K1TrainRunner(OnPolicyRunner):
             from K1_env import K1Env
 
             env_cfg, obs_cfg, reward_cfg, command_cfg = self.video_env_cfgs
+            video_num_envs = env_cfg.get("video", {}).get("num_envs", 1)
             self._video_env = K1Env(
-                num_envs=1,
+                num_envs=video_num_envs,
                 env_cfg=copy.deepcopy(env_cfg),
                 obs_cfg=obs_cfg,
                 reward_cfg=reward_cfg,
