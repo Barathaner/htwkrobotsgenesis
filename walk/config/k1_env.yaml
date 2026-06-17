@@ -100,6 +100,9 @@ env_cfg:
     camera_fov: 32
     follow: true
     follow_smoothing: 0.9
+    hero_ghost: true
+    hero_ghost_color: [0.55, 1.0, 0.55]   # hellgrün
+    hero_ghost_opacity: 0.42
 
 obs_cfg:
   obs_scales:

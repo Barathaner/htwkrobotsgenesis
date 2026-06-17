@@ -107,7 +107,7 @@ class K1TrainRunner(OnPolicyRunner):
 
         with torch.inference_mode():
             obs = video_env.reset()
-            for _ in range(self.video_steps):
+            for frame_idx in range(self.video_steps):
                 actions = policy(obs)
                 obs, _, _, _ = video_env.step(actions)
 
@@ -118,6 +118,8 @@ class K1TrainRunner(OnPolicyRunner):
                     if n in video_env.reward_scales:
                         episode_sums[n] += row.get(f"reward_step/{n}", 0.0)
 
+                if video_env.hero_ghost is not None:
+                    video_env.hero_ghost.set_frame(frame_idx, video_env)
                 if video_env.cam._followed_entity is not None:
                     video_env.cam.update_following()
                 frames.append(render_annotated_frame(video_env))

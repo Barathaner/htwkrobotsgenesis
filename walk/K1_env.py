@@ -74,6 +74,11 @@ class K1Env:
                 quat=env_cfg["base_init_quat"],
             )
         )
+        self.hero_ghost = None
+        if record_camera and num_envs == 1 and env_cfg.get("video", {}).get("hero_ghost", True):
+            from k1_hero_ghost import HeroGhost
+
+            self.hero_ghost = HeroGhost(self.scene, env_cfg, reward_cfg)
         if show_viewer:
             from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 
@@ -263,6 +268,10 @@ class K1Env:
             self.reward_scales[name] *= self.dt
             self.reward_functions[name] = getattr(self, "_reward_" + name)
             self.episode_sums[name] = torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device)
+
+        if self.hero_ghost is not None:
+            self.hero_ghost.attach_after_build(self)
+            print(f"[video] hero ghost ON — {os.path.basename(self.hero_ghost._motion_path)}")
 
         self.reset()
 
