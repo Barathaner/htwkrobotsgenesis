@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import os
 import time
+from collections.abc import Callable
+from typing import Any
 
 import imageio.v2 as imageio
 import torch
@@ -29,15 +31,25 @@ class K1TrainRunner(OnPolicyRunner):
         video_steps: int = 300,
         video_fps: int = 50,
         video_env_cfgs: tuple[dict, dict, dict, dict] | None = None,
+        enable_video: bool = True,
+        on_iteration_end: Callable[[int, Any], None] | None = None,
     ) -> None:
         super().__init__(env, train_cfg, log_dir, device)
         self.video_interval = video_interval
         self.video_steps = video_steps
         self.video_fps = video_fps
         self.video_env_cfgs = video_env_cfgs
+        self.enable_video = enable_video
+        self.on_iteration_end = on_iteration_end
         self._video_env = None
 
-    def _log_video_rollout(self, it: int, step_rows: list[dict[str, float]], summary: dict[str, float], video_path: str) -> None:
+    def _log_video_rollout(
+        self,
+        it: int,
+        step_rows: list[dict[str, float]],
+        summary: dict[str, float],
+        video_path: str,
+    ) -> None:
         """Video-Rollout getrennt vom PPO-Logging — ein einziger wandb.log @ step=it."""
         try:
             import wandb
@@ -167,7 +179,11 @@ class K1TrainRunner(OnPolicyRunner):
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            record_video = self.logger.writer is not None and it % self.video_interval == 0
+            record_video = (
+                self.enable_video
+                and self.logger.writer is not None
+                and it % self.video_interval == 0
+            )
             if record_video:
                 self._record_video(it)
 
@@ -187,6 +203,9 @@ class K1TrainRunner(OnPolicyRunner):
             # Video-Rollout danach: eigene frame-Achse + Summary/Video @ step=it.
             if record_video:
                 self._flush_pending_video_log()
+
+            if self.on_iteration_end is not None:
+                self.on_iteration_end(it, self)
 
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore

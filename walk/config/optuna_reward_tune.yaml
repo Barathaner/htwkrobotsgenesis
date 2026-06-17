@@ -1,0 +1,51 @@
+# Optuna study: tune reward_scales in k1_env.yaml.
+# search_space: absolute scale values (low/high), NOT multipliers.
+# Penalties are negative (low = stärkere Strafe, high = milder, näher an 0).
+
+study:
+  n_trials: 50
+  sampler: TPE
+  pruner: median
+  storage: logs/optuna/k1_reward_tune.db
+  study_name: k1-reward-tune
+
+trial:
+  max_iterations: 1000
+  num_envs: 2048
+  seed: 42
+  eval_steps: 1000
+  report_interval: 100
+  save_interval: 10000   # effectively no checkpoints during tuning
+  wandb_project: k1-optuna-tune
+  video_interval: 250     # rollout videos → wandb (iter 0, 250, 500, …)
+
+# Scales listed here are NOT tuned (baseline from k1_env.yaml kept).
+fixed_scales: []
+
+search_space:
+  # ── Task (positiv) — Baseline in k1_env.yaml in Klammern ─────────────────
+  tracking_lin_vel: {low: 0.5,  high: 5.0,  log: true}   # (2.0)  primär
+  tracking_ang_vel: {low: 0.2,  high: 2.0,  log: true}   # (0.75) kleiner als lin
+  style:            {low: 0.5,  high: 5.0,  log: true}   # (2.0)  co-primär
+  survival:         {low: 0.25, high: 2.0,  log: true}   # (1.0)
+  feet_air_time:    {low: 1.0,  high: 12.0, log: true}   # (4.0)  Impuls-Reward → hohe Scales nötig
+
+  # ── Kontakt / Schritt (negativ = Strafe) ───────────────────────────────────
+  feet_slip:        {low: -1.0,  high: -0.05}             # (-0.35) Hero dominierte früher bei -1.0
+  leg_symmetry:     {low: -0.8,  high: -0.02}             # (-0.25)
+
+  # ── Regularizer (kleine negative Scales) ───────────────────────────────────
+  action_rate:      {low: -0.25, high: -0.01}             # (-0.05)
+  dof_vel:          {low: -0.25, high: -0.01}             # (-0.05)
+  ang_vel_xy:       {low: -0.25, high: -0.01}             # (-0.05)
+  orientation:      {low: -1.5,  high: -0.1}              # (-0.5)
+
+objective:
+  weights:
+    tracking_lin_vel: 2.0
+    tracking_ang_vel: 1.5
+    style: 2.0
+    survival: 1.0
+    feet_air_time: 0.5
+    feet_slip: -0.3
+    orientation: -0.2
