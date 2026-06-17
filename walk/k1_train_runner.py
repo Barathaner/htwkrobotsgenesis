@@ -11,6 +11,7 @@ import torch
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import check_nan
 
+from k1_reward_log import build_step_reward_row, episode_summary, reward_names
 from k1_video_overlay import render_annotated_frame
 
 
@@ -36,6 +37,28 @@ class K1TrainRunner(OnPolicyRunner):
         self.video_env_cfgs = video_env_cfgs
         self._video_env = None
 
+    def _log_video_rollout(self, it: int, step_rows: list[dict[str, float]], summary: dict[str, float], video_path: str) -> None:
+        """Video-Rollout getrennt vom PPO-Logging — ein einziger wandb.log @ step=it."""
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        payload: dict = {
+            "video_rollout/train_iteration": float(it),
+            "video_rollout/video": wandb.Video(video_path, fps=self.video_fps, format="mp4"),
+        }
+        for k, v in summary.items():
+            payload[k] = v
+        if step_rows:
+            columns = ["frame", *step_rows[0].keys()]
+            table = wandb.Table(columns=columns)
+            for t, row in enumerate(step_rows):
+                table.add_data(t, *[row[c] for c in step_rows[0].keys()])
+            payload["video_rollout/step_rewards"] = table
+        wandb.log(payload, step=it)
+
     def _get_video_env(self):
         if self._video_env is None:
             if self.video_env_cfgs is None:
@@ -43,7 +66,6 @@ class K1TrainRunner(OnPolicyRunner):
             from K1_env import K1Env
 
             env_cfg, obs_cfg, reward_cfg, command_cfg = self.video_env_cfgs
-            # Video-Env mit eigener Scene; env_cfg enthält video-Block (seitliche Hero-Kamera).
             self._video_env = K1Env(
                 num_envs=1,
                 env_cfg=copy.deepcopy(env_cfg),
@@ -64,20 +86,45 @@ class K1TrainRunner(OnPolicyRunner):
         path = os.path.join(video_dir, f"train_{it}.mp4")
 
         policy = self.get_inference_policy(device=self.device)
-        frames = []
+        frames: list = []
+        step_rows: list[dict[str, float]] = []
+        names = reward_names(video_env)
+        episode_sums = {n: 0.0 for n in names}
+        raw_sums = {n: 0.0 for n in names}
+        duration_s = self.video_steps / self.video_fps
 
         with torch.inference_mode():
             obs = video_env.reset()
             for _ in range(self.video_steps):
                 actions = policy(obs)
                 obs, _, _, _ = video_env.step(actions)
+
+                row = build_step_reward_row(video_env, names)
+                step_rows.append(row)
+                for n in names:
+                    raw_sums[n] += row[f"reward_raw/{n}"]
+                    if n in video_env.reward_scales:
+                        episode_sums[n] += row.get(f"reward_step/{n}", 0.0)
+
                 if video_env.cam._followed_entity is not None:
                     video_env.cam.update_following()
                 frames.append(render_annotated_frame(video_env))
 
         imageio.mimsave(path, frames, fps=self.video_fps)
+        summary = episode_summary(raw_sums, episode_sums, self.video_steps, duration_s)
+
+        self._pending_video_log = (it, step_rows, summary, path)
         print(f"Recorded rollout video: {path}")
         return path
+
+    def _flush_pending_video_log(self) -> None:
+        pending = getattr(self, "_pending_video_log", None)
+        if pending is None:
+            return
+        it, step_rows, summary, path = pending
+        self._pending_video_log = None
+        self._log_video_rollout(it, step_rows, summary, path)
+        print(f"  → video_rollout/* logged @ train step {it}")
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         if init_at_random_ep_len:
@@ -93,6 +140,7 @@ class K1TrainRunner(OnPolicyRunner):
             self.alg.broadcast_parameters()
 
         self.logger.init_logging_writer()
+        self._pending_video_log = None
 
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
@@ -119,9 +167,11 @@ class K1TrainRunner(OnPolicyRunner):
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            if self.logger.writer is not None and it % self.video_interval == 0:
+            record_video = self.logger.writer is not None and it % self.video_interval == 0
+            if record_video:
                 self._record_video(it)
 
+            # Trainings-Metriken ZUERST (globaler Step = it) — unverändert wie vorher.
             self.logger.log(
                 it=it,
                 start_it=start_it,
@@ -133,6 +183,10 @@ class K1TrainRunner(OnPolicyRunner):
                 action_std=self.alg.get_policy().output_std,
                 rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
             )
+
+            # Video-Rollout danach: eigene frame-Achse + Summary/Video @ step=it.
+            if record_video:
+                self._flush_pending_video_log()
 
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
