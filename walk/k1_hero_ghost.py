@@ -3,6 +3,10 @@
 Die Referenz-NPZ läuft in ihrer eigenen Welt-Richtung (typ. −x). Training nutzt
 Commands im Spawn-Heading-Frame (+vx vorwärts). Der Ghost wird per Yaw-Rotation
 in dieselbe Richtung/Orientierung gebracht und startet am Trainings-Spawn.
+
+Position wird inkrementell integriert (nur der aktuelle NPZ-Step-Delta wird mit
+der aktuellen Command-Richtung rotiert). Command-Wechsel ohne Episode-Reset
+dreht den Ghost, ohne die bisherige Weltposition neu vom Spawn zu spiegeln.
 """
 
 from __future__ import annotations
@@ -55,9 +59,10 @@ class HeroGhost:
         self._motion_path = path
         self._ready = False
         self.T = 0
-        self.yaw_align_quats: list[torch.Tensor] = []   # one per env
-        self._env_spawn_pos: torch.Tensor | None = None  # (num_envs, 3) world positions
-        self._hidden_qpos: torch.Tensor | None = None    # parked qpos for invisible instances
+        self.yaw_align_quats: list[torch.Tensor] = []
+        self._world_pos: torch.Tensor | None = None   # (num_envs, 3) integrated root position
+        self._last_t: torch.Tensor | None = None      # (num_envs,) previous NPZ frame; -1 after reset
+        self._hidden_qpos: torch.Tensor | None = None
 
     def attach_after_build(self, env) -> None:
         """Motion laden, Yaw-Offset berechnen, Spawn-Positionen jedes Envs speichern."""
@@ -83,15 +88,31 @@ class HeroGhost:
 
         self.yaw_align_quats = [self._compute_yaw_align(env, i) for i in range(self.num_envs)]
 
-        # Per-env robot spawn positions in world coordinates (shape: num_envs, 3)
-        self._env_spawn_pos = env.robot.get_pos().clone().detach()
+        self._world_pos = env.robot.get_pos().clone().detach()
+        self._last_t = torch.full((self.num_envs,), -1, dtype=torch.long, device=dev)
 
-        # Hidden qpos: place ghost far underground; valid joint angles from frame 0
         hidden_pos = torch.tensor([0.0, 0.0, -20.0], dtype=gs.tc_float, device=dev)
         hidden_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=gs.tc_float, device=dev)
         self._hidden_qpos = torch.cat([hidden_pos, hidden_quat, self.dof_full[0]])
 
         self._ready = True
+
+    def reset_envs(self, env, envs_idx=None) -> None:
+        """Sync ghost lifecycle with env episode reset — only place that restarts world position."""
+        if not self._ready:
+            return
+        spawn = env.robot.get_pos()
+        if envs_idx is None:
+            self._world_pos.copy_(spawn)
+            self._last_t.fill_(-1)
+            for i in range(self.num_envs):
+                self.yaw_align_quats[i] = self._compute_yaw_align(env, i)
+        else:
+            reset_indices = envs_idx.nonzero(as_tuple=True)[0]
+            for i in reset_indices.tolist():
+                self._world_pos[i] = spawn[i]
+                self._last_t[i] = -1
+                self.yaw_align_quats[i] = self._compute_yaw_align(env, i)
 
     def _compute_yaw_align(self, env, env_idx: int = 0) -> torch.Tensor:
         """Rotates NPZ forward direction to match env env_idx's spawn heading in world frame."""
@@ -103,7 +124,6 @@ class HeroGhost:
             fwd_npz = self.root_lin_vel[:n, :2].mean(dim=0)
         fwd_npz = fwd_npz / torch.norm(fwd_npz).clamp(min=1e-6)
 
-        # heading +x → world for this env's spawn yaw
         heading_quat = inv_quat(env.inv_heading_quat[env_idx : env_idx + 1])
         fwd_train = transform_by_quat(
             torch.tensor([[1.0, 0.0, 0.0]], dtype=gs.tc_float, device=dev),
@@ -126,29 +146,56 @@ class HeroGhost:
         cmd_angle = torch.atan2(env.commands[env_idx, 1], env.commands[env_idx, 0])
         cmd_rpy = torch.zeros(1, 3, dtype=gs.tc_float, device=gs.device)
         cmd_rpy[0, 2] = cmd_angle
-        return xyz_to_quat(cmd_rpy)  # (1, 4)
+        return xyz_to_quat(cmd_rpy)
 
-    def _ghost_qpos_for_env(self, t: int, cycle: int, env, env_idx: int) -> torch.Tensor:
+    def _pos_align_quat(self, env, env_idx: int) -> torch.Tensor:
+        """Combined yaw_align @ cmd_rot for translating NPZ deltas into world frame."""
+        base = self.yaw_align_quats[env_idx].unsqueeze(0)
+        cmd_rot = self._get_cmd_rot(env, env_idx)
+        return transform_quat_by_quat(base, cmd_rot) if cmd_rot is not None else base
+
+    def _integrate_npz_delta(self, env_idx: int, delta_npz: torch.Tensor, pos_align: torch.Tensor) -> None:
+        self._world_pos[env_idx] = self._world_pos[env_idx] + transform_by_quat(
+            delta_npz.unsqueeze(0), pos_align
+        )[0]
+
+    def _advance_world_pos(self, env, env_idx: int, t: int) -> None:
+        """Integrate NPZ root displacement from last_t to t using current command direction."""
+        last = int(self._last_t[env_idx].item())
+        if last < 0:
+            self._last_t[env_idx] = t
+            return
+        if last == t:
+            return
+
+        pos_align = self._pos_align_quat(env, env_idx)
+
+        if t > last:
+            for frame in range(last + 1, t + 1):
+                delta_npz = self.root_pos[frame] - self.root_pos[frame - 1]
+                self._integrate_npz_delta(env_idx, delta_npz, pos_align)
+        else:
+            # NPZ loop wrap: last → T-1, then T-1 → 0 (+ loop_disp), then 0 → t
+            for frame in range(last + 1, self.T):
+                delta_npz = self.root_pos[frame] - self.root_pos[frame - 1]
+                self._integrate_npz_delta(env_idx, delta_npz, pos_align)
+            delta_npz = (self.root_pos[0] - self.root_pos[self.T - 1]) + self.loop_disp
+            self._integrate_npz_delta(env_idx, delta_npz, pos_align)
+            for frame in range(1, t + 1):
+                delta_npz = self.root_pos[frame] - self.root_pos[frame - 1]
+                self._integrate_npz_delta(env_idx, delta_npz, pos_align)
+
+        self._last_t[env_idx] = t
+
+    def _ghost_qpos_for_env(self, t: int, env, env_idx: int) -> torch.Tensor:
         """Compute the qpos (29,) for ghost entity env_idx at NPZ frame t."""
-        base = self.yaw_align_quats[env_idx].unsqueeze(0)  # (1,4)
-
+        base = self.yaw_align_quats[env_idx].unsqueeze(0)
         cmd_rot = self._get_cmd_rot(env, env_idx)
 
-        # ── position ──────────────────────────────────────────────────────────
-        # pos_align rotates NPZ relative displacement into the commanded world direction:
-        # transform_quat_by_quat(v, u) = R_u @ R_v  → (yaw_align, cmd_rot) = R_cmd @ R_yaw
-        pos_align = transform_quat_by_quat(base, cmd_rot) if cmd_rot is not None else base
-        pos_ref = self.root_pos[t] + cycle * self.loop_disp
-        pos_rel = (pos_ref - self.root_pos[0]).unsqueeze(0)
-        spawn = self._env_spawn_pos[env_idx]
-        ghost_pos = spawn + transform_by_quat(pos_rel, pos_align)[0]
+        ghost_pos = self._world_pos[env_idx]
 
-        # ── orientation ───────────────────────────────────────────────────────
-        # Base: NPZ body rotation expressed in training world (transform_quat_by_quat(v,u)=R_u@R_v)
-        ghost_quat = transform_quat_by_quat(base, self.root_quat[t].unsqueeze(0))  # (1,4)
+        ghost_quat = transform_quat_by_quat(base, self.root_quat[t].unsqueeze(0))
         if cmd_rot is not None:
-            # Apply cmd_rot as outermost (world-space) rotation:
-            # transform_quat_by_quat(ghost_quat, cmd_rot) = R_cmd @ R_ghost
             ghost_quat = transform_quat_by_quat(ghost_quat, cmd_rot)
         ghost_quat = ghost_quat[0]
 
@@ -162,28 +209,16 @@ class HeroGhost:
         n = self.num_envs
 
         for i, entity in enumerate(self.entities):
-            # Use per-env episode step so the ghost resets in sync with each training env.
             env_step = int(env.episode_length_buf[i].item())
-
-            # Recompute yaw alignment on the first two steps of each episode.
-            # env_step==0: mid-video reset (episode_length_buf zeroed inside step()).
-            # env_step==1: covers the initial episode whose heading was randomised by
-            #              reset() AFTER attach_after_build() first ran.
-            if env_step <= 1:
-                self.yaw_align_quats[i] = self._compute_yaw_align(env, i)
-
             t = env_step % self.T
-            cycle = env_step // self.T
 
-            # Build per-env qpos: entity i's env-i copy at correct position, others underground
+            self._advance_world_pos(env, i, t)
+
             qpos = self._hidden_qpos.unsqueeze(0).expand(n, -1).contiguous().clone()
-            qpos[i] = self._ghost_qpos_for_env(t, cycle, env, i)
+            qpos[i] = self._ghost_qpos_for_env(t, env, i)
             entity.set_qpos(qpos, zero_velocity=False, skip_forward=False)
 
-            # Velocity for the visible instance
-            base = self.yaw_align_quats[i].unsqueeze(0)
-            cmd_rot = self._get_cmd_rot(env, i)
-            pos_align = transform_quat_by_quat(base, cmd_rot) if cmd_rot is not None else base
+            pos_align = self._pos_align_quat(env, i)
             ghost_quat = qpos[i, 3:7]
 
             wlv = transform_by_quat(self.root_lin_vel[t].unsqueeze(0), pos_align)[0]

@@ -76,7 +76,19 @@ class K1Env:
             )
         self.scene = gs.Scene(**scene_kwargs)
         vcfg_vis = env_cfg.get("video", {})
-        self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+        # Video env (multi-env rollout): URDF plane is instanced per env (~100 m mesh each).
+        # With env_spacing << plane size they overlap coplanar → z-fighting / ground flicker.
+        # gs.morphs.Plane renders one shared floor (is_floor + env_shared) for all envs.
+        if record_camera:
+            self.scene.add_entity(
+                gs.morphs.Plane(fixed=True),
+                surface=gs.surfaces.Default(
+                    color=tuple(float(c) for c in vcfg_vis.get("plane_color", [1.0, 1.0, 1.0])),
+                    roughness=float(vcfg_vis.get("plane_roughness", 0.95)),
+                ),
+            )
+        else:
+            self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
         use_color_shadow = record_camera and env_cfg.get("video", {}).get("color_shadow", True)
         robot_opacity = 0.0 if use_color_shadow else 1.0
         self.robot = self.scene.add_entity(
@@ -800,6 +812,9 @@ class K1Env:
         self._resample_commands(envs_idx)
         # domain randomization: re-sample physics per episode
         self._randomize_domain(envs_idx)
+
+        if self.hero_ghost is not None:
+            self.hero_ghost.reset_envs(self, envs_idx)
 
     def _read_foot_contact_forces(self):
         """Net contact force on foot links (n_envs, 2, 3) [N], world frame.

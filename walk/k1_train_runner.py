@@ -130,7 +130,15 @@ class K1TrainRunner(OnPolicyRunner):
                 update_camera_centroid(video_env)
                 frames.append(render_annotated_frame(video_env))
 
-        imageio.mimsave(path, frames, fps=self.video_fps)
+        imageio.mimsave(
+            path,
+            frames,
+            fps=self.video_fps,
+            codec="libx264",
+            pixelformat="yuv420p",
+            macro_block_size=1,
+            output_params=["-crf", "18"],  # high-quality H.264 (lower = better, 18 ≈ visually lossless)
+        )
         summary = episode_summary(raw_sums, episode_sums, self.video_steps, duration_s)
 
         self._pending_video_log = (it, step_rows, summary, path)
