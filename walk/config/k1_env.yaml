@@ -218,6 +218,9 @@ reward_cfg:
   amp_lr: 1.0e-4
   amp_grad_penalty: 10.0          # WGAN-GP weight; keeps discriminator Lipschitz
   amp_replay_size: 100000         # circular buffer of policy transitions for disc training
+  amp_disc_updates_per_iter: 5    # disc gradient steps per PPO iteration; PPO does
+                                   # num_learning_epochs×num_mini_batches=20 steps → 5 disc
+                                   # steps gives ~4:1 ratio (AMP paper recommends 1:1–5:1)
 
   # Gebundene Strafterme: jeder gibt tanh(quantity / σ) ∈ [0,1) zurück (0 = sauber, →1 = starke
   # Verletzung); Vorzeichen kommt aus reward_scales (negativ = Strafe). Kleineres σ = strenger
@@ -226,13 +229,15 @@ reward_cfg:
   feet_slip_sigma: 1.5      # Hero-kinematisch ~0.44 bei 0.5 (Replay-Artefakt); 1.5 → ~0.16, Training-Physik niedriger.
   leg_symmetry_sigma: 0.5
   pose_symmetry_sigma: 1.5  # (rad²·joints) sensitivity; 6 joints × (0.5rad)² ≈ 1.5 at moderate error
+  pose_symmetry_yaw_max: 0.5   # [rad/s] suppress symmetry penalty above this yaw command magnitude
+                                 # (turning requires deliberate hip/ankle lateral asymmetry)
   dof_vel_sigma: 2000.0   # an Referenz kalibriert (Σdof_vel²≈212 beim Jog) → Hero-Strafe ~0.10 statt 0.99.
                           # style matcht dof_vel ohnehin gegen die Referenz; hier nur noch Schutz vor EXTREM-Geschw.
   orientation_sigma: 0.2
   ang_vel_xy_sigma: 6.0   # an Referenz kalibriert (Σω_xy²≈0.64 beim Jog) → Hero-Strafe ~0.10 statt 0.46.
   ang_vel_z_sigma: 1.0
   base_height_target: 0.56   # [m] Ziel-Rumpfhöhe = Spawn-Höhe; hält den Roboter aufrecht
-  base_height_sigma: 0.01    # tanh(Δz²/σ): bei 10cm Abweichung → ~0.76; bei 5cm → ~0.24
+  base_height_sigma: 0.06    # tanh(Δz²/σ): bei 10cm Abweichung → ~0.17; bei 5cm → ~0.04 (mild)
   lin_vel_z_sigma: 0.5       # tanh(vz²/σ): bei 0.5 m/s → ~0.46; bei 1.0 m/s → ~0.96
 
   reward_scales:
@@ -249,15 +254,15 @@ reward_cfg:
     feet_air_time: 7.0       # Event-Reward; Scale hoch wegen seltener On-Beat-Landungen
     feet_slip: -0.5         # -1.0→-0.35: Hero war -0.44/s (dominierte alle Strafen); σ=1.5 mildert tanh
     leg_symmetry: -0.25      # aktiviert: Hero ~0.10 → ~-0.025/s; sanfter Wechselschritt-Nudge
-    gait_phase: -0.8          # Strafe: Off-Beat-Kontakt (0–2 Fuß-Fehler/Step), negatives Vorzeichen
+    gait_phase: -0.8          # Strafe: Off-Beat-Kontakt (0–1, normiert über 2 Füße), negatives Vorzeichen
     pose_symmetry: -0.5      # cyclic mirror symmetry: left_now ≈ mirror(right_half_ago)
 
     # ── Regularizer (Hero-Ziel: raw_mean ≈ 0.05–0.12, klein vs. Task) ─────────
     action_rate: -0.1        # Hero ~0.09
-    dof_vel: -0.05            # Hero ~0.11; style matcht dof_vel ohnehin
+    #dof_vel: -0.05            # Hero ~0.11; style matcht dof_vel ohnehin
     ang_vel_xy: -0.05        # Hero ~0.11
     # ang_vel_z: deaktiviert — redundant zu tracking_ang_vel (EMA)
-    orientation: -0.5         # -1.0→-0.5: Hero ~0.03, style deckt Rumpf-Orientierung ab
+    #orientation: -0.5         # -1.0→-0.5: Hero ~0.03, style deckt Rumpf-Orientierung ab
     base_height: -1.0         # Hocken/Aufbäumen bestrafen; raw ≈0 bei gutem Gehen, steigt bei Sturz
     lin_vel_z: -0.5           # Bouncing/Hüpfen dämpfen; reagiert früher als base_height
 

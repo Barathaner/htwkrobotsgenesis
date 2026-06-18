@@ -67,7 +67,13 @@ class K1Env:
             "show_viewer": show_viewer,
         }
         if record_camera:
-            scene_kwargs["vis_options"] = gs.options.VisOptions(rendered_envs_idx=list(range(num_envs)))
+            # shadow=False: directional-light shadow maps are recomputed from dynamic scene bounds
+            # every frame, causing the ground plane to flicker as robots move. Diffuse lighting
+            # is preserved; only the dynamic shadow cast is removed.
+            scene_kwargs["vis_options"] = gs.options.VisOptions(
+                rendered_envs_idx=list(range(num_envs)),
+                shadow=False,
+            )
         self.scene = gs.Scene(**scene_kwargs)
         vcfg_vis = env_cfg.get("video", {})
         self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
@@ -256,7 +262,9 @@ class K1Env:
         self.foot_air_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
         self.feet_air_time_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
         # foot_step_quality: zerfallende On-Beat-Landequalität je Fuß; koppelt Alternation (s. _update_foot_contact).
-        self.foot_step_quality = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
+        # Init 1.0 (not 0.0): first on-beat landing receives full credit immediately; torch.where in
+        # _update_foot_contact replaces the 1.0 with actual air_quality on the first real touchdown.
+        self.foot_step_quality = torch.ones((num_envs, 2), dtype=gs.tc_float, device=gs.device)
 
         # leg_symmetry: Strafe für nicht-alternierenden Gang (siehe _reward_leg_symmetry). Sowohl die
         # Doppelstütze (beide am Boden) als auch die Flugphase (beide in der Luft) sind als kurze
@@ -425,9 +433,10 @@ class K1Env:
 
         # AMP: build normalized reference transitions (s_t, s_{t+1}) for discriminator training
         if self.reward_cfg.get("amp_disc_enabled", False):
-            self._setup_amp_discriminator(ref, mean, std)
+            self._setup_amp_discriminator(ref, mean, std, sqrt_w)
 
-    def _setup_amp_discriminator(self, ref_raw: np.ndarray, mean: np.ndarray, std: np.ndarray) -> None:
+    def _setup_amp_discriminator(self, ref_raw: np.ndarray, mean: np.ndarray, std: np.ndarray,
+                                   sqrt_w: np.ndarray) -> None:
         from amp_discriminator import AMPDiscriminator
 
         amp_obs_dim = ref_raw.shape[1]  # 38
@@ -439,8 +448,11 @@ class K1Env:
         self.amp_disc = AMPDiscriminator(amp_obs_dim, hidden, lr, gp_w, device=str(gs.device))
         self._amp_obs_dim = amp_obs_dim
 
-        # Reference transitions: all consecutive (s_t, s_{t+1}) pairs from NPZ, pre-normalized
-        ref_norm = (ref_raw - mean) / std
+        # Reference transitions: normalize then apply group weights so dof_vel (w=0.25) is
+        # weighted 4× lower than dof_pos (w=1.0) in the discriminator input space.
+        # Without weighting, dof_vel dominates by equal dimension count and the discriminator
+        # can satisfy its loss on velocity/gravity features while ignoring joint-angle poses.
+        ref_norm = (ref_raw - mean) / std * sqrt_w
         s  = torch.tensor(ref_norm[:-1], dtype=gs.tc_float, device=gs.device)
         sn = torch.tensor(ref_norm[1:],  dtype=gs.tc_float, device=gs.device)
         self._amp_ref_buf = torch.cat([s, sn], dim=-1)  # (T-1, 76)
@@ -450,14 +462,15 @@ class K1Env:
         self._amp_replay_ptr = 0
         self._amp_replay_n = 0
 
-        # Current/previous AMP obs buffers (updated every step)
+        # Current/previous AMP obs buffers (updated every step via copy_() to avoid aliasing)
         self._amp_obs_prev = torch.zeros((self.num_envs, amp_obs_dim), dtype=gs.tc_float, device=gs.device)
         self._amp_obs_curr = torch.zeros((self.num_envs, amp_obs_dim), dtype=gs.tc_float, device=gs.device)
+        self._amp_just_reset = torch.zeros((self.num_envs,), dtype=torch.bool, device=gs.device)
 
         print(f"[AMP] disc ON  obs_dim={amp_obs_dim}  ref_transitions={len(self._amp_ref_buf)}  replay={replay_size}")
 
     def _build_amp_obs(self) -> torch.Tensor:
-        """38-dim AMP state: same features as style reference, normalized with ref statistics."""
+        """38-dim AMP state: same features as style reference, normalized and group-weighted."""
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
         foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
         feat = torch.cat([
@@ -467,12 +480,19 @@ class K1Env:
             self.dof_vel,
             foot_clear,
         ], dim=1)
-        return (feat - self.style_mean) / self.style_std
+        return (feat - self.style_mean) / self.style_std * self.style_sqrt_w
 
     def _amp_push_replay(self) -> None:
-        """Append current (prev, curr) transitions to the replay buffer."""
-        trans = torch.cat([self._amp_obs_prev, self._amp_obs_curr], dim=-1)  # (n, 76)
-        n = self.num_envs
+        """Append current (prev, curr) transitions to the replay buffer.
+
+        Envs that just reset have _amp_obs_prev=zeros (not a real observation) — skip them
+        to avoid poisoning the replay with (zeros, s_1) which is out-of-distribution.
+        """
+        valid = ~self._amp_just_reset                                         # (n,) bool
+        trans = torch.cat([self._amp_obs_prev[valid], self._amp_obs_curr[valid]], dim=-1)
+        n = int(valid.sum().item())
+        if n == 0:
+            return
         size = self._amp_replay.shape[0]
         end = (self._amp_replay_ptr + n) % size
         if end > self._amp_replay_ptr:
@@ -483,16 +503,20 @@ class K1Env:
             self._amp_replay[:end] = trans[cut:]
         self._amp_replay_ptr = end
         self._amp_replay_n = min(self._amp_replay_n + n, size)
+        self._amp_just_reset.fill_(False)
 
-    def update_amp_disc(self, batch_size: int = 512) -> dict[str, float]:
+    def update_amp_disc(self, batch_size: int = 512, n_updates: int = 1) -> dict[str, float]:
         """Sample real/fake transitions, update discriminator. Called by runner after PPO update."""
         if self.amp_disc is None or self._amp_replay_n < batch_size:
             return {}
-        ri = torch.randint(len(self._amp_ref_buf), (batch_size,), device=gs.device)
-        real = self._amp_ref_buf[ri]
-        fi = torch.randint(self._amp_replay_n, (batch_size,), device=gs.device)
-        fake = self._amp_replay[fi]
-        return self.amp_disc.update(*real.chunk(2, -1), *fake.chunk(2, -1))
+        stats: dict[str, float] = {}
+        for _ in range(n_updates):
+            ri = torch.randint(len(self._amp_ref_buf), (batch_size,), device=gs.device)
+            real = self._amp_ref_buf[ri]
+            fi = torch.randint(self._amp_replay_n, (batch_size,), device=gs.device)
+            fake = self._amp_replay[fi]
+            stats = self.amp_disc.update(*real.chunk(2, -1), *fake.chunk(2, -1))
+        return stats
 
     # ── Curriculum ────────────────────────────────────────────────────────────
 
@@ -615,8 +639,8 @@ class K1Env:
         self._update_command_tracking_ema()
 
         if self.amp_disc is not None:
-            self._amp_obs_prev = self._amp_obs_curr
-            self._amp_obs_curr = self._build_amp_obs()
+            self._amp_obs_prev.copy_(self._amp_obs_curr)
+            self._amp_obs_curr.copy_(self._build_amp_obs())
             self._amp_push_replay()
 
         self.rew_buf.zero_()
@@ -708,7 +732,7 @@ class K1Env:
             self.foot_in_contact.fill_(True)
             self.foot_air_time.zero_()
             self.feet_air_time_reward.zero_()
-            self.foot_step_quality.zero_()
+            self.foot_step_quality.fill_(1.0)
             self.both_stance_time.zero_()
             self.both_air_time.zero_()
             self.leg_symmetry_penalty.zero_()
@@ -721,6 +745,7 @@ class K1Env:
             if self.amp_disc is not None:
                 self._amp_obs_prev.zero_()
                 self._amp_obs_curr.zero_()
+                self._amp_just_reset.fill_(True)
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
             torch.where(envs_idx[:, None], init_quats_batch, self.base_quat, out=self.base_quat)
@@ -743,7 +768,7 @@ class K1Env:
             self.foot_in_contact.masked_fill_(envs_idx[:, None], True)
             self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
-            self.foot_step_quality.masked_fill_(envs_idx[:, None], 0.0)
+            self.foot_step_quality.masked_fill_(envs_idx[:, None], 1.0)
             self.both_stance_time.masked_fill_(envs_idx, 0.0)
             self.both_air_time.masked_fill_(envs_idx, 0.0)
             self.leg_symmetry_penalty.masked_fill_(envs_idx, 0.0)
@@ -755,6 +780,7 @@ class K1Env:
             if self.amp_disc is not None:
                 self._amp_obs_prev.masked_fill_(envs_idx[:, None], 0.0)
                 self._amp_obs_curr.masked_fill_(envs_idx[:, None], 0.0)
+                self._amp_just_reset.masked_fill_(envs_idx, True)
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -1003,7 +1029,9 @@ class K1Env:
 
         At phase φ the left leg should be doing what the right leg did at φ+0.5 (mirror-flipped).
         _symm_ptr is the NEXT write slot, so it points to the oldest stored frame = half period ago.
-        Gate: only active while moving and after the warm-up buffer is filled (episode_length_buf ≥ half_period).
+        Gates: moving (linear speed > threshold), warm-up filled (episode_length_buf ≥ half_period),
+        AND low yaw command (|cmd_yaw| < pose_symmetry_yaw_max) — turning requires deliberate
+        hip/ankle lateral asymmetry that would falsely trigger this penalty.
         """
         left_now  = self.dof_pos[:, self._symm_left_idx]         # (n_envs, 6)
         right_now = self.dof_pos[:, self._symm_right_idx]        # (n_envs, 6)
@@ -1014,19 +1042,21 @@ class K1Env:
         sq += ((right_now - self._symm_mirror * left_ago)  ** 2).sum(dim=1)
 
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
-        active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).float()
-        warm   = (self.episode_length_buf >= self._symm_half).float()
-        sigma  = float(self.reward_cfg.get("pose_symmetry_sigma", 1.0))
-        return torch.tanh(sq / sigma) * active * warm
+        active  = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).float()
+        warm    = (self.episode_length_buf >= self._symm_half).float()
+        sigma   = float(self.reward_cfg.get("pose_symmetry_sigma", 1.0))
+        yaw_max = float(self.reward_cfg.get("pose_symmetry_yaw_max", 0.5))
+        yaw_ok  = (torch.abs(self.commands[:, 2]) < yaw_max).float()
+        return torch.tanh(sq / sigma) * active * warm * yaw_ok
 
     def _reward_gait_phase(self):
         """Strafe: Fuß-Kontakt passt nicht zum Phase-Clock-Takt (Off-Beat / falsches Swing-Fenster).
 
-        Je Fuß 1 bei mismatch (Soll-Stance ≠ Ist-Kontakt), summiert über beide Füße → 0–2.
-        Nutzt dasselbe Kontaktmodell wie feet_air_time (_desired_stance). Gate: cmd_speed >
-        feet_air_cmd_threshold.
+        Je Fuß 1 bei mismatch (Soll-Stance ≠ Ist-Kontakt), dividiert durch 2 → 0–1 normiert
+        (beide Füße falsch = 1.0, beide richtig = 0.0). Nutzt dasselbe Kontaktmodell wie
+        feet_air_time (_desired_stance). Gate: cmd_speed > feet_air_cmd_threshold.
         """
-        mismatch = (self._desired_stance() != self.foot_in_contact).to(gs.tc_float).sum(dim=1)
+        mismatch = (self._desired_stance() != self.foot_in_contact).to(gs.tc_float).sum(dim=1) / 2.0
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
         return mismatch * active
