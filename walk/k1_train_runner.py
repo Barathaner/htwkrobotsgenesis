@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import collections
 import copy
+import math
 import os
 import time
 from collections.abc import Callable
@@ -157,6 +159,12 @@ class K1TrainRunner(OnPolicyRunner):
         self.logger.init_logging_writer()
         self._pending_video_log = None
 
+        # ── Curriculum setup ──────────────────────────────────────────────────
+        curr_cfg = getattr(self.env, "env_cfg", {}).get("curriculum", {})
+        eval_window = curr_cfg.get("eval_window", 150)
+        _curr_track: collections.deque[float] = collections.deque(maxlen=eval_window)
+        _phase_start_it = self.current_learning_iteration
+
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
@@ -172,6 +180,12 @@ class K1TrainRunner(OnPolicyRunner):
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
                     self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
 
+                    # Collect per-episode tracking metric for curriculum advancement
+                    if self.env.curriculum_active:
+                        val = extras.get("episode", {}).get("rew_tracking_lin_vel")
+                        if val is not None and not math.isnan(float(val)):
+                            _curr_track.append(float(val))
+
                 stop = time.time()
                 collect_time = stop - start
                 start = stop
@@ -183,6 +197,31 @@ class K1TrainRunner(OnPolicyRunner):
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+
+            # ── Curriculum advancement check ──────────────────────────────────
+            if self.env.curriculum_active and not self.env.curriculum_at_final_phase:
+                phase_cfg = self.env.curriculum_phase_cfg or {}
+                adv = phase_cfg.get("advance_when", {})
+                if adv:
+                    mean_track = sum(_curr_track) / len(_curr_track) if _curr_track else 0.0
+                    min_its = adv.get("min_iterations", 0)
+                    threshold = adv.get("tracking_rew_per_sec", float("inf"))
+                    if (it - _phase_start_it >= min_its
+                            and len(_curr_track) >= min(eval_window, 30)
+                            and mean_track >= threshold):
+                        new_phase = self.env.advance_curriculum_phase()
+                        _phase_start_it = it
+                        _curr_track.clear()
+                        msg = (f"[curriculum] → '{new_phase}' at it={it}  "
+                               f"mean_tracking={mean_track:.1f}/s")
+                        print(msg)
+                        loss_dict["curriculum/phase_idx"] = float(self.env._curriculum_phase_idx)
+
+            # Log curriculum phase name and tracking metric
+            if self.env.curriculum_active:
+                loss_dict["curriculum/phase_idx"] = float(self.env._curriculum_phase_idx)
+                if _curr_track:
+                    loss_dict["curriculum/tracking_rew_per_sec"] = sum(_curr_track) / len(_curr_track)
 
             record_video = (
                 self.enable_video

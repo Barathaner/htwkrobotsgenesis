@@ -52,17 +52,8 @@ def draw_env_markers(
     speed: float,
     color_bgr: tuple[int, int, int],
 ) -> None:
-    """Draw a colored halo ring around the robot body + a command arrow above it."""
+    """Draw a command arrow above the robot."""
     base = env.base_pos[env_idx].detach().cpu().numpy()
-
-    # ── halo ring at torso height ─────────────────────────────────────────────
-    torso = base + np.array([0.0, 0.0, 0.85])
-    uv_t, z_t = project_to_pixels(np.array([torso]), env.cam)
-    if z_t[0] > 0:
-        cx = int(round(uv_t[0, 0]))
-        cy = int(round(uv_t[0, 1]))
-        cv2.circle(rgb, (cx, cy), 28, (0, 0, 0), 6, cv2.LINE_AA)
-        cv2.circle(rgb, (cx, cy), 28, color_bgr, 3, cv2.LINE_AA)
 
     # ── command arrow ─────────────────────────────────────────────────────────
     horiz = cmd_unit_world.clone()

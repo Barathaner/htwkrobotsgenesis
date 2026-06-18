@@ -334,6 +334,7 @@ class K1Env:
             self.hero_ghost.attach_after_build(self)
             print(f"[video] hero ghost ON — {os.path.basename(self.hero_ghost._motion_path)}")
 
+        self._init_curriculum()
         self.reset()
 
     def _setup_style_reference(self):
@@ -467,6 +468,86 @@ class K1Env:
         fi = torch.randint(self._amp_replay_n, (batch_size,), device=gs.device)
         fake = self._amp_replay[fi]
         return self.amp_disc.update(*real.chunk(2, -1), *fake.chunk(2, -1))
+
+    # ── Curriculum ────────────────────────────────────────────────────────────
+
+    def _init_curriculum(self) -> None:
+        curr_cfg = self.env_cfg.get("curriculum", {})
+        if not curr_cfg.get("enabled", False):
+            self._curriculum_phases: list | None = None
+            return
+        phases = curr_cfg.get("phases", [])
+        if not phases:
+            self._curriculum_phases = None
+            return
+        self._curriculum_phases = phases
+        self._curriculum_phase_idx = 0
+        # Phase 0 overrides command ranges and style file (style already loaded
+        # with the base yaml value; re-apply so phase 0 takes precedence).
+        self._apply_curriculum_phase(0)
+        print(f"[curriculum] {len(phases)} phases | starting → '{phases[0]['name']}'")
+
+    def _apply_curriculum_phase(self, phase_idx: int) -> None:
+        phase = self._curriculum_phases[phase_idx]
+
+        # ── command ranges ────────────────────────────────────────────────────
+        cmd_ranges = phase.get("command_ranges", {})
+        for key, val in cmd_ranges.items():
+            self.command_cfg[key] = val
+        # Rebuild the pre-computed tensors used by _resample_commands.
+        self.commands_limits = tuple(
+            torch.tensor(values, dtype=gs.tc_float, device=gs.device)
+            for values in zip(
+                self.command_cfg["lin_vel_x_range"],
+                self.command_cfg["lin_vel_y_range"],
+                self.command_cfg["ang_vel_range"],
+            )
+        )
+
+        # ── style reference + AMP discriminator ──────────────────────────────
+        style_file = phase.get("style_motion_file")
+        if style_file and self.style_enabled:
+            self.reward_cfg["style_motion_file"] = style_file
+            # _setup_style_reference re-builds style_ref_feat and (if amp_disc_enabled)
+            # calls _setup_amp_discriminator which resets disc + replay + AMP obs.
+            self._setup_style_reference()
+
+        print(f"[curriculum] phase {phase_idx}: '{phase['name']}' | "
+              f"vx={self.command_cfg['lin_vel_x_range']}  "
+              f"style={os.path.basename(phase.get('style_motion_file', '?'))}")
+
+    def advance_curriculum_phase(self) -> str:
+        """Advance to the next curriculum phase. Returns the new phase name."""
+        if self._curriculum_phases is None:
+            return "none"
+        next_idx = self._curriculum_phase_idx + 1
+        if next_idx >= len(self._curriculum_phases):
+            return self._curriculum_phases[-1]["name"]   # already at final phase
+        self._curriculum_phase_idx = next_idx
+        self._apply_curriculum_phase(next_idx)
+        return self._curriculum_phases[next_idx]["name"]
+
+    @property
+    def curriculum_active(self) -> bool:
+        return self._curriculum_phases is not None
+
+    @property
+    def curriculum_phase_name(self) -> str:
+        if not self.curriculum_active:
+            return "none"
+        return self._curriculum_phases[self._curriculum_phase_idx]["name"]
+
+    @property
+    def curriculum_phase_cfg(self) -> dict | None:
+        if not self.curriculum_active:
+            return None
+        return self._curriculum_phases[self._curriculum_phase_idx]
+
+    @property
+    def curriculum_at_final_phase(self) -> bool:
+        if not self.curriculum_active:
+            return True
+        return self._curriculum_phase_idx >= len(self._curriculum_phases) - 1
 
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))

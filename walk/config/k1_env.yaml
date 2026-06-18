@@ -138,6 +138,44 @@ env_cfg:
     randomize_motor_strength: true
     motor_strength_range: [0.8, 1.2]  # multiplicative scale on kp & kd
 
+  # ── Curriculum learning ─────────────────────────────────────────────────────
+  # Phases advance when advance_when.min_iterations have passed AND the rolling
+  # mean of rew_tracking_lin_vel (per second) crosses advance_when.tracking_rew_per_sec.
+  # With tracking_lin_vel scale=2.0 and dt=0.02: perfect tracking ≈ 100/s.
+  # The final phase has no advance_when → stays there.
+  curriculum:
+    enabled: true
+    eval_window: 150   # episodes to average for the advancement check
+
+    phases:
+      - name: slow_walk
+        style_motion_file: walk/data/motions/slow.npz
+        command_ranges:
+          lin_vel_x_range: [-0.2, 0.8]
+          lin_vel_y_range: [-0.4, 0.4]
+          ang_vel_range:   [-0.5, 0.5]
+        advance_when:
+          min_iterations: 500
+          tracking_rew_per_sec: 56.0   # ~60% of max (scale=2.0 → max≈100/s)
+
+      - name: jog
+        style_motion_file: walk/data/motions/k1_jogging_motion.npz
+        command_ranges:
+          lin_vel_x_range: [-0.4, 1.6]
+          lin_vel_y_range: [-0.6, 0.6]
+          ang_vel_range:   [-0.7, 0.7]
+        advance_when:
+          min_iterations: 500
+          tracking_rew_per_sec: 56.0
+
+      - name: all
+        style_motion_file: walk/data/motions/k1_jogging_motion.npz
+        command_ranges:
+          lin_vel_x_range: [-0.8, 2.0]
+          lin_vel_y_range: [-0.8, 1.0]
+          ang_vel_range:   [-0.8, 0.8]
+        # no advance_when → final phase
+
 obs_cfg:
   obs_scales:
     lin_vel: 2.0
