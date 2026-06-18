@@ -225,6 +225,7 @@ reward_cfg:
   action_rate_sigma: 15.0   # an Referenz kalibriert (ΣΔaction²≈1.4 beim Jog) → Hero-Strafe ~0.09.
   feet_slip_sigma: 1.5      # Hero-kinematisch ~0.44 bei 0.5 (Replay-Artefakt); 1.5 → ~0.16, Training-Physik niedriger.
   leg_symmetry_sigma: 0.5
+  pose_symmetry_sigma: 1.5  # (rad²·joints) sensitivity; 6 joints × (0.5rad)² ≈ 1.5 at moderate error
   dof_vel_sigma: 2000.0   # an Referenz kalibriert (Σdof_vel²≈212 beim Jog) → Hero-Strafe ~0.10 statt 0.99.
                           # style matcht dof_vel ohnehin gegen die Referenz; hier nur noch Schutz vor EXTREM-Geschw.
   orientation_sigma: 0.2
@@ -249,6 +250,7 @@ reward_cfg:
     feet_slip: -0.5         # -1.0→-0.35: Hero war -0.44/s (dominierte alle Strafen); σ=1.5 mildert tanh
     leg_symmetry: -0.25      # aktiviert: Hero ~0.10 → ~-0.025/s; sanfter Wechselschritt-Nudge
     gait_phase: -0.8          # Strafe: Off-Beat-Kontakt (0–2 Fuß-Fehler/Step), negatives Vorzeichen
+    pose_symmetry: -0.5      # cyclic mirror symmetry: left_now ≈ mirror(right_half_ago)
 
     # ── Regularizer (Hero-Ziel: raw_mean ≈ 0.05–0.12, klein vs. Task) ─────────
     action_rate: -0.1        # Hero ~0.09

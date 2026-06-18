@@ -279,6 +279,23 @@ class K1Env:
         self.feet_air_decay = float(reward_cfg["feet_air_decay"])
         self.gait_phase = torch.rand((num_envs,), dtype=gs.tc_float, device=gs.device)
 
+        # pose_symmetry: ring buffer for cyclic gait mirror-symmetry reward.
+        # Each step stores left/right leg dof_pos; the reward compares left_now with
+        # mirror(right_half_ago) — i.e. same pattern, laterally mirrored, half-period delayed.
+        _jn = env_cfg["joint_names"]
+        _left_names  = ["Left_Hip_Pitch",  "Left_Hip_Roll",  "Left_Hip_Yaw",
+                         "Left_Knee_Pitch", "Left_Ankle_Pitch","Left_Ankle_Roll"]
+        _right_names = ["Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
+                         "Right_Knee_Pitch","Right_Ankle_Pitch","Right_Ankle_Roll"]
+        self._symm_left_idx  = torch.tensor([_jn.index(n) for n in _left_names],  dtype=torch.long, device=gs.device)
+        self._symm_right_idx = torch.tensor([_jn.index(n) for n in _right_names], dtype=torch.long, device=gs.device)
+        # +1 = same sign across the sagittal mirror plane; -1 = flipped (Roll / Yaw joints)
+        self._symm_mirror = torch.tensor([1., -1., -1., 1., 1., -1.], dtype=gs.tc_float, device=gs.device)
+        self._symm_half   = max(1, self.gait_period_steps // 2)
+        self._symm_buf_L  = torch.zeros((num_envs, self._symm_half, 6), dtype=gs.tc_float, device=gs.device)
+        self._symm_buf_R  = torch.zeros((num_envs, self._symm_half, 6), dtype=gs.tc_float, device=gs.device)
+        self._symm_ptr    = 0  # circular write pointer, 0 .. _symm_half-1
+
         # Random push state (always allocated; only used when push_enabled=True)
         self.push_force_buf = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
         self.push_steps_remaining = torch.zeros((num_envs,), dtype=gs.tc_int, device=gs.device)
@@ -591,6 +608,9 @@ class K1Env:
         self.projected_gravity.copy_(transform_by_quat(self.global_gravity, inv_base_quat))
         self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
         self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
+        self._symm_buf_L[:, self._symm_ptr] = self.dof_pos[:, self._symm_left_idx]
+        self._symm_buf_R[:, self._symm_ptr] = self.dof_pos[:, self._symm_right_idx]
+        self._symm_ptr = (self._symm_ptr + 1) % self._symm_half
         self._update_foot_contact()
         self._update_command_tracking_ema()
 
@@ -695,6 +715,9 @@ class K1Env:
             self.gait_phase.uniform_(0.0, 1.0)
             self.push_force_buf.zero_()
             self.push_steps_remaining.zero_()
+            self._symm_buf_L.zero_()
+            self._symm_buf_R.zero_()
+            self._symm_ptr = 0
             if self.amp_disc is not None:
                 self._amp_obs_prev.zero_()
                 self._amp_obs_curr.zero_()
@@ -727,6 +750,8 @@ class K1Env:
             torch.where(envs_idx, torch.rand_like(self.gait_phase), self.gait_phase, out=self.gait_phase)
             self.push_force_buf.masked_fill_(envs_idx[:, None], 0.0)
             self.push_steps_remaining.masked_fill_(envs_idx, 0)
+            self._symm_buf_L.masked_fill_(envs_idx[:, None, None], 0.0)
+            self._symm_buf_R.masked_fill_(envs_idx[:, None, None], 0.0)
             if self.amp_disc is not None:
                 self._amp_obs_prev.masked_fill_(envs_idx[:, None], 0.0)
                 self._amp_obs_curr.masked_fill_(envs_idx[:, None], 0.0)
@@ -972,6 +997,27 @@ class K1Env:
         (Hüpfen, Stillstand auf beiden Beinen). Stehen (cmd≈0) → 0.
         """
         return torch.tanh(self.leg_symmetry_penalty / self.reward_cfg["leg_symmetry_sigma"])
+
+    def _reward_pose_symmetry(self):
+        """Cyclic mirror symmetry: left leg now should match mirrored right leg half a period ago.
+
+        At phase φ the left leg should be doing what the right leg did at φ+0.5 (mirror-flipped).
+        _symm_ptr is the NEXT write slot, so it points to the oldest stored frame = half period ago.
+        Gate: only active while moving and after the warm-up buffer is filled (episode_length_buf ≥ half_period).
+        """
+        left_now  = self.dof_pos[:, self._symm_left_idx]         # (n_envs, 6)
+        right_now = self.dof_pos[:, self._symm_right_idx]        # (n_envs, 6)
+        left_ago  = self._symm_buf_L[:, self._symm_ptr]          # oldest = half period ago
+        right_ago = self._symm_buf_R[:, self._symm_ptr]
+
+        sq  = ((left_now  - self._symm_mirror * right_ago) ** 2).sum(dim=1)
+        sq += ((right_now - self._symm_mirror * left_ago)  ** 2).sum(dim=1)
+
+        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
+        active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).float()
+        warm   = (self.episode_length_buf >= self._symm_half).float()
+        sigma  = float(self.reward_cfg.get("pose_symmetry_sigma", 1.0))
+        return torch.tanh(sq / sigma) * active * warm
 
     def _reward_gait_phase(self):
         """Strafe: Fuß-Kontakt passt nicht zum Phase-Clock-Takt (Off-Beat / falsches Swing-Fenster).

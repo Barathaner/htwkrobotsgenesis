@@ -122,7 +122,7 @@ class K1TrainRunner(OnPolicyRunner):
                         episode_sums[n] += row.get(f"reward_step/{n}", 0.0)
 
                 if video_env.hero_ghost is not None:
-                    video_env.hero_ghost.set_frame(frame_idx, video_env)
+                    video_env.hero_ghost.set_frame(video_env)
                 if video_env.color_shadow is not None:
                     video_env.color_shadow.update(video_env)
                 if video_env.cam._followed_entity is not None:

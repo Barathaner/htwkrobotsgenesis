@@ -34,6 +34,7 @@ search_space:
   feet_slip:        {low: -1.0,  high: -0.05}             # (-0.5)  Hero dominierte früher bei -1.0
   leg_symmetry:     {low: -0.8,  high: -0.02}             # (-0.25)
   gait_phase:       {low: -2.0,  high: -0.1}              # (-0.8)  Off-Beat-Strafe (negativ)
+  pose_symmetry:    {low: -2.0,  high: -0.05}             # (-0.5)  cyclic mirror symmetry
 
   # ── Regularizer (kleine negative Scales) ───────────────────────────────────
   action_rate:      {low: -0.25, high: -0.01}             # (-0.05)
@@ -50,5 +51,6 @@ objective:
     feet_slip: -0.3
     leg_symmetry: -0.15   # in search_space → must be in objective or it drifts toward 0
     gait_phase: -0.3       # lower Off-Beat mismatch → better phase sync
+    pose_symmetry: -0.2   # penalise asymmetric gait patterns over the cycle
     orientation: -0.2
     base_height: -0.1     # penalise crouching / falling posture

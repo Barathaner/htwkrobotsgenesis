@@ -154,16 +154,27 @@ class HeroGhost:
 
         return torch.cat([ghost_pos, ghost_quat, self.dof_full[t]])
 
-    def set_frame(self, step: int, env) -> None:
+    def set_frame(self, env) -> None:
         """Update each ghost entity: env i's ghost follows env i's command and spawn position."""
         if not self._ready:
             self.attach_after_build(env)
 
-        t = step % self.T
-        cycle = step // self.T
         n = self.num_envs
 
         for i, entity in enumerate(self.entities):
+            # Use per-env episode step so the ghost resets in sync with each training env.
+            env_step = int(env.episode_length_buf[i].item())
+
+            # Recompute yaw alignment on the first two steps of each episode.
+            # env_step==0: mid-video reset (episode_length_buf zeroed inside step()).
+            # env_step==1: covers the initial episode whose heading was randomised by
+            #              reset() AFTER attach_after_build() first ran.
+            if env_step <= 1:
+                self.yaw_align_quats[i] = self._compute_yaw_align(env, i)
+
+            t = env_step % self.T
+            cycle = env_step // self.T
+
             # Build per-env qpos: entity i's env-i copy at correct position, others underground
             qpos = self._hidden_qpos.unsqueeze(0).expand(n, -1).contiguous().clone()
             qpos[i] = self._ghost_qpos_for_env(t, cycle, env, i)
