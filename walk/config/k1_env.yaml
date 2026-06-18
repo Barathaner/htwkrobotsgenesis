@@ -209,18 +209,7 @@ reward_cfg:
 
   # style (feature-matching Style-Reward gegen eine NPZ-Referenzmotion, siehe K1_env._reward_style)
   style_motion_file: walk/data/motions/k1_jogging_motion.npz  # relativ zur Repo-Root
-  style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); nur genutzt wenn amp_disc_enabled: false
-
-  # AMP adversarial style discriminator (Peng et al. 2021)
-  # Replaces nearest-neighbour feature matching with a learned discriminator on (s_t, s_{t+1}) transitions.
-  amp_disc_enabled: true
-  amp_hidden_dims: [256, 128]
-  amp_lr: 1.0e-4
-  amp_grad_penalty: 10.0          # WGAN-GP weight; keeps discriminator Lipschitz
-  amp_replay_size: 100000         # circular buffer of policy transitions for disc training
-  amp_disc_updates_per_iter: 5    # disc gradient steps per PPO iteration; PPO does
-                                   # num_learning_epochs×num_mini_batches=20 steps → 5 disc
-                                   # steps gives ~4:1 ratio (AMP paper recommends 1:1–5:1)
+  style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); feature-distance fallback (non-AMP path)
 
   # Gebundene Strafterme: jeder gibt tanh(quantity / σ) ∈ [0,1) zurück (0 = sauber, →1 = starke
   # Verletzung); Vorzeichen kommt aus reward_scales (negativ = Strafe). Kleineres σ = strenger
@@ -247,7 +236,7 @@ reward_cfg:
     tracking_lin_vel: 2.5   # primär: Command-Geschwindigkeit (EMA-geglättet)
     tracking_ang_vel: 0.75  # 0.5→0.75: yaw-Tracking wichtiger, Hero raw≈0.91 wie lin_vel
     #survival: 1.0
-    style: 2.0              # co-primär mit tracking: perfekter Gang = 1.0
+    style: 0.0              # co-primär mit tracking: perfekter Gang = 1.0
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
     # feet_air_time: On-Beat-Touchdown + kadenz-treue Luftzeit (s. _update_foot_contact)
@@ -306,6 +295,27 @@ train_cfg:
   obs_groups:
     actor: [policy]
     critic: [policy]
+
+  # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
+  # style_weight: fraction of the total reward that comes from the discriminator.
+  # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
+  style_weight: 0.5
+
+  amp:
+    # Discriminator hidden layer sizes (amp_rsl_rl.networks.Discriminator)
+    hidden_dims: [256, 128]
+    # Reward scale applied to discriminator output before mixing
+    reward_scale: 1.0
+    # Loss type: BCEWithLogits (standard) or Wasserstein (experimental)
+    loss_type: BCEWithLogits
+    # Paths to .npz motion reference files (relative to repo root).
+    # Defaults to reward_cfg.style_motion_file when omitted.
+    # motion_paths:
+    #   - walk/data/motions/k1_jogging_motion.npz
+    #   - walk/data/motions/slow.npz
+
+  # Replay buffer size inside AMP_PPO (policy transitions for discriminator training)
+  amp_replay_buffer_size: 100000
 
   num_steps_per_env: 48
   save_interval: 250

@@ -1,4 +1,4 @@
-"""OnPolicyRunner with periodic checkpoint videos for wandb."""
+"""OnPolicyRunner with AMP_PPO (amp-rsl-rl) and periodic checkpoint videos for wandb."""
 
 from __future__ import annotations
 
@@ -20,7 +20,12 @@ from k1_video_overlay import render_annotated_frame, update_camera_centroid
 
 
 class K1TrainRunner(OnPolicyRunner):
-    """Saves checkpoints every save_interval and records rollout videos for wandb."""
+    """OnPolicyRunner extended with AMP_PPO (amp-rsl-rl), video recording and curriculum.
+
+    After OnPolicyRunner.__init__ constructs the PPO actor/critic, __init__ replaces
+    self.alg with AMP_PPO reusing the same actor and critic, then initialises the
+    amp-rsl-rl Discriminator and K1AMPLoader expert-data loader.
+    """
 
     def __init__(
         self,
@@ -37,6 +42,12 @@ class K1TrainRunner(OnPolicyRunner):
         on_iteration_end: Callable[[int, Any], None] | None = None,
     ) -> None:
         super().__init__(env, train_cfg, log_dir, device)
+
+        # ── Swap standard PPO for AMP_PPO ────────────────────────────────────
+        self.style_weight: float = self.cfg.get("style_weight", 0.5)
+        amp_cfg = self.cfg.get("amp", {})
+        self._setup_amp_ppo(amp_cfg)
+
         self.video_interval = video_interval
         self.video_steps = video_steps
         self.video_fps = video_fps
@@ -44,6 +55,94 @@ class K1TrainRunner(OnPolicyRunner):
         self.enable_video = enable_video
         self.on_iteration_end = on_iteration_end
         self._video_env = None
+
+    def _setup_amp_ppo(self, amp_cfg: dict) -> None:
+        """Replace self.alg (PPO) with AMP_PPO, reusing the actor/critic already built."""
+        import inspect
+        from amp_rsl_rl.algorithms import AMP_PPO
+        from amp_rsl_rl.networks import Discriminator
+        from k1_amp_loader import K1AMPLoader
+
+        obs = self.env.get_observations()
+        if "amp" not in obs.keys():
+            raise RuntimeError("K1Env must include 'amp' key in get_observations() for AMP training.")
+        amp_obs_dim = obs["amp"].shape[-1]
+
+        discriminator = Discriminator(
+            input_dim=amp_obs_dim * 2,
+            hidden_layer_sizes=amp_cfg.get("hidden_dims", [256, 128]),
+            reward_scale=amp_cfg.get("reward_scale", 1.0),
+            loss_type=amp_cfg.get("loss_type", "BCEWithLogits"),
+            empirical_normalization=False,  # K1AMPLoader pre-normalizes identically to _build_amp_obs
+            device=self.device,
+        ).to(self.device)
+
+        motion_paths = amp_cfg.get("motion_paths", [self.env.reward_cfg["style_motion_file"]])
+        joint_names = self.env.env_cfg["joint_names"]
+        amp_data = K1AMPLoader(motion_paths, joint_names, device=self.device)
+
+        ppo = self.alg
+        # Filter cfg["algorithm"] to only keys AMP_PPO accepts
+        amp_ppo_params = set(inspect.signature(AMP_PPO.__init__).parameters)
+        alg_kwargs = {k: v for k, v in self.cfg["algorithm"].items() if k in amp_ppo_params}
+        # amp_replay_buffer_size lives at train_cfg level (not under algorithm)
+        if "amp_replay_buffer_size" in self.cfg:
+            alg_kwargs["amp_replay_buffer_size"] = self.cfg["amp_replay_buffer_size"]
+
+        self.alg = AMP_PPO(
+            actor=ppo.actor,
+            critic=ppo.critic,
+            discriminator=discriminator,
+            amp_data=amp_data,
+            device=self.device,
+            **alg_kwargs,
+        )
+        self.alg.init_storage(
+            self.env.num_envs,
+            self.cfg["num_steps_per_env"],
+            obs.clone().detach().to(self.device),
+            (self.env.num_actions,),
+        )
+        self.discriminator = discriminator
+        print(f"[K1TrainRunner] AMP_PPO active  amp_obs_dim={amp_obs_dim}  "
+              f"style_weight={self.style_weight}")
+
+    def get_inference_policy(self, device=None):
+        """Return a callable policy for inference (eval mode, deterministic)."""
+        self.alg.test_mode()
+        actor = self.alg.actor
+        if device is not None:
+            actor = actor.to(device)
+        return lambda obs: actor(obs, stochastic_output=False)
+
+    def save(self, path: str, infos: dict | None = None) -> None:
+        """Save actor, critic, discriminator and optimizer state."""
+        saved_dict = {
+            "actor_state_dict": self.alg.actor.state_dict(),
+            "critic_state_dict": self.alg.critic.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "discriminator_state_dict": self.alg.discriminator.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        torch.save(saved_dict, path)
+        self.logger.save_model(path, self.current_learning_iteration)
+
+    def load(self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location: str | None = None) -> dict | None:
+        """Load actor, critic, discriminator and optimizer state."""
+        loaded_dict = torch.load(path, weights_only=False, map_location=map_location or self.device)
+        load_cfg = load_cfg or {}
+        if load_cfg.get("actor", True) and "actor_state_dict" in loaded_dict:
+            self.alg.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
+        if load_cfg.get("critic", True) and "critic_state_dict" in loaded_dict:
+            self.alg.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
+        if load_cfg.get("discriminator", True) and "discriminator_state_dict" in loaded_dict:
+            self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"], strict=False)
+        if load_cfg.get("optimizer", True) and "optimizer_state_dict" in loaded_dict:
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        if "iter" in loaded_dict:
+            self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict.get("infos")
 
     def _log_video_rollout(
         self,
@@ -161,6 +260,7 @@ class K1TrainRunner(OnPolicyRunner):
             )
 
         obs = self.env.get_observations().to(self.device)
+        amp_obs = obs["amp"].clone()
         self.alg.train_mode()
 
         if self.is_distributed:
@@ -183,13 +283,23 @@ class K1TrainRunner(OnPolicyRunner):
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
                     actions = self.alg.act(obs)
+                    self.alg.act_amp(amp_obs)
+
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+
+                    next_amp_obs = obs["amp"].clone()
+
+                    # Style reward from discriminator, mixed with task reward
+                    style_reward = self.discriminator.predict_reward(amp_obs, next_amp_obs)
+                    rewards = (1.0 - self.style_weight) * rewards + self.style_weight * style_reward
+
                     self.alg.process_env_step(obs, rewards, dones, extras)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.cfg["algorithm"]["rnd_cfg"] else None
-                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+                    self.alg.process_amp_step(next_amp_obs)
+                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards=None)
+                    amp_obs = next_amp_obs
 
                     # Collect per-episode tracking metric for curriculum advancement
                     if self.env.curriculum_active:
@@ -202,12 +312,31 @@ class K1TrainRunner(OnPolicyRunner):
                 start = stop
                 self.alg.compute_returns(obs)
 
-            loss_dict = self.alg.update()
-            amp_stats = self.env.update_amp_disc(
-                batch_size=self.cfg.get("amp_disc_batch_size", 512),
-                n_updates=self.env.reward_cfg.get("amp_disc_updates_per_iter", 1),
-            )
-            loss_dict.update(amp_stats)
+            (
+                mean_value_loss,
+                mean_surrogate_loss,
+                mean_amp_loss,
+                mean_grad_pen_loss,
+                mean_policy_pred,
+                mean_expert_pred,
+                mean_accuracy_policy,
+                mean_accuracy_expert,
+                mean_kl_divergence,
+                _mean_symmetry_loss,
+            ) = self.alg.update()
+
+            loss_dict = {
+                "value_function": mean_value_loss,
+                "surrogate": mean_surrogate_loss,
+                "amp_loss": mean_amp_loss,
+                "grad_pen": mean_grad_pen_loss,
+                "disc_policy_pred": mean_policy_pred,
+                "disc_expert_pred": mean_expert_pred,
+                "disc_accuracy_policy": mean_accuracy_policy,
+                "disc_accuracy_expert": mean_accuracy_expert,
+                "kl_divergence": mean_kl_divergence,
+            }
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -254,8 +383,8 @@ class K1TrainRunner(OnPolicyRunner):
                 learn_time=learn_time,
                 loss_dict=loss_dict,
                 learning_rate=self.alg.learning_rate,
-                action_std=self.alg.get_policy().output_std,
-                rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
+                action_std=self.alg.actor.output_std,
+                rnd_weight=None,
             )
 
             # Video-Rollout danach: eigene frame-Achse + Summary/Video @ step=it.

@@ -334,8 +334,8 @@ class K1Env:
 
         # style (feature-matching Style-Reward): belohnt Nähe der Live-Bewegung zur NPZ-Referenz im
         # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
-        self.amp_disc = None  # set inside _setup_style_reference if amp_disc_enabled
         self.style_enabled = "style" in self.reward_scales
+        self._amp_obs_curr: torch.Tensor | None = None  # initialized in _setup_style_reference
         if self.style_enabled:
             self._setup_style_reference()
 
@@ -440,46 +440,13 @@ class K1Env:
         q0 = self.init_qpos.unsqueeze(0).expand(self.num_envs, -1).contiguous()
         links_pos, _ = self.robot.forward_kinematics(q0)
         self.style_ground_z = links_pos[0, self.feet_link_idx, 2].clone()  # (2,)
-        print(f"[style] ref={self.style_ref_feat.shape[0]} frames  feat_dim={self.style_feat_dim}  "
-              f"sigma={self.style_sigma}  ground_z={np.round(self.style_ground_z.cpu().numpy(), 3)}")
-
-        # AMP: build normalized reference transitions (s_t, s_{t+1}) for discriminator training
-        if self.reward_cfg.get("amp_disc_enabled", False):
-            self._setup_amp_discriminator(ref, mean, std, sqrt_w)
-
-    def _setup_amp_discriminator(self, ref_raw: np.ndarray, mean: np.ndarray, std: np.ndarray,
-                                   sqrt_w: np.ndarray) -> None:
-        from amp_discriminator import AMPDiscriminator
-
-        amp_obs_dim = ref_raw.shape[1]  # 38
-        hidden = tuple(int(h) for h in self.reward_cfg.get("amp_hidden_dims", [256, 128]))
-        lr = float(self.reward_cfg.get("amp_lr", 1e-4))
-        gp_w = float(self.reward_cfg.get("amp_grad_penalty", 10.0))
-        replay_size = int(self.reward_cfg.get("amp_replay_size", 100_000))
-
-        self.amp_disc = AMPDiscriminator(amp_obs_dim, hidden, lr, gp_w, device=str(gs.device))
-        self._amp_obs_dim = amp_obs_dim
-
-        # Reference transitions: normalize then apply group weights so dof_vel (w=0.25) is
-        # weighted 4× lower than dof_pos (w=1.0) in the discriminator input space.
-        # Without weighting, dof_vel dominates by equal dimension count and the discriminator
-        # can satisfy its loss on velocity/gravity features while ignoring joint-angle poses.
-        ref_norm = (ref_raw - mean) / std * sqrt_w
-        s  = torch.tensor(ref_norm[:-1], dtype=gs.tc_float, device=gs.device)
-        sn = torch.tensor(ref_norm[1:],  dtype=gs.tc_float, device=gs.device)
-        self._amp_ref_buf = torch.cat([s, sn], dim=-1)  # (T-1, 76)
-
-        # Circular replay buffer for policy transitions
-        self._amp_replay = torch.zeros((replay_size, 2 * amp_obs_dim), dtype=gs.tc_float, device=gs.device)
-        self._amp_replay_ptr = 0
-        self._amp_replay_n = 0
-
-        # Current/previous AMP obs buffers (updated every step via copy_() to avoid aliasing)
-        self._amp_obs_prev = torch.zeros((self.num_envs, amp_obs_dim), dtype=gs.tc_float, device=gs.device)
+        # Initialize AMP obs buffer (used by get_observations)
+        amp_obs_dim = ref.shape[1]
         self._amp_obs_curr = torch.zeros((self.num_envs, amp_obs_dim), dtype=gs.tc_float, device=gs.device)
-        self._amp_just_reset = torch.zeros((self.num_envs,), dtype=torch.bool, device=gs.device)
 
-        print(f"[AMP] disc ON  obs_dim={amp_obs_dim}  ref_transitions={len(self._amp_ref_buf)}  replay={replay_size}")
+        print(f"[style] ref={self.style_ref_feat.shape[0]} frames  feat_dim={self.style_feat_dim}  "
+              f"sigma={self.style_sigma}  ground_z={np.round(self.style_ground_z.cpu().numpy(), 3)}"
+              f"  amp_obs_dim={amp_obs_dim}")
 
     def _build_amp_obs(self) -> torch.Tensor:
         """38-dim AMP state: same features as style reference, normalized and group-weighted."""
@@ -493,42 +460,6 @@ class K1Env:
             foot_clear,
         ], dim=1)
         return (feat - self.style_mean) / self.style_std * self.style_sqrt_w
-
-    def _amp_push_replay(self) -> None:
-        """Append current (prev, curr) transitions to the replay buffer.
-
-        Envs that just reset have _amp_obs_prev=zeros (not a real observation) — skip them
-        to avoid poisoning the replay with (zeros, s_1) which is out-of-distribution.
-        """
-        valid = ~self._amp_just_reset                                         # (n,) bool
-        trans = torch.cat([self._amp_obs_prev[valid], self._amp_obs_curr[valid]], dim=-1)
-        n = int(valid.sum().item())
-        if n == 0:
-            return
-        size = self._amp_replay.shape[0]
-        end = (self._amp_replay_ptr + n) % size
-        if end > self._amp_replay_ptr:
-            self._amp_replay[self._amp_replay_ptr:end] = trans
-        else:
-            cut = size - self._amp_replay_ptr
-            self._amp_replay[self._amp_replay_ptr:] = trans[:cut]
-            self._amp_replay[:end] = trans[cut:]
-        self._amp_replay_ptr = end
-        self._amp_replay_n = min(self._amp_replay_n + n, size)
-        self._amp_just_reset.fill_(False)
-
-    def update_amp_disc(self, batch_size: int = 512, n_updates: int = 1) -> dict[str, float]:
-        """Sample real/fake transitions, update discriminator. Called by runner after PPO update."""
-        if self.amp_disc is None or self._amp_replay_n < batch_size:
-            return {}
-        stats: dict[str, float] = {}
-        for _ in range(n_updates):
-            ri = torch.randint(len(self._amp_ref_buf), (batch_size,), device=gs.device)
-            real = self._amp_ref_buf[ri]
-            fi = torch.randint(self._amp_replay_n, (batch_size,), device=gs.device)
-            fake = self._amp_replay[fi]
-            stats = self.amp_disc.update(*real.chunk(2, -1), *fake.chunk(2, -1))
-        return stats
 
     # ── Curriculum ────────────────────────────────────────────────────────────
 
@@ -565,12 +496,10 @@ class K1Env:
             )
         )
 
-        # ── style reference + AMP discriminator ──────────────────────────────
+        # ── style reference ───────────────────────────────────────────────────
         style_file = phase.get("style_motion_file")
         if style_file and self.style_enabled:
             self.reward_cfg["style_motion_file"] = style_file
-            # _setup_style_reference re-builds style_ref_feat and (if amp_disc_enabled)
-            # calls _setup_amp_discriminator which resets disc + replay + AMP obs.
             self._setup_style_reference()
 
         print(f"[curriculum] phase {phase_idx}: '{phase['name']}' | "
@@ -650,10 +579,8 @@ class K1Env:
         self._update_foot_contact()
         self._update_command_tracking_ema()
 
-        if self.amp_disc is not None:
-            self._amp_obs_prev.copy_(self._amp_obs_curr)
+        if self._amp_obs_curr is not None:
             self._amp_obs_curr.copy_(self._build_amp_obs())
-            self._amp_push_replay()
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
@@ -754,10 +681,8 @@ class K1Env:
             self._symm_buf_L.zero_()
             self._symm_buf_R.zero_()
             self._symm_ptr = 0
-            if self.amp_disc is not None:
-                self._amp_obs_prev.zero_()
+            if self._amp_obs_curr is not None:
                 self._amp_obs_curr.zero_()
-                self._amp_just_reset.fill_(True)
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
             torch.where(envs_idx[:, None], init_quats_batch, self.base_quat, out=self.base_quat)
@@ -789,10 +714,8 @@ class K1Env:
             self.push_steps_remaining.masked_fill_(envs_idx, 0)
             self._symm_buf_L.masked_fill_(envs_idx[:, None, None], 0.0)
             self._symm_buf_R.masked_fill_(envs_idx[:, None, None], 0.0)
-            if self.amp_disc is not None:
-                self._amp_obs_prev.masked_fill_(envs_idx[:, None], 0.0)
+            if self._amp_obs_curr is not None:
                 self._amp_obs_curr.masked_fill_(envs_idx[:, None], 0.0)
-                self._amp_just_reset.masked_fill_(envs_idx, True)
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -918,7 +841,10 @@ class K1Env:
         assert self.obs_buf.shape[-1] == self.obs_dim
 
     def get_observations(self):
-        return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
+        td = {"policy": self.obs_buf}
+        if self._amp_obs_curr is not None:
+            td["amp"] = self._amp_obs_curr
+        return TensorDict(td, batch_size=[self.num_envs])
 
     def _termination_mask(self):
         """True je Env, wenn Episode endet (Fall, zu tief, Timeout, Sim-Fehler)."""
@@ -1009,11 +935,9 @@ class K1Env:
 
 
     def _reward_style(self):
-        if self.amp_disc is not None:
-            # AMP adversarial reward: discriminator judges whether (s_{t-1}, s_t) looks like reference
-            return self.amp_disc.reward(self._amp_obs_prev, self._amp_obs_curr)
-
-        # Fallback: nearest-neighbour feature matching (non-adversarial, timing-agnostic)
+        # Nearest-neighbour feature matching fallback (non-adversarial, timing-agnostic).
+        # When AMP is active the style reward_scale should be 0; the discriminator-based
+        # style signal is mixed in by the runner via amp_rsl_rl.networks.Discriminator.
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
         foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
         feat = torch.cat(
