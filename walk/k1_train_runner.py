@@ -123,6 +123,8 @@ class K1TrainRunner(OnPolicyRunner):
 
                 if video_env.hero_ghost is not None:
                     video_env.hero_ghost.set_frame(frame_idx, video_env)
+                if video_env.color_shadow is not None:
+                    video_env.color_shadow.update(video_env)
                 if video_env.cam._followed_entity is not None:
                     video_env.cam.update_following()
                 frames.append(render_annotated_frame(video_env))

@@ -71,6 +71,8 @@ class K1Env:
         self.scene = gs.Scene(**scene_kwargs)
         vcfg_vis = env_cfg.get("video", {})
         self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+        use_color_shadow = record_camera and env_cfg.get("video", {}).get("color_shadow", True)
+        robot_opacity = 0.0 if use_color_shadow else 1.0
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="models/K1/K1_22dof.urdf",
@@ -80,6 +82,7 @@ class K1Env:
             surface=gs.surfaces.Default(
                 color=tuple(float(c) for c in vcfg_vis.get("robot_color", [0.82, 0.10, 0.10])),
                 roughness=float(vcfg_vis.get("robot_roughness", 0.6)),
+                opacity=robot_opacity,
             ),
         )
         self.hero_ghost = None
@@ -87,6 +90,11 @@ class K1Env:
             from k1_hero_ghost import HeroGhost
 
             self.hero_ghost = HeroGhost(self.scene, env_cfg, reward_cfg, num_envs)
+        self.color_shadow = None
+        if use_color_shadow:
+            from k1_color_shadow import ColorShadow
+
+            self.color_shadow = ColorShadow(self.scene, env_cfg, num_envs)
         if show_viewer:
             from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 

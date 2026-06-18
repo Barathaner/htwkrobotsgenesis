@@ -100,9 +100,10 @@ env_cfg:
     camera_fov: 32
     follow: true
     follow_smoothing: 0.9
+    color_shadow: true                       # kinematic per-env colored copies; hides the physics robot
     hero_ghost: true
     hero_ghost_opacity: 0.55
-    robot_color: [0.35, 0.35, 0.35]       # neutral gray — ghosts carry the per-env colour
+    robot_color: [0.35, 0.35, 0.35]
     robot_roughness: 0.6
     plane_roughness: 0.95
     # Multi-env training video: show N envs in a grid to observe episode variety.

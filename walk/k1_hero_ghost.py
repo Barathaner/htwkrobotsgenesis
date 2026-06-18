@@ -55,7 +55,7 @@ class HeroGhost:
         self._motion_path = path
         self._ready = False
         self.T = 0
-        self.yaw_align_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
+        self.yaw_align_quats: list[torch.Tensor] = []   # one per env
         self._env_spawn_pos: torch.Tensor | None = None  # (num_envs, 3) world positions
         self._hidden_qpos: torch.Tensor | None = None    # parked qpos for invisible instances
 
@@ -81,7 +81,7 @@ class HeroGhost:
         loop_disp[2] = 0.0
         self.loop_disp = loop_disp
 
-        self.yaw_align_quat = self._compute_yaw_align(env)
+        self.yaw_align_quats = [self._compute_yaw_align(env, i) for i in range(self.num_envs)]
 
         # Per-env robot spawn positions in world coordinates (shape: num_envs, 3)
         self._env_spawn_pos = env.robot.get_pos().clone().detach()
@@ -93,8 +93,8 @@ class HeroGhost:
 
         self._ready = True
 
-    def _compute_yaw_align(self, env) -> torch.Tensor:
-        """Dreht NPZ-Vorwärtsrichtung auf +x im Spawn-Heading-Frame (wie Training-Command)."""
+    def _compute_yaw_align(self, env, env_idx: int = 0) -> torch.Tensor:
+        """Rotates NPZ forward direction to match env env_idx's spawn heading in world frame."""
         dev = gs.device
         n = min(50, self.T - 1)
         delta = self.root_pos[n] - self.root_pos[0]
@@ -103,8 +103,8 @@ class HeroGhost:
             fwd_npz = self.root_lin_vel[:n, :2].mean(dim=0)
         fwd_npz = fwd_npz / torch.norm(fwd_npz).clamp(min=1e-6)
 
-        # +x im Heading-Frame → Welt (Spawn-Yaw)
-        heading_quat = inv_quat(env.inv_heading_quat[0:1])
+        # heading +x → world for this env's spawn yaw
+        heading_quat = inv_quat(env.inv_heading_quat[env_idx : env_idx + 1])
         fwd_train = transform_by_quat(
             torch.tensor([[1.0, 0.0, 0.0]], dtype=gs.tc_float, device=dev),
             heading_quat,
@@ -130,7 +130,7 @@ class HeroGhost:
 
     def _ghost_qpos_for_env(self, t: int, cycle: int, env, env_idx: int) -> torch.Tensor:
         """Compute the qpos (29,) for ghost entity env_idx at NPZ frame t."""
-        base = self.yaw_align_quat.unsqueeze(0)  # (1,4)
+        base = self.yaw_align_quats[env_idx].unsqueeze(0)  # (1,4)
 
         cmd_rot = self._get_cmd_rot(env, env_idx)
 
@@ -170,7 +170,7 @@ class HeroGhost:
             entity.set_qpos(qpos, zero_velocity=False, skip_forward=False)
 
             # Velocity for the visible instance
-            base = self.yaw_align_quat.unsqueeze(0)
+            base = self.yaw_align_quats[i].unsqueeze(0)
             cmd_rot = self._get_cmd_rot(env, i)
             pos_align = transform_quat_by_quat(base, cmd_rot) if cmd_rot is not None else base
             ghost_quat = qpos[i, 3:7]

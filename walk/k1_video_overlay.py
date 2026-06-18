@@ -53,7 +53,10 @@ def draw_env_markers(
     color_bgr: tuple[int, int, int],
 ) -> None:
     """Draw a command arrow above the robot."""
-    base = env.base_pos[env_idx].detach().cpu().numpy()
+    # base_pos is in env-local coords; add the per-env world offset so the arrow
+    # is projected to the correct pixel in the world-space camera view.
+    env_offset = np.asarray(env.scene.envs_offset[env_idx], dtype=np.float64)
+    base = env.base_pos[env_idx].detach().cpu().numpy() + env_offset
 
     # ── command arrow ─────────────────────────────────────────────────────────
     horiz = cmd_unit_world.clone()
