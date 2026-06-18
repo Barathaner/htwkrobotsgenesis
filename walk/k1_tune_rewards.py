@@ -1,4 +1,4 @@
-"""Optuna Bayesian tuning of reward_scales for K1 locomotion.
+"""Optuna Bayesian tuning of reward_scales + AMP params for K1 locomotion.
 
 Requires: pip install optuna
           wandb login   # once, before first run
@@ -8,12 +8,13 @@ Usage (from repo root):
   python walk/k1_tune_rewards.py --study_name k1-reward-tune --resume
 
 Each trial logs to wandb (unique run name) and records rollout videos.
-Best scales are written to logs/optuna/<study_name>_best.yaml for manual merge into k1_env.yaml.
+Best params are written to logs/optuna/<study_name>_best.yaml for manual merge into k1_env.yaml.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import os
 import shutil
@@ -55,18 +56,49 @@ def sample_reward_scales(
     return scales
 
 
-def export_best_scales(study, baseline_scales: dict[str, float], out_path: str) -> dict[str, float]:
+def sample_amp_params(
+    trial,
+    amp_search_space: dict[str, dict],
+) -> dict[str, float]:
+    """Sample AMP/train_cfg params (style_weight, amp_reward_scale) from amp_search_space."""
+    sampled: dict[str, float] = {}
+    for name, bounds in amp_search_space.items():
+        low = float(bounds["low"])
+        high = float(bounds["high"])
+        use_log = bool(bounds.get("log", low > 0 and high > 0))
+        sampled[name] = trial.suggest_float(f"amp/{name}", low, high, log=use_log)
+    return sampled
+
+
+def apply_amp_params(train_cfg: dict, amp_params: dict[str, float]) -> dict:
+    """Inject sampled AMP params into a copy of train_cfg."""
+    cfg = copy.deepcopy(train_cfg)
+    if "style_weight" in amp_params:
+        cfg["style_weight"] = amp_params["style_weight"]
+    if "amp_reward_scale" in amp_params:
+        cfg.setdefault("amp", {})["reward_scale"] = amp_params["amp_reward_scale"]
+    return cfg
+
+
+def export_best_params(
+    study,
+    baseline_scales: dict[str, float],
+    amp_search_space: dict[str, dict],
+    out_path: str,
+) -> dict:
     best = study.best_trial
     scales = sample_reward_scales_from_params(best.params, baseline_scales)
+    amp_params = {name: best.params[f"amp/{name}"] for name in amp_search_space if f"amp/{name}" in best.params}
     payload = {
         "best_value": best.value,
         "best_trial": best.number,
         "reward_scales": scales,
+        "amp_params": amp_params,
     }
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         yaml.safe_dump(payload, f, default_flow_style=False, sort_keys=False)
-    return scales
+    return payload
 
 
 def sample_reward_scales_from_params(
@@ -80,20 +112,27 @@ def sample_reward_scales_from_params(
     return scales
 
 
-def print_top_trials(study, baseline_scales: dict[str, float], n: int = 5) -> None:
+def print_top_trials(
+    study,
+    baseline_scales: dict[str, float],
+    amp_search_space: dict[str, dict],
+    n: int = 5,
+) -> None:
     trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else float("-inf"), reverse=True)
     print(f"\nTop {n} trials:")
     for t in trials[:n]:
         if t.value is None:
             continue
         scales = sample_reward_scales_from_params(t.params, baseline_scales)
+        amp_params = {name: t.params[f"amp/{name}"] for name in amp_search_space if f"amp/{name}" in t.params}
         print(f"  trial {t.number:3d}  score={t.value:.4f}")
         for k, v in sorted(scales.items()):
-            print(f"    {k:20s} {v:+.4f}")
+            print(f"    scale/{k:20s} {v:+.4f}")
+        for k, v in sorted(amp_params.items()):
+            print(f"    amp/{k:20s} {v:+.4f}")
 
 
 def trial_run_name(study_name: str, trial_number: int) -> str:
-    """Eindeutiger wandb-/Log-Name pro Optuna-Trial."""
     return f"{study_name}-trial-{trial_number:04d}"
 
 
@@ -126,21 +165,17 @@ def main() -> None:
     study_cfg = optuna_cfg["study"]
     trial_cfg = optuna_cfg["trial"]
     search_space = optuna_cfg["search_space"]
+    amp_search_space = optuna_cfg.get("amp_search_space", {})
     objective_weights = optuna_cfg["objective"]["weights"]
     fixed_scales = optuna_cfg.get("fixed_scales", [])
 
-    parser = argparse.ArgumentParser(description="Optuna reward-scale tuning for K1")
+    parser = argparse.ArgumentParser(description="Optuna reward-scale + AMP tuning for K1")
     parser.add_argument("--n_trials", type=int, default=study_cfg.get("n_trials", 50))
     parser.add_argument("--study_name", type=str, default=study_cfg.get("study_name", "k1-reward-tune"))
     parser.add_argument("--storage", type=str, default=study_cfg.get("storage", "logs/optuna/k1_reward_tune.db"))
     parser.add_argument("--config", type=str, default=OPTUNA_CONFIG_PATH)
     parser.add_argument("--resume", action="store_true", help="Resume existing study in storage")
-    parser.add_argument(
-        "--wandb_project",
-        type=str,
-        default=None,
-        help="wandb project (default: trial.wandb_project or k1_env.yaml wandb_project)",
-    )
+    parser.add_argument("--wandb_project", type=str, default=None)
     args = parser.parse_args()
 
     if args.config != OPTUNA_CONFIG_PATH:
@@ -148,6 +183,7 @@ def main() -> None:
         study_cfg = optuna_cfg["study"]
         trial_cfg = optuna_cfg["trial"]
         search_space = optuna_cfg["search_space"]
+        amp_search_space = optuna_cfg.get("amp_search_space", {})
         objective_weights = optuna_cfg["objective"]["weights"]
         fixed_scales = optuna_cfg.get("fixed_scales", [])
 
@@ -211,6 +247,7 @@ def main() -> None:
 
     def objective(trial: optuna.Trial) -> float:
         scales = sample_reward_scales(trial, baseline_scales, search_space, fixed_scales)
+        amp_params = sample_amp_params(trial, amp_search_space)
         trial_reward_cfg = apply_reward_scales(reward_cfg, scales)
         run_name = trial_run_name(args.study_name, trial.number)
 
@@ -224,11 +261,10 @@ def main() -> None:
             wandb_project=wandb_project,
             logger_class="WandbLogWriter",
         )
+        train_cfg = apply_amp_params(train_cfg, amp_params)
         train_cfg["save_interval"] = trial_cfg.get("save_interval", 10000)
         if "video_interval" in trial_cfg:
             video_opts["video_interval"] = int(trial_cfg["video_interval"])
-        # Disable video recording by default: each trial's K1Env already uses one Genesis scene;
-        # recording would create a second scene in the same process which is unsupported.
         enable_video = bool(trial_cfg.get("enable_video", False))
 
         save_session_cfgs(
@@ -264,12 +300,14 @@ def main() -> None:
         )
 
         try:
-            print(f"\n[optuna] trial {trial.number}: wandb run '{run_name}'  project={wandb_project}")
+            print(
+                f"\n[optuna] trial {trial.number}: style_weight={amp_params.get('style_weight', '?'):.3f}  "
+                f"amp_reward_scale={amp_params.get('amp_reward_scale', '?'):.3f}  "
+                f"wandb='{run_name}'"
+            )
             try:
                 run_training(runner, max_iterations)
             except optuna.TrialPruned:
-                # Finalize the wandb/logger run before re-raising — runner.learn() exits early
-                # on TrialPruned and never reaches its own stop_logging_writer() call.
                 try:
                     if runner.logger.writer is not None:
                         runner.logger.stop_logging_writer()
@@ -281,6 +319,7 @@ def main() -> None:
             score = hero_composite_score(raw_means, objective_weights)
             trial.set_user_attr("raw_means", raw_means)
             trial.set_user_attr("reward_scales", scales)
+            trial.set_user_attr("amp_params", amp_params)
             trial.set_user_attr("wandb_run_name", run_name)
             return score
         finally:
@@ -293,15 +332,19 @@ def main() -> None:
         f"Optuna study '{args.study_name}': {args.n_trials} trials, "
         f"{max_iterations} iters, {num_envs} envs, wandb={wandb_project}, storage={args.storage}"
     )
+    if amp_search_space:
+        print(f"AMP params in search space: {list(amp_search_space.keys())}")
     study.optimize(objective, n_trials=args.n_trials)
 
     out_path = os.path.join("logs", "optuna", f"{args.study_name}_best.yaml")
-    best_scales = export_best_scales(study, baseline_scales, out_path)
+    best = export_best_params(study, baseline_scales, amp_search_space, out_path)
     print(f"\nBest trial {study.best_trial.number}: score={study.best_value:.4f}")
-    print(f"Best scales written to {out_path}")
-    for k, v in sorted(best_scales.items()):
-        print(f"  {k:20s} {v:+.4f}")
-    print_top_trials(study, baseline_scales)
+    print(f"Best params written to {out_path}")
+    for k, v in sorted(best.get("reward_scales", {}).items()):
+        print(f"  scale/{k:20s} {v:+.4f}")
+    for k, v in sorted(best.get("amp_params", {}).items()):
+        print(f"  amp/{k:20s} {v:+.4f}")
+    print_top_trials(study, baseline_scales, amp_search_space)
 
 
 if __name__ == "__main__":

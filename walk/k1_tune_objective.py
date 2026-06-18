@@ -7,12 +7,10 @@ import torch
 from k1_reward_log import build_step_reward_row, reward_names
 
 DEFAULT_OBJECTIVE_WEIGHTS: dict[str, float] = {
-    "tracking_lin_vel": 2.0,
+    "tracking_lin_vel": 2.5,
     "tracking_ang_vel": 1.5,
-    "style": 2.0,
-    "feet_air_time": 0.5,
+    "feet_air_time": 1.0,
     "feet_slip": -0.3,
-    "leg_symmetry": -0.15,
     "gait_phase": -0.3,
     "orientation": -0.2,
     "base_height": -0.1,

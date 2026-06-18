@@ -334,7 +334,7 @@ class K1Env:
 
         # style (feature-matching Style-Reward): belohnt Nähe der Live-Bewegung zur NPZ-Referenz im
         # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
-        self.style_enabled = "style" in self.reward_scales
+        self.style_enabled = bool(self.reward_cfg.get("style_motion_file"))
         self._amp_obs_curr: torch.Tensor | None = None  # initialized in _setup_style_reference
         if self.style_enabled:
             self._setup_style_reference()
@@ -646,6 +646,12 @@ class K1Env:
         return self.get_observations()
 
     def _reset_idx(self, envs_idx=None):
+        # Save episode lengths before they are zeroed below
+        if envs_idx is None:
+            saved_ep_lengths = self.episode_length_buf.clone()
+        else:
+            saved_ep_lengths = self.episode_length_buf[envs_idx].clone()
+
         # reset state with init-state noise + random yaw
         noisy_qpos, init_quats_batch = self._build_noisy_init_qpos(envs_idx)
         self.robot.set_qpos(noisy_qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=True)
@@ -719,13 +725,22 @@ class K1Env:
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
+
+        # episode_length_buf was already zeroed above — use saved lengths
+        durations_s = (saved_ep_lengths.float() * self.dt).clamp(min=self.dt)
+
         self.extras["episode"] = {}
         for key, value in self.episode_sums.items():
             if envs_idx is None:
-                mean = value.mean()
+                ep_sum = value.mean()
+                per_s = (value / durations_s).mean()
             else:
-                mean = torch.where(n_envs > 0, value[envs_idx].sum() / n_envs, 0.0)
-            self.extras["episode"]["rew_" + key] = mean / self.env_cfg["episode_length_s"]
+                ep_sum = value[envs_idx].sum() / n_envs.clamp(min=1)
+                per_s = (value[envs_idx] / durations_s).sum() / n_envs.clamp(min=1)
+            # raw episode sum: multiply by (1-style_weight) to get contribution to Mean reward
+            self.extras["episode"][f"rew/{key}"] = ep_sum
+            # per-second rate: used by curriculum advancement check
+            self.extras["episode"][f"rew_rate/{key}"] = per_s
             if envs_idx is None:
                 value.zero_()
             else:
@@ -771,7 +786,7 @@ class K1Env:
         air_quality = torch.exp(-torch.square(self.foot_air_time - self.gait_swing_time) / self.feet_air_sigma)
         other_quality = self.foot_step_quality[:, [1, 0]]
         landing = air_quality * on_beat_land.to(gs.tc_float) * other_quality
-        self.feet_air_time_reward.copy_(landing.sum(dim=1) * active)
+        self.feet_air_time_reward.copy_(landing.mean(dim=1) * active)
         self.foot_step_quality.mul_(self.feet_air_decay)
         self.foot_step_quality.copy_(torch.where(on_beat_land, air_quality, self.foot_step_quality))
         self.foot_air_time *= (~in_contact).to(gs.tc_float)

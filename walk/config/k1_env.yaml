@@ -141,8 +141,8 @@ env_cfg:
 
   # ── Curriculum learning ─────────────────────────────────────────────────────
   # Phases advance when advance_when.min_iterations have passed AND the rolling
-  # mean of rew_tracking_lin_vel (per second) crosses advance_when.tracking_rew_per_sec.
-  # With tracking_lin_vel scale=2.0 and dt=0.02: perfect tracking ≈ 100/s.
+  # mean of rew_rate/tracking_lin_vel (per second) crosses advance_when.tracking_rew_per_sec.
+  # rew_rate = fn_avg × scale  (dt cancels). With scale=4.0: perfect tracking = 4.0/s.
   # The final phase has no advance_when → stays there.
   curriculum:
     enabled: true
@@ -157,7 +157,7 @@ env_cfg:
           ang_vel_range:   [-0.5, 0.5]
         advance_when:
           min_iterations: 500
-          tracking_rew_per_sec: 56.0   # ~60% of max (scale=2.0 → max≈100/s)
+          tracking_rew_per_sec: 2.0    # ~50% of max (scale=4.0 → max=4.0/s)
 
       - name: jog
         style_motion_file: walk/data/motions/k1_jogging_motion.npz
@@ -167,7 +167,7 @@ env_cfg:
           ang_vel_range:   [-0.7, 0.7]
         advance_when:
           min_iterations: 500
-          tracking_rew_per_sec: 56.0
+          tracking_rew_per_sec: 2.5    # ~62% of max
 
       - name: all
         style_motion_file: walk/data/motions/k1_jogging_motion.npz
@@ -230,30 +230,28 @@ reward_cfg:
   lin_vel_z_sigma: 0.5       # tanh(vz²/σ): bei 0.5 m/s → ~0.46; bei 1.0 m/s → ~0.96
 
   reward_scales:
-    # ── Task (Hero-Ziel: raw_mean ≈ 0.9–1.0) ─────────────────────────────────────
-    # Hero 2025-06: tracking_lin 0.91, tracking_ang 0.91, style 1.0, survival 1.0
-    # → zusammen ~5.3/s Beitrag; dominieren das Return klar.
-    tracking_lin_vel: 2.5   # primär: Command-Geschwindigkeit (EMA-geglättet)
-    tracking_ang_vel: 0.75  # 0.5→0.75: yaw-Tracking wichtiger, Hero raw≈0.91 wie lin_vel
-    #survival: 1.0
-    style: 0.0              # co-primär mit tracking: perfekter Gang = 1.0
+    # ── Task ──────────────────────────────────────────────────────────────────────
+    # All functions output [0,1] per step. rew_rate/NAME = fn_avg × scale (the /s metric).
+    # With amp.reward_scale=0.1: AMP per step ≈ 0.026, task per step ≈ 0.04–0.08 → balanced.
+    tracking_lin_vel: 4.0   # primär; max rew_rate = 4.0/s at perfect tracking
+    tracking_ang_vel: 1.5   # yaw-Tracking; max = 1.5/s
+    survival: 2.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
-    # feet_air_time: On-Beat-Touchdown + kadenz-treue Luftzeit (s. _update_foot_contact)
-    feet_air_time: 7.0       # Event-Reward; Scale hoch wegen seltener On-Beat-Landungen
-    feet_slip: -0.5         # -1.0→-0.35: Hero war -0.44/s (dominierte alle Strafen); σ=1.5 mildert tanh
-    leg_symmetry: -0.25      # aktiviert: Hero ~0.10 → ~-0.025/s; sanfter Wechselschritt-Nudge
-    gait_phase: -0.8          # Strafe: Off-Beat-Kontakt (0–1, normiert über 2 Füße), negatives Vorzeichen
-    pose_symmetry: -0.5      # cyclic mirror symmetry: left_now ≈ mirror(right_half_ago)
+    # feet_air_time: ×2 vs. old 7.0 to compensate for mean() normalisation fix (was sum() → 0–2)
+    feet_air_time: 14.0      # event reward; mean() per step ∈ [0, 0.5] → max 0.14/step
+    feet_slip: -0.5          # σ=1.5; mild at normal slip levels
+    #leg_symmetry: -0.25
+    gait_phase: -0.8         # Off-Beat penalty ∈ [0,1]; -0.8 gives max -0.016/step
+    #pose_symmetry: -0.5
 
-    # ── Regularizer (Hero-Ziel: raw_mean ≈ 0.05–0.12, klein vs. Task) ─────────
-    action_rate: -0.1        # Hero ~0.09
-    #dof_vel: -0.05            # Hero ~0.11; style matcht dof_vel ohnehin
-    ang_vel_xy: -0.05        # Hero ~0.11
-    # ang_vel_z: deaktiviert — redundant zu tracking_ang_vel (EMA)
-    #orientation: -0.5         # -1.0→-0.5: Hero ~0.03, style deckt Rumpf-Orientierung ab
-    base_height: -1.0         # Hocken/Aufbäumen bestrafen; raw ≈0 bei gutem Gehen, steigt bei Sturz
-    lin_vel_z: -0.5           # Bouncing/Hüpfen dämpfen; reagiert früher als base_height
+    # ── Regularizer ──────────────────────────────────────────────────────────────
+    action_rate: -0.15       # smoother actions
+    #dof_vel: -0.05
+    ang_vel_xy: -0.1         # roll/pitch rate damping
+    #orientation: -0.5
+    base_height: -1.0        # crouching/falling penalty; ≈0 when upright
+    lin_vel_z: -0.3          # bounce damping; was -0.5
 
 command_cfg:
   num_commands: 3
@@ -304,8 +302,9 @@ train_cfg:
   amp:
     # Discriminator hidden layer sizes (amp_rsl_rl.networks.Discriminator)
     hidden_dims: [256, 128]
-    # Reward scale applied to discriminator output before mixing
-    reward_scale: 1.0
+    # Reward scale applied to discriminator output before mixing.
+    # softplus(logit) ≈ 0.26/step early training → ×0.1 = 0.026/step ≈ task magnitude.
+    reward_scale: 0.1
     # Loss type: BCEWithLogits (standard) or Wasserstein (experimental)
     loss_type: BCEWithLogits
     # Paths to .npz motion reference files (relative to repo root).

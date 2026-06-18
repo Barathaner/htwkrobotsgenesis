@@ -263,6 +263,10 @@ class K1TrainRunner(OnPolicyRunner):
         amp_obs = obs["amp"].clone()
         self.alg.train_mode()
 
+        # Per-env reward accumulators for exact Mean reward breakdown
+        _task_ep_buf = torch.zeros(self.env.num_envs, device=self.device)
+        _style_ep_buf = torch.zeros(self.env.num_envs, device=self.device)
+
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
@@ -293,8 +297,25 @@ class K1TrainRunner(OnPolicyRunner):
                     next_amp_obs = obs["amp"].clone()
 
                     # Style reward from discriminator, mixed with task reward
+                    task_rewards = rewards.clone()
                     style_reward = self.discriminator.predict_reward(amp_obs, next_amp_obs)
-                    rewards = (1.0 - self.style_weight) * rewards + self.style_weight * style_reward
+                    rewards = (1.0 - self.style_weight) * task_rewards + self.style_weight * style_reward
+
+                    # Accumulate per-env episode totals for reward breakdown
+                    _task_ep_buf += task_rewards.detach()
+                    _style_ep_buf += style_reward.detach()
+
+                    # When episodes end: inject exact weighted breakdown into extras["episode"]
+                    done_mask = dones.bool()
+                    if done_mask.any():
+                        n_done = done_mask.sum().item()
+                        task_contrib = ((1.0 - self.style_weight) * _task_ep_buf[done_mask]).sum().item() / n_done
+                        style_contrib = (self.style_weight * _style_ep_buf[done_mask]).sum().item() / n_done
+                        extras.setdefault("episode", {})
+                        extras["episode"]["reward/task"] = task_contrib
+                        extras["episode"]["reward/style"] = style_contrib
+                        _task_ep_buf[done_mask] = 0.0
+                        _style_ep_buf[done_mask] = 0.0
 
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.alg.process_amp_step(next_amp_obs)
@@ -303,7 +324,7 @@ class K1TrainRunner(OnPolicyRunner):
 
                     # Collect per-episode tracking metric for curriculum advancement
                     if self.env.curriculum_active:
-                        val = extras.get("episode", {}).get("rew_tracking_lin_vel")
+                        val = extras.get("episode", {}).get("rew_rate/tracking_lin_vel")
                         if val is not None and not math.isnan(float(val)):
                             _curr_track.append(float(val))
 

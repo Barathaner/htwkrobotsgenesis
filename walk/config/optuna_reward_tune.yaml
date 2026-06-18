@@ -25,32 +25,33 @@ fixed_scales: []
 
 search_space:
   # ── Task (positiv) — Baseline in k1_env.yaml in Klammern ─────────────────
-  tracking_lin_vel: {low: 0.5,  high: 5.0,  log: true}   # (2.0)  primär
-  tracking_ang_vel: {low: 0.2,  high: 2.0,  log: true}   # (0.75) kleiner als lin
-  style:            {low: 0.5,  high: 5.0,  log: true}   # (2.5)  co-primär
-  feet_air_time:    {low: 1.0,  high: 12.0, log: true}   # (4.0)  Impuls-Reward → hohe Scales nötig
+  tracking_lin_vel: {low: 1.0,  high: 8.0,  log: true}   # (4.0)  primär
+  tracking_ang_vel: {low: 0.3,  high: 3.0,  log: true}   # (1.5)
+  survival:         {low: 0.5,  high: 5.0,  log: true}   # (2.0)  alive anchor
+  feet_air_time:    {low: 4.0,  high: 30.0, log: true}   # (14.0) event; mean() ∈ [0,0.5]/step
 
   # ── Kontakt / Schritt ─────────────────────────────────────────────────────
-  feet_slip:        {low: -1.0,  high: -0.05}             # (-0.5)  Hero dominierte früher bei -1.0
-  leg_symmetry:     {low: -0.8,  high: -0.02}             # (-0.25)
-  gait_phase:       {low: -2.0,  high: -0.1}              # (-0.8)  Off-Beat-Strafe (negativ)
-  pose_symmetry:    {low: -2.0,  high: -0.05}             # (-0.5)  cyclic mirror symmetry
+  feet_slip:        {low: -1.0,  high: -0.05}             # (-0.5)
+  gait_phase:       {low: -2.0,  high: -0.1}              # (-0.8)
 
-  # ── Regularizer (kleine negative Scales) ───────────────────────────────────
-  action_rate:      {low: -0.25, high: -0.01}             # (-0.05)
-  dof_vel:          {low: -0.25, high: -0.01}             # (-0.05)
-  ang_vel_xy:       {low: -0.25, high: -0.01}             # (-0.05)
-  orientation:      {low: -1.5,  high: -0.1}              # (-0.5)
+  # ── Regularizer ──────────────────────────────────────────────────────────
+  action_rate:      {low: -0.5,  high: -0.02}             # (-0.15)
+  ang_vel_xy:       {low: -0.5,  high: -0.02}             # (-0.1)
+  base_height:      {low: -3.0,  high: -0.1}              # (-1.0)
+  lin_vel_z:        {low: -1.0,  high: -0.05}             # (-0.3)
+
+# ── AMP / train_cfg Parameter ──────────────────────────────────────────────
+amp_search_space:
+  style_weight:     {low: 0.1,  high: 0.7}                # (0.5)
+  amp_reward_scale: {low: 0.02, high: 0.5,  log: true}   # (0.1)  now calibrated to task magnitude
 
 objective:
   weights:
-    tracking_lin_vel: 2.0
+    tracking_lin_vel: 2.5
     tracking_ang_vel: 1.5
-    style: 2.0
-    feet_air_time: 0.5
+    survival: 1.0
+    feet_air_time: 1.0
     feet_slip: -0.3
-    leg_symmetry: -0.15   # in search_space → must be in objective or it drifts toward 0
-    gait_phase: -0.3       # lower Off-Beat mismatch → better phase sync
-    pose_symmetry: -0.2   # penalise asymmetric gait patterns over the cycle
-    orientation: -0.2
-    base_height: -0.1     # penalise crouching / falling posture
+    gait_phase: -0.3
+    base_height: -0.2
+    lin_vel_z: -0.1
