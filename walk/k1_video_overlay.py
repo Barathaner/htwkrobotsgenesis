@@ -11,8 +11,8 @@ from genesis.utils.geom import inv_quat, transform_by_quat
 # Per-env colors (BGR for OpenCV) — must stay in sync with k1_hero_ghost.ENV_GHOST_COLORS
 ENV_COLORS_BGR = [
     (60,  255,  60),   # env 0: green
-    (  0, 140, 255),   # env 1: orange
     (220, 210,   0),   # env 2: cyan
+    (0, 255, 255),  # yellow
     (220,   0, 200),   # env 3: purple
 ]
 

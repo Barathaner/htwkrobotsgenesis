@@ -10,7 +10,7 @@ study:
   study_name: k1-reward-tune
 
 trial:
-  max_iterations: 2000
+  max_iterations: 2001
   num_envs: 2048
   seed: 42
   eval_steps: 1000
