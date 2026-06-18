@@ -16,7 +16,7 @@ from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import check_nan
 
 from k1_reward_log import build_step_reward_row, episode_summary, reward_names
-from k1_video_overlay import render_annotated_frame
+from k1_video_overlay import render_annotated_frame, update_camera_centroid
 
 
 class K1TrainRunner(OnPolicyRunner):
@@ -127,6 +127,7 @@ class K1TrainRunner(OnPolicyRunner):
                     video_env.color_shadow.update(video_env)
                 if video_env.cam._followed_entity is not None:
                     video_env.cam.update_following()
+                update_camera_centroid(video_env)
                 frames.append(render_annotated_frame(video_env))
 
         imageio.mimsave(path, frames, fps=self.video_fps)

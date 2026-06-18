@@ -95,6 +95,38 @@ def draw_all_hud(rgb: np.ndarray, env_infos: list[tuple[float, float, float, tup
     return rgb
 
 
+def update_camera_centroid(env, smoothing: float = 0.92) -> None:
+    """Smoothly re-center the video camera on the XY centroid of all env robots.
+
+    Only active for multi-env recordings (n > 1) where the camera is not already
+    following a single entity.  The camera-to-lookat offset vector is preserved so
+    the viewing angle never changes.
+    """
+    n = env.num_envs
+    cam = env.cam
+    if cam is None or cam._followed_entity is not None or n <= 1:
+        return
+
+    offsets = np.array([env.scene.envs_offset[i] for i in range(n)], dtype=np.float64)
+    local_xy = env.base_pos[:n, :2].detach().cpu().numpy()          # (n, 2) local
+    centroid_xy = (local_xy + offsets[:, :2]).mean(axis=0)          # world XY centroid
+
+    # Replicate update_following's batching convention
+    env_idx = cam._env_idx if cam._is_batched and cam._env_idx is not None else ()
+    cur_lookat = cam._lookat[env_idx].clone()
+    cur_pos    = cam._pos[env_idx].clone()
+    cam_offset = cur_pos - cur_lookat                                # fixed angle offset
+
+    target = cur_lookat.clone()
+    target[0] = float(centroid_xy[0])
+    target[1] = float(centroid_xy[1])
+    # z stays as-is so the camera doesn't pitch when robots jump
+
+    new_lookat = smoothing * cur_lookat + (1.0 - smoothing) * target
+    new_pos    = new_lookat + cam_offset
+    cam.set_pose(pos=new_pos, lookat=new_lookat)
+
+
 def render_annotated_frame(env, *, force_render: bool = False) -> np.ndarray:
     """Genesis-Render + per-env Command-Pfeile + HUD."""
     assert env.cam is not None
