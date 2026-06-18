@@ -1,6 +1,6 @@
 # Booster K1 locomotion — 16-DOF (12 legs + 4 arms).
 # Unbenutzte DOFs (Shoulder_Roll, Elbow_Yaw, Kopf) per PD fix gehalten (fixed_joint_names).
-# Obs dim = 3+3+3 + 2+2+1+1+1+2+2 + 16+16+16 = 68 (auto in K1_env.py). Privilegiert (sim-only): lin_vel_heading(2), lin_vel_ema(2), ang_vel_z_ema(1), base_height(1), lin_vel_z(1), foot_contact(2), gait_clock(2).
+# Obs dim = 3+3+3 + 2+2+1+1+1 + 16+16+16+2+2 = 66 (auto in K1_env.py). Privilegiert: lin_vel_heading(2), lin_vel_ema(2), ang_vel_z_ema(1), base_height(1), lin_vel_z(1). Deploy: gait_phase(2), feet_contact(2).
 
 env_cfg:
   num_actions: 16
@@ -101,11 +101,9 @@ env_cfg:
     follow: true
     follow_smoothing: 0.9
     hero_ghost: true
-    hero_ghost_color: [0.45, 0.80, 1.0]    # hellblau
-    hero_ghost_opacity: 0.42
-    robot_color: [0.82, 0.10, 0.10]       # Vereinsrot / jersey red
+    hero_ghost_opacity: 0.55
+    robot_color: [0.35, 0.35, 0.35]       # neutral gray — ghosts carry the per-env colour
     robot_roughness: 0.6
-    plane_color: [0.18, 0.52, 0.12]       # Rasengrün / grass green
     plane_roughness: 0.95
     # Multi-env training video: show N envs in a grid to observe episode variety.
     num_envs: 4
@@ -158,13 +156,13 @@ reward_cfg:
   # contact (net contact force on foot links, via RigidEntity.get_links_net_contact_force)
   foot_contact_force_threshold: 20.0  # [N] |F| on foot link above = in_contact
 
-  # feet_air_time (klassisch legged_gym: Bonus = air_time − target beim Aufsetzen)
-  feet_air_time_target: 0.25      # [s] Hero-Jog ~0.15–0.20 s Luftzeit/Schritt; 0.25 → Touchdown-Bonus ~0.6–0.8
-  feet_air_cmd_threshold: 0.05    # [m/s] darunter kein Reward
-
-  # gait_clock: speed-adaptive phase oscillator for foot-contact synchronization
-  gait_freq_base:  0.5    # [Hz] step frequency at zero command speed
-  gait_freq_scale: 0.8    # [Hz per m/s] → at 1.5 m/s jog: 0.5 + 0.8×1.5 = 1.7 Hz
+  # feet_air_time + gait_phase: gemeinsames Phase-Clock-Kontaktmodell (Siekmann/Margolis-Stil)
+  feet_air_cmd_threshold: 0.05    # [m/s] darunter kein Schritt-Reward / keine Off-Beat-Strafe
+  gait_period_s: 0.80             # [s] fester Schritt-Takt (φ∈[0,1), unabhängig von cmd_speed)
+  gait_stance_ratio: 0.60          # Anteil der Periode in Stance je Fuß (Rest = Swing)
+  gait_phase_offset: 0.50         # L/R-Versatz in φ (0.5 = anti-phasig)
+  feet_air_sigma: 0.04             # Gauß-Breite für Luftzeit vs. Soll-Schwung (1−stance)·period
+  feet_air_decay: 0.96             # foot_step_quality Zerfall/Step (Symmetrie-Kopplung)
 
   # leg_symmetry (alternierender Gang: ein Fuß schwingt, der andere stützt; dann Wechsel)
   leg_symmetry_ds_allow_s: 0.15      # [s] erlaubte Doppelstütz-Dauer je Phase (natürl. (2·stance_ratio−1)·period/2 ≈ 0.11)
@@ -172,7 +170,15 @@ reward_cfg:
 
   # style (feature-matching Style-Reward gegen eine NPZ-Referenzmotion, siehe K1_env._reward_style)
   style_motion_file: walk/data/motions/k1_jogging_motion.npz  # relativ zur Repo-Root
-  style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); kleiner = strenger an der Referenz
+  style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); nur genutzt wenn amp_disc_enabled: false
+
+  # AMP adversarial style discriminator (Peng et al. 2021)
+  # Replaces nearest-neighbour feature matching with a learned discriminator on (s_t, s_{t+1}) transitions.
+  amp_disc_enabled: true
+  amp_hidden_dims: [256, 128]
+  amp_lr: 1.0e-4
+  amp_grad_penalty: 10.0          # WGAN-GP weight; keeps discriminator Lipschitz
+  amp_replay_size: 100000         # circular buffer of policy transitions for disc training
 
   # Gebundene Strafterme: jeder gibt tanh(quantity / σ) ∈ [0,1) zurück (0 = sauber, →1 = starke
   # Verletzung); Vorzeichen kommt aus reward_scales (negativ = Strafe). Kleineres σ = strenger
@@ -199,12 +205,11 @@ reward_cfg:
     style: 2.0              # co-primär mit tracking: perfekter Gang = 1.0
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
-    # feet_air_time: Impuls-Reward (nur Touchdown-Frames) → raw_mean immer klein (~0.03–0.08).
-    # Scale hoch, damit der Beitrag trotzdem spürbar ist (Hero-Ziel ~0.1/s).
-    feet_air_time: 4.0       # 1.5→4.0: Hero +0.04/s→~+0.10/s; style deckt Schwung mit ab
+    # feet_air_time: On-Beat-Touchdown + kadenz-treue Luftzeit (s. _update_foot_contact)
+    feet_air_time: 7.0       # Event-Reward; Scale hoch wegen seltener On-Beat-Landungen
     feet_slip: -0.5         # -1.0→-0.35: Hero war -0.44/s (dominierte alle Strafen); σ=1.5 mildert tanh
     leg_symmetry: -0.25      # aktiviert: Hero ~0.10 → ~-0.025/s; sanfter Wechselschritt-Nudge
-    gait_clock: 1.5          # ∈[−1,1]×scale×dt; +1 = beide Füße perfekt mit Uhr, −1 = beide falsch
+    gait_phase: -0.8          # Strafe: Off-Beat-Kontakt (0–2 Fuß-Fehler/Step), negatives Vorzeichen
 
     # ── Regularizer (Hero-Ziel: raw_mean ≈ 0.05–0.12, klein vs. Task) ─────────
     action_rate: -0.1        # Hero ~0.09
@@ -217,9 +222,9 @@ reward_cfg:
 
 command_cfg:
   num_commands: 3
-  lin_vel_x_range: [-0.3, 1.0]   # negative: occasional backward walking
-  lin_vel_y_range: [-0.3, 0.3]   # lateral stepping
-  ang_vel_range: [-0.5, 0.5]     # turning
+  lin_vel_x_range: [-0.8, 2.0]   # negative: occasional backward walking
+  lin_vel_y_range: [-0.8, 1.0]   # lateral stepping
+  ang_vel_range: [-0.8, 0.8]     # turning
 
 # PPO / rsl-rl — obs_dim & num_actions kommen automatisch aus K1Env
 train_cfg:

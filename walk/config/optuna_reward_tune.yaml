@@ -33,7 +33,7 @@ search_space:
   # ── Kontakt / Schritt ─────────────────────────────────────────────────────
   feet_slip:        {low: -1.0,  high: -0.05}             # (-0.5)  Hero dominierte früher bei -1.0
   leg_symmetry:     {low: -0.8,  high: -0.02}             # (-0.25)
-  gait_clock:       {low: 0.1,   high: 3.0,  log: true}   # (1.0)   ∈[−1,1]; steuert Schritt-Taktung
+  gait_phase:       {low: -2.0,  high: -0.1}              # (-0.8)  Off-Beat-Strafe (negativ)
 
   # ── Regularizer (kleine negative Scales) ───────────────────────────────────
   action_rate:      {low: -0.25, high: -0.01}             # (-0.05)
@@ -49,6 +49,6 @@ objective:
     feet_air_time: 0.5
     feet_slip: -0.3
     leg_symmetry: -0.15   # in search_space → must be in objective or it drifts toward 0
-    gait_clock: 0.5       # ∈[−1,1]: positive = reward correct phase; keeps clock useful
+    gait_phase: -0.3       # lower Off-Beat mismatch → better phase sync
     orientation: -0.2
     base_height: -0.1     # penalise crouching / falling posture

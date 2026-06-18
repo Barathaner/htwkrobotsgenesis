@@ -70,13 +70,7 @@ class K1Env:
             scene_kwargs["vis_options"] = gs.options.VisOptions(rendered_envs_idx=list(range(num_envs)))
         self.scene = gs.Scene(**scene_kwargs)
         vcfg_vis = env_cfg.get("video", {})
-        self.scene.add_entity(
-            gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True),
-            surface=gs.surfaces.Default(
-                color=tuple(float(c) for c in vcfg_vis.get("plane_color", [0.18, 0.52, 0.12])),
-                roughness=float(vcfg_vis.get("plane_roughness", 0.95)),
-            ),
-        )
+        self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="models/K1/K1_22dof.urdf",
@@ -92,7 +86,7 @@ class K1Env:
         if record_camera and env_cfg.get("video", {}).get("hero_ghost", True):
             from k1_hero_ghost import HeroGhost
 
-            self.hero_ghost = HeroGhost(self.scene, env_cfg, reward_cfg)
+            self.hero_ghost = HeroGhost(self.scene, env_cfg, reward_cfg, num_envs)
         if show_viewer:
             from genesis.ext.pyrender.overlay import ImGuiOverlayPlugin
 
@@ -253,6 +247,8 @@ class K1Env:
         # feet_air_time: Luftphase je Fuß [s]; phasen-gekoppelte Belohnung beim Aufsetzen.
         self.foot_air_time = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
         self.feet_air_time_reward = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
+        # foot_step_quality: zerfallende On-Beat-Landequalität je Fuß; koppelt Alternation (s. _update_foot_contact).
+        self.foot_step_quality = torch.zeros((num_envs, 2), dtype=gs.tc_float, device=gs.device)
 
         # leg_symmetry: Strafe für nicht-alternierenden Gang (siehe _reward_leg_symmetry). Sowohl die
         # Doppelstütze (beide am Boden) als auch die Flugphase (beide in der Luft) sind als kurze
@@ -266,10 +262,14 @@ class K1Env:
         self.ds_allow_time = float(self.reward_cfg["leg_symmetry_ds_allow_s"])
         self.flight_allow_time = float(self.reward_cfg.get("leg_symmetry_flight_allow_s", 0.20))
 
-        # gait_clock: continuous phase oscillator ∈ [0, 2π); drives phase-matched foot contact reward.
-        self.gait_phase = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
-        self.gait_freq_base  = float(reward_cfg.get("gait_freq_base",  0.5))   # [Hz] at zero speed
-        self.gait_freq_scale = float(reward_cfg.get("gait_freq_scale", 0.8))   # [Hz / (m/s)]
+        # Phase-Clock (Siekmann/Margolis): φ∈[0,1), feste Periode; sin/cos(2πφ) in Obs.
+        self.gait_period_steps = max(1, int(reward_cfg["gait_period_s"] / self.dt))
+        self.gait_stance_ratio = float(reward_cfg["gait_stance_ratio"])
+        self.gait_phase_offset = float(reward_cfg["gait_phase_offset"])
+        self.gait_swing_time = (1.0 - self.gait_stance_ratio) * float(reward_cfg["gait_period_s"])
+        self.feet_air_sigma = float(reward_cfg["feet_air_sigma"])
+        self.feet_air_decay = float(reward_cfg["feet_air_decay"])
+        self.gait_phase = torch.rand((num_envs,), dtype=gs.tc_float, device=gs.device)
 
         # Random push state (always allocated; only used when push_enabled=True)
         self.push_force_buf = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
@@ -289,6 +289,7 @@ class K1Env:
 
         # style (feature-matching Style-Reward): belohnt Nähe der Live-Bewegung zur NPZ-Referenz im
         # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
+        self.amp_disc = None  # set inside _setup_style_reference if amp_disc_enabled
         self.style_enabled = "style" in self.reward_scales
         if self.style_enabled:
             self._setup_style_reference()
@@ -307,12 +308,12 @@ class K1Env:
             "ang_vel_z_ema": 1,          # geglättete Yaw-Rate   (= was tracking_ang_vel misst)
             "base_height": 1,            # Rumpfhöhe [m]
             "base_lin_vel_z": 1,         # vertikale Geschw. [m/s] (Fallen/Hüpfen)
-            "foot_contact": 2,           # Bodenkontakt je Fuß (0/1)
-            "gait_clock": 2,             # Phasen-Uhr [sin φ, cos φ] für Schritt-Synchronisierung
             # ── deploy-fähig ──────────────────────────────────────────────────
             "dof_pos": self.dof_pos.shape[-1],
             "dof_vel": self.dof_vel.shape[-1],
             "actions": self.actions.shape[-1],
+            "gait_phase": 2,             # sin/cos(2πφ) — Phase-Clock für Schritt-Timing
+            "feet_contact": 2,             # L/R-Kontakt, zentriert auf ±0.5
         }
         self.obs_dim = sum(self._obs_slices.values())
 
@@ -396,6 +397,77 @@ class K1Env:
         print(f"[style] ref={self.style_ref_feat.shape[0]} frames  feat_dim={self.style_feat_dim}  "
               f"sigma={self.style_sigma}  ground_z={np.round(self.style_ground_z.cpu().numpy(), 3)}")
 
+        # AMP: build normalized reference transitions (s_t, s_{t+1}) for discriminator training
+        if self.reward_cfg.get("amp_disc_enabled", False):
+            self._setup_amp_discriminator(ref, mean, std)
+
+    def _setup_amp_discriminator(self, ref_raw: np.ndarray, mean: np.ndarray, std: np.ndarray) -> None:
+        from amp_discriminator import AMPDiscriminator
+
+        amp_obs_dim = ref_raw.shape[1]  # 38
+        hidden = tuple(int(h) for h in self.reward_cfg.get("amp_hidden_dims", [256, 128]))
+        lr = float(self.reward_cfg.get("amp_lr", 1e-4))
+        gp_w = float(self.reward_cfg.get("amp_grad_penalty", 10.0))
+        replay_size = int(self.reward_cfg.get("amp_replay_size", 100_000))
+
+        self.amp_disc = AMPDiscriminator(amp_obs_dim, hidden, lr, gp_w, device=str(gs.device))
+        self._amp_obs_dim = amp_obs_dim
+
+        # Reference transitions: all consecutive (s_t, s_{t+1}) pairs from NPZ, pre-normalized
+        ref_norm = (ref_raw - mean) / std
+        s  = torch.tensor(ref_norm[:-1], dtype=gs.tc_float, device=gs.device)
+        sn = torch.tensor(ref_norm[1:],  dtype=gs.tc_float, device=gs.device)
+        self._amp_ref_buf = torch.cat([s, sn], dim=-1)  # (T-1, 76)
+
+        # Circular replay buffer for policy transitions
+        self._amp_replay = torch.zeros((replay_size, 2 * amp_obs_dim), dtype=gs.tc_float, device=gs.device)
+        self._amp_replay_ptr = 0
+        self._amp_replay_n = 0
+
+        # Current/previous AMP obs buffers (updated every step)
+        self._amp_obs_prev = torch.zeros((self.num_envs, amp_obs_dim), dtype=gs.tc_float, device=gs.device)
+        self._amp_obs_curr = torch.zeros((self.num_envs, amp_obs_dim), dtype=gs.tc_float, device=gs.device)
+
+        print(f"[AMP] disc ON  obs_dim={amp_obs_dim}  ref_transitions={len(self._amp_ref_buf)}  replay={replay_size}")
+
+    def _build_amp_obs(self) -> torch.Tensor:
+        """38-dim AMP state: same features as style reference, normalized with ref statistics."""
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
+        foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
+        feat = torch.cat([
+            self.base_pos[:, 2:3],
+            self.projected_gravity,
+            self.dof_pos,
+            self.dof_vel,
+            foot_clear,
+        ], dim=1)
+        return (feat - self.style_mean) / self.style_std
+
+    def _amp_push_replay(self) -> None:
+        """Append current (prev, curr) transitions to the replay buffer."""
+        trans = torch.cat([self._amp_obs_prev, self._amp_obs_curr], dim=-1)  # (n, 76)
+        n = self.num_envs
+        size = self._amp_replay.shape[0]
+        end = (self._amp_replay_ptr + n) % size
+        if end > self._amp_replay_ptr:
+            self._amp_replay[self._amp_replay_ptr:end] = trans
+        else:
+            cut = size - self._amp_replay_ptr
+            self._amp_replay[self._amp_replay_ptr:] = trans[:cut]
+            self._amp_replay[:end] = trans[cut:]
+        self._amp_replay_ptr = end
+        self._amp_replay_n = min(self._amp_replay_n + n, size)
+
+    def update_amp_disc(self, batch_size: int = 512) -> dict[str, float]:
+        """Sample real/fake transitions, update discriminator. Called by runner after PPO update."""
+        if self.amp_disc is None or self._amp_replay_n < batch_size:
+            return {}
+        ri = torch.randint(len(self._amp_ref_buf), (batch_size,), device=gs.device)
+        real = self._amp_ref_buf[ri]
+        fi = torch.randint(self._amp_replay_n, (batch_size,), device=gs.device)
+        fake = self._amp_replay[fi]
+        return self.amp_disc.update(*real.chunk(2, -1), *fake.chunk(2, -1))
+
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
@@ -414,6 +486,8 @@ class K1Env:
         self.scene.step()
 
         self.episode_length_buf += 1
+        # Phase-Clock weiterdrehen (in-place, mod 1) — vor Kontakt-Update für On-Beat-Gating.
+        self.gait_phase.add_(1.0 / self.gait_period_steps).remainder_(1.0)
         # copy into pre-allocated buffers so reset() works outside torch.inference_mode()
         self.base_pos.copy_(self.robot.get_pos())
         self.base_quat.copy_(self.robot.get_quat())
@@ -429,8 +503,12 @@ class K1Env:
         self.dof_pos.copy_(self.robot.get_dofs_position(self.motors_dof_idx))
         self.dof_vel.copy_(self.robot.get_dofs_velocity(self.motors_dof_idx))
         self._update_foot_contact()
-        self._update_gait_phase()
         self._update_command_tracking_ema()
+
+        if self.amp_disc is not None:
+            self._amp_obs_prev = self._amp_obs_curr
+            self._amp_obs_curr = self._build_amp_obs()
+            self._amp_push_replay()
 
         self.rew_buf.zero_()
         for name, reward_func in self.reward_functions.items():
@@ -521,12 +599,16 @@ class K1Env:
             self.foot_in_contact.fill_(True)
             self.foot_air_time.zero_()
             self.feet_air_time_reward.zero_()
+            self.foot_step_quality.zero_()
             self.both_stance_time.zero_()
             self.both_air_time.zero_()
             self.leg_symmetry_penalty.zero_()
-            self.gait_phase.uniform_(0, 2 * math.pi)
+            self.gait_phase.uniform_(0.0, 1.0)
             self.push_force_buf.zero_()
             self.push_steps_remaining.zero_()
+            if self.amp_disc is not None:
+                self._amp_obs_prev.zero_()
+                self._amp_obs_curr.zero_()
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
             torch.where(envs_idx[:, None], init_quats_batch, self.base_quat, out=self.base_quat)
@@ -549,13 +631,16 @@ class K1Env:
             self.foot_in_contact.masked_fill_(envs_idx[:, None], True)
             self.foot_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.feet_air_time_reward.masked_fill_(envs_idx, 0.0)
+            self.foot_step_quality.masked_fill_(envs_idx[:, None], 0.0)
             self.both_stance_time.masked_fill_(envs_idx, 0.0)
             self.both_air_time.masked_fill_(envs_idx, 0.0)
             self.leg_symmetry_penalty.masked_fill_(envs_idx, 0.0)
-            rand_phase = torch.rand_like(self.gait_phase) * (2 * math.pi)
-            torch.where(envs_idx, rand_phase, self.gait_phase, out=self.gait_phase)
+            torch.where(envs_idx, torch.rand_like(self.gait_phase), self.gait_phase, out=self.gait_phase)
             self.push_force_buf.masked_fill_(envs_idx[:, None], 0.0)
             self.push_steps_remaining.masked_fill_(envs_idx, 0)
+            if self.amp_disc is not None:
+                self._amp_obs_prev.masked_fill_(envs_idx[:, None], 0.0)
+                self._amp_obs_curr.masked_fill_(envs_idx[:, None], 0.0)
 
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
@@ -601,14 +686,17 @@ class K1Env:
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
 
-        # feet_air_time (gebunden ∈[0,1]): Luftzeit je Fuß akkumulieren und beim Aufsetzen (touchdown)
-        # min(air_time/target, 1) gutschreiben, gemittelt über beide Füße → ∈[0,1], immer ≥0 (keine
-        # Strafe für kurze Schritte), Deckel bei target (kein Hüpf-Anreiz). Danach Timer in Kontakt nullen.
+        # feet_air_time (phasen-gekoppelt): Touchdown nur on-beat + Gauß um Soll-Schwungdauer;
+        # Symmetrie via foot_step_quality des ANDEREN Fußes (s. _desired_stance).
         self.foot_air_time += self.dt
-        swing_frac = torch.clamp(self.foot_air_time / self.reward_cfg["feet_air_time_target"], max=1.0)
-        landing = swing_frac * touchdown.to(gs.tc_float)
-        self.feet_air_time_reward.copy_(landing.mean(dim=1) * active)
-        self.foot_air_time *= (~in_contact).to(gs.tc_float)  # Füße am Boden: Timer zurücksetzen
+        on_beat_land = touchdown & self._desired_stance()
+        air_quality = torch.exp(-torch.square(self.foot_air_time - self.gait_swing_time) / self.feet_air_sigma)
+        other_quality = self.foot_step_quality[:, [1, 0]]
+        landing = air_quality * on_beat_land.to(gs.tc_float) * other_quality
+        self.feet_air_time_reward.copy_(landing.sum(dim=1) * active)
+        self.foot_step_quality.mul_(self.feet_air_decay)
+        self.foot_step_quality.copy_(torch.where(on_beat_land, air_quality, self.foot_step_quality))
+        self.foot_air_time *= (~in_contact).to(gs.tc_float)
 
         # leg_symmetry: alternierender Gang = genau ein Fuß schwingt, der andere stützt; dann Wechsel.
         # both_stance (Doppelstütze) und both_air (Flugphase) sind als KURZE Übergänge natürlich
@@ -628,6 +716,17 @@ class K1Env:
 
         self.foot_in_contact.copy_(in_contact)
 
+    def _desired_stance(self):
+        """Soll-Bodenkontakt je Fuß (n,2): True = Stance-Fenster laut Phase-Clock.
+
+        Linkes Bein folgt gait_phase, rechtes um gait_phase_offset versetzt (typisch 0.5 = anti-phasig).
+        Stance solange Phase < gait_stance_ratio. Gemeinsames Modell für gait_phase-Strafe und feet_air_time.
+        """
+        phase = torch.stack(
+            [self.gait_phase, (self.gait_phase + self.gait_phase_offset).remainder(1.0)], dim=1
+        )
+        return phase < self.gait_stance_ratio
+
     def _update_command_tracking_ema(self):
         """EMA-Tiefpass der Heading-Lineargeschw. (xy) und Yaw-Rate für das Command-Tracking.
 
@@ -640,6 +739,7 @@ class K1Env:
         self.ang_vel_z_ema.mul_(a).add_(self.base_ang_vel[:, 2], alpha=1.0 - a)
 
     def _update_observation(self):
+        phase_2pi = self.gait_phase * (2.0 * math.pi)
         obs_parts = [
             self.base_ang_vel * self.obs_scales["ang_vel"],
             self.projected_gravity,
@@ -650,12 +750,12 @@ class K1Env:
             self.ang_vel_z_ema.unsqueeze(1) * self.obs_scales["ang_vel"],
             self.base_pos[:, 2:3],
             self.base_lin_vel[:, 2:3] * self.obs_scales["lin_vel"],
-            self.foot_in_contact.to(gs.tc_float),
-            torch.stack([torch.sin(self.gait_phase), torch.cos(self.gait_phase)], dim=1),
             # deploy-fähig
             (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
             self.dof_vel * self.obs_scales["dof_vel"],
             self.actions,
+            torch.stack([torch.sin(phase_2pi), torch.cos(phase_2pi)], dim=1),
+            self.foot_in_contact.to(gs.tc_float) - 0.5,
         ]
         for i, part in enumerate(obs_parts):
             assert part.ndim == 2 and part.shape[0] == self.num_envs, f"obs part {i}: bad shape {part.shape}"
@@ -734,16 +834,11 @@ class K1Env:
 
 
     def _reward_feet_air_time(self):
-        """Belohnung (gebunden ∈[0,1]): klare Schritte (Event beim Aufsetzen).
+        """Belohnung: phasen-gekoppelter, kadenz-treuer Schritt (Event beim Aufsetzen).
 
-        In _update_foot_contact: je Fuß min(air_time/target, 1) beim Touchdown, gemittelt über beide Füße
-        → ∈[0,1], immer ≥0 (keine Strafe für kurze Schritte), Deckel bei target (kein Hüpf-Anreiz).
-        Gate: cmd_speed > feet_air_cmd_threshold (im Stand kein Reward).
-
-        Beispiel (target=0.3):
-          Touchdown mit air=0.45 → min(1.5,1)=1.0, ein Fuß → mean=0.5
-          Touchdown mit air=0.15 → min(0.5,1)=0.5, ein Fuß → mean=0.25
-          Stehen (cmd≈0)         → 0
+        In _update_foot_contact: Touchdown nur on-beat (_desired_stance) und
+        exp(−(air_time − gait_swing_time)² / feet_air_sigma), gekoppelt über foot_step_quality
+        des anderen Fußes. Gate: cmd_speed > feet_air_cmd_threshold.
         """
         return self.feet_air_time_reward
 
@@ -759,30 +854,19 @@ class K1Env:
 
 
     def _reward_style(self):
-        """Belohnung: Live-Bewegung sieht aus wie die NPZ-Referenz (feature-matching, nicht-adversariell).
+        if self.amp_disc is not None:
+            # AMP adversarial reward: discriminator judges whether (s_{t-1}, s_t) looks like reference
+            return self.amp_disc.reward(self._amp_obs_prev, self._amp_obs_curr)
 
-        Baut je Step dasselbe 38-dim Feature wie die Referenz (root_height, projected_gravity, dof_pos,
-        dof_vel, foot_clear), standardisiert mit den Referenz-Statistiken und misst die Distanz zum
-        NÄCHSTEN Referenz-Frame im Feature-Raum. Da dof_vel/foot_clear enthalten sind, kodiert das
-        BEWEGUNG (eine eingefrorene Pose hat v=0 → weit weg vom Jog) — timing-/speed-agnostisch, kein
-        Phasen-Clock. r = exp(−mean_sq_z / (2σ²)) ∈ (0,1]: 1 wenn die Pose+Dynamik im Schnitt < σ Std
-        von einem Referenz-Frame entfernt ist.
-
-        Beispiel (σ=1.0, scale positiv → *dt):
-          Bewegung trifft Referenz-Stil    → mean_sq_z≈0   → r≈1
-          im Schnitt 1 Std daneben         → mean_sq_z≈1   → r≈0.61
-          völlig anderer Gang/steif        → mean_sq_z groß → r→0
-        """
-        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]  # (n,2)
+        # Fallback: nearest-neighbour feature matching (non-adversarial, timing-agnostic)
+        foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
         foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
         feat = torch.cat(
             [self.base_pos[:, 2:3], self.projected_gravity, self.dof_pos, self.dof_vel, foot_clear], dim=1
         )
-        feat = (feat - self.style_mean) / self.style_std * self.style_sqrt_w  # standardisiert + gewichtet
-        # nächster Referenz-Frame je Env: min gewichtete ||feat − ref_k||² (Std-Einheiten), normiert auf Σw
+        feat = (feat - self.style_mean) / self.style_std * self.style_sqrt_w
         min_sq = torch.cdist(feat, self.style_ref_feat).pow(2).min(dim=1).values
-        mean_sq = min_sq / self.style_w_sum
-        return torch.exp(-mean_sq / (2.0 * self.style_sigma**2))
+        return torch.exp(-min_sq / self.style_w_sum / (2.0 * self.style_sigma**2))
 
     def _reward_leg_symmetry(self):
         """Strafe: Beine laufen nicht alternierend (anti-phasig: ein Fuß schwingt, der andere stützt).
@@ -800,29 +884,17 @@ class K1Env:
         """
         return torch.tanh(self.leg_symmetry_penalty / self.reward_cfg["leg_symmetry_sigma"])
 
-    def _update_gait_phase(self):
-        """Advance gait phase clock based on commanded speed (speed-adaptive frequency)."""
-        cmd_speed = torch.norm(self.commands[:, :2], dim=1)
-        freq = self.gait_freq_base + self.gait_freq_scale * cmd_speed
-        self.gait_phase = (self.gait_phase + 2 * math.pi * freq * self.dt) % (2 * math.pi)
+    def _reward_gait_phase(self):
+        """Strafe: Fuß-Kontakt passt nicht zum Phase-Clock-Takt (Off-Beat / falsches Swing-Fenster).
 
-    def _reward_gait_clock(self):
-        """Belohnung ∈[−1,1]: Fuß-Kontaktmuster stimmt mit Phasen-Uhr überein.
-
-        Linker Fuß soll in der Kontaktphase (sin φ > 0) am Boden sein, rechter Fuß
-        anti-phasig (sin(φ+π) = −sin φ > 0 in der zweiten Hälfte). Gibt +1 wenn
-        beide Füße perfekt synchron mit der Uhr sind, −1 wenn beide falsch liegen.
-        Wie andere Kontakt-Rewards auf cmd_speed > feet_air_cmd_threshold gegated.
+        Je Fuß 1 bei mismatch (Soll-Stance ≠ Ist-Kontakt), summiert über beide Füße → 0–2.
+        Nutzt dasselbe Kontaktmodell wie feet_air_time (_desired_stance). Gate: cmd_speed >
+        feet_air_cmd_threshold.
         """
-        c = self.foot_in_contact.to(gs.tc_float)   # (n, 2)
-        state = 2.0 * c - 1.0                      # ±1: +1 = Kontakt, −1 = Schwung
-        expect = torch.stack([
-            torch.sin(self.gait_phase),
-            torch.sin(self.gait_phase + math.pi),  # = −sin(phase): rechter Fuß anti-phasig
-        ], dim=1)                                   # (n, 2) ∈ [−1, 1]
+        mismatch = (self._desired_stance() != self.foot_in_contact).to(gs.tc_float).sum(dim=1)
         cmd_speed = torch.norm(self.commands[:, :2], dim=1)
         active = (cmd_speed > self.reward_cfg["feet_air_cmd_threshold"]).to(gs.tc_float)
-        return (state * expect).mean(dim=1) * active
+        return mismatch * active
 
     def _reward_dof_vel(self):
         """Strafe (gebunden ∈[0,1)): hohe Gelenkgeschwindigkeiten dämpfen (Energie/Vibration).

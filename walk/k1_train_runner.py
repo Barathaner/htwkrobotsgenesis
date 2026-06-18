@@ -178,6 +178,8 @@ class K1TrainRunner(OnPolicyRunner):
                 self.alg.compute_returns(obs)
 
             loss_dict = self.alg.update()
+            amp_stats = self.env.update_amp_disc(batch_size=self.cfg.get("amp_disc_batch_size", 512))
+            loss_dict.update(amp_stats)
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it

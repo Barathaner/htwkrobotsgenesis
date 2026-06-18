@@ -293,51 +293,35 @@ def test_d(num_envs: int = 64, steps: int = 50) -> bool:
 # Test E — feet_air_time landing reward (deterministisch)
 # ---------------------------------------------------------------------------
 def test_e() -> bool:
-    print("\n=== Test E: feet_air_time (klassisch: air_time − target beim Aufsetzen) ===")
-    print("Idee: stehen lassen bis beide Füße Kontakt, dann (ohne scene.step!) den vorherigen")
-    print("Zustand auf 'in der Luft' setzen, air_time vorgeben, _update_foot_contact() auslösen.")
-    print("Keine Physik dazwischen → deterministisch.\n")
+    print("\n=== Test E: feet_air_time (phasen-gekoppelt: On-Beat + Kadenz) ===")
+    print("Idee: Touchdown nur wenn _desired_stance() und Luftzeit nahe gait_swing_time.\n")
 
     env = make_env(num_envs=1, reward_names=["feet_air_time"])
-    target = env.reward_cfg["feet_air_time_target"]
+    swing = env.gait_swing_time
     fwd = torch.tensor([0.6, 0.0, 0.0], device=gs.device)
 
-    def settle_until(n_target: int, max_steps: int = 150) -> bool:
-        env.reset()
-        for _ in range(max_steps):
-            env.step(zero_actions(env))
-            if int(env.foot_in_contact[0].sum()) == n_target:
-                return True
-        return False
-
-    def land_with(cmd, air_time):
+    def land_with(cmd, air_time, phase=0.05, step_quality=1.0):
         env.commands[:] = cmd
-        env.foot_in_contact[:] = False       # vorheriger Step: alle Füße galten als 'in der Luft'
-        env.foot_air_time[:] = air_time      # _update_foot_contact addiert intern noch dt
+        env.gait_phase[:] = phase
+        env.foot_in_contact[:] = False
+        env.foot_air_time[:] = air_time
+        env.foot_step_quality[:] = step_quality
         env._update_foot_contact()
         return float(env._reward_feet_air_time()[0]), int(env.foot_in_contact[0].sum())
 
-    ok = True
-    if settle_until(2):
-        # langer Schritt: air > target → positiver Bonus, beide Füße landen → 2·(air − target)
-        rew_long, n = land_with(fwd, 0.5 - env.dt)
-        print(f"  langer Schritt (air≈0.5, target={target}): raw={rew_long:.4f} (>0), in_contact={n}")
-        ok &= rew_long > 0 and n == 2
-        # kurzer Schritt: air < target → Malus
-        rew_short, _ = land_with(fwd, 0.1 - env.dt)
-        print(f"  kurzer Schritt (air≈0.1):                  raw={rew_short:.4f} (<0)")
-        ok &= rew_short < 0
-        # länger ist besser (monoton in der Luftzeit)
-        print(f"  Monotonie: lang {rew_long:.4f} > kurz {rew_short:.4f}")
-        ok &= rew_long > rew_short
-        # cmd=0 (Stehen) → kein Reward
-        rew0, _ = land_with(torch.zeros(3, device=gs.device), 0.5 - env.dt)
-        print(f"  cmd=0 (Stehen):                            raw={rew0:.4f} (erwartet 0)")
-        ok &= rew0 == 0.0
-    else:
-        print("  HINWEIS: kein Frame mit beiden Füßen in Kontakt — Test übersprungen.")
+    # On-beat bei φ=0.05 (Doppelstütz-Fenster), swing_time≈0.32 s
+    rew_good, n = land_with(fwd, swing - env.dt, phase=0.05, step_quality=1.0)
+    rew_short, _ = land_with(fwd, 0.05, phase=0.05, step_quality=1.0)
+    rew_offbeat, _ = land_with(fwd, swing - env.dt, phase=0.75, step_quality=1.0)
+    rew0, _ = land_with(torch.zeros(3, device=gs.device), swing - env.dt, phase=0.05, step_quality=1.0)
 
-    print(f"  {'PASS' if ok else 'FAIL'}: Bonus = air_time − target beim Aufsetzen, cmd-gated.")
+    print(f"  on-beat, air≈swing ({swing:.2f}s): raw={rew_good:.4f} (>0)")
+    print(f"  on-beat, kurze Luft:              raw={rew_short:.4f} (< good)")
+    print(f"  off-beat:                          raw={rew_offbeat:.4f} (=0)")
+    print(f"  cmd=0:                             raw={rew0:.4f} (=0)")
+
+    ok = rew_good > rew_short > 0 and rew_offbeat == 0.0 and rew0 == 0.0
+    print(f"  {'PASS' if ok else 'FAIL'}: On-Beat-Gating + Gauß-Luftzeit.")
     return ok
 
 

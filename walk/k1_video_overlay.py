@@ -1,4 +1,4 @@
-"""Gemeinsames HUD + Command-Pfeil für Hero-Test und Trainings-Rollout-Videos."""
+"""Gemeinsames HUD + Command-Pfeile für Hero-Test und Trainings-Rollout-Videos."""
 
 from __future__ import annotations
 
@@ -8,18 +8,13 @@ import numpy as np
 import torch
 from genesis.utils.geom import inv_quat, transform_by_quat
 
-
-def draw_hud(rgb: np.ndarray, cmd_vx: float, cmd_vy: float, speed: float) -> np.ndarray:
-    """Command-Geschwindigkeit als Text (Richtung = 3D-Pfeil über dem Kopf)."""
-    lines = [
-        f"cmd speed: {speed:0.2f} m/s",
-        f"cmd vx/vy: {cmd_vx:+0.2f} / {cmd_vy:+0.2f} m/s",
-    ]
-    for i, s in enumerate(lines):
-        org = (14, 30 + 28 * i)
-        cv2.putText(rgb, s, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(rgb, s, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 255, 60), 1, cv2.LINE_AA)
-    return rgb
+# Per-env colors (BGR for OpenCV) — must stay in sync with k1_hero_ghost.ENV_GHOST_COLORS
+ENV_COLORS_BGR = [
+    (60,  255,  60),   # env 0: green
+    (  0, 140, 255),   # env 1: orange
+    (220, 210,   0),   # env 2: cyan
+    (220,   0, 200),   # env 3: purple
+]
 
 
 def project_to_pixels(world_pts: np.ndarray, cam) -> tuple[np.ndarray, np.ndarray]:
@@ -38,15 +33,44 @@ def project_to_pixels(world_pts: np.ndarray, cam) -> tuple[np.ndarray, np.ndarra
     return uv, z
 
 
-def draw_command_arrow(rgb: np.ndarray, env, cmd_unit_world: torch.Tensor, speed: float) -> None:
-    """2D-Projektion eines horizontalen Command-Pfeils über dem Kopf."""
+def _cmd_info_for_env(env, env_idx: int) -> tuple[torch.Tensor, float, float, float]:
+    """Command direction in world frame + scalars for one env."""
+    heading_quat = inv_quat(env.inv_heading_quat[env_idx : env_idx + 1])
+    cmd_vx = float(env.commands[env_idx, 0])
+    cmd_vy = float(env.commands[env_idx, 1])
+    speed = float(torch.norm(env.commands[env_idx, :2]).item())
+    cmd_dir = torch.tensor([cmd_vx, cmd_vy, 0.0], dtype=gs.tc_float, device=env.device)
+    unit = transform_by_quat((cmd_dir / max(speed, 1e-6)).unsqueeze(0), heading_quat)[0]
+    return unit, cmd_vx, cmd_vy, speed
+
+
+def draw_env_markers(
+    rgb: np.ndarray,
+    env,
+    env_idx: int,
+    cmd_unit_world: torch.Tensor,
+    speed: float,
+    color_bgr: tuple[int, int, int],
+) -> None:
+    """Draw a colored halo ring around the robot body + a command arrow above it."""
+    base = env.base_pos[env_idx].detach().cpu().numpy()
+
+    # ── halo ring at torso height ─────────────────────────────────────────────
+    torso = base + np.array([0.0, 0.0, 0.85])
+    uv_t, z_t = project_to_pixels(np.array([torso]), env.cam)
+    if z_t[0] > 0:
+        cx = int(round(uv_t[0, 0]))
+        cy = int(round(uv_t[0, 1]))
+        cv2.circle(rgb, (cx, cy), 28, (0, 0, 0), 6, cv2.LINE_AA)
+        cv2.circle(rgb, (cx, cy), 28, color_bgr, 3, cv2.LINE_AA)
+
+    # ── command arrow ─────────────────────────────────────────────────────────
     horiz = cmd_unit_world.clone()
     horiz[2] = 0.0
     n = torch.norm(horiz).clamp(min=1e-6)
     horiz = horiz / n
-    length = 0.35 + 0.55 * speed
-    base = env.base_pos[0].detach().cpu().numpy()
-    p0 = base + np.array([0.0, 0.0, 0.65])
+    length = 0.30 + 0.50 * speed
+    p0 = base + np.array([0.0, 0.0, 0.60])
     p1 = p0 + horiz.detach().cpu().numpy() * length
 
     uv, z = project_to_pixels(np.stack([p0, p1]), env.cam)
@@ -55,26 +79,41 @@ def draw_command_arrow(rgb: np.ndarray, env, cmd_unit_world: torch.Tensor, speed
     a = (int(round(uv[0, 0])), int(round(uv[0, 1])))
     b = (int(round(uv[1, 0])), int(round(uv[1, 1])))
     cv2.arrowedLine(rgb, a, b, (0, 0, 0), 7, cv2.LINE_AA, tipLength=0.3)
-    cv2.arrowedLine(rgb, a, b, (60, 255, 60), 4, cv2.LINE_AA, tipLength=0.3)
+    cv2.arrowedLine(rgb, a, b, color_bgr, 4, cv2.LINE_AA, tipLength=0.3)
 
 
-def cmd_overlay_from_env(env) -> tuple[torch.Tensor, float, float, float]:
-    """Command-Richtung (Welt) + vx/vy/speed aus env.commands (Heading-Frame)."""
-    heading_quat = inv_quat(env.inv_heading_quat)
-    cmd_vx = float(env.commands[0, 0])
-    cmd_vy = float(env.commands[0, 1])
-    speed = float(torch.norm(env.commands[0, :2]).item())
-    cmd_dir = torch.tensor([cmd_vx, cmd_vy, 0.0], dtype=gs.tc_float, device=env.device)
-    unit = transform_by_quat((cmd_dir / max(speed, 1e-6)).unsqueeze(0), heading_quat)[0]
-    return unit, cmd_vx, cmd_vy, speed
+def draw_all_hud(rgb: np.ndarray, env_infos: list[tuple[float, float, float, tuple]]) -> np.ndarray:
+    """Top-left HUD: one compact line per env with per-env color.
+
+    env_infos: list of (cmd_vx, cmd_vy, speed, color_bgr) per env.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.45
+    thickness = 1
+    line_h = 18
+    x0 = 8
+    y0 = 18
+    for i, (vx, vy, spd, color) in enumerate(env_infos):
+        text = f"E{i}: spd={spd:.2f}  vx={vx:+.2f}  vy={vy:+.2f}"
+        org = (x0, y0 + i * line_h)
+        cv2.putText(rgb, text, org, font, scale, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(rgb, text, org, font, scale, color, thickness, cv2.LINE_AA)
+    return rgb
 
 
 def render_annotated_frame(env, *, force_render: bool = False) -> np.ndarray:
-    """Genesis-Render + Command-Pfeil + HUD (Hero + Trainings-Videos)."""
+    """Genesis-Render + per-env Command-Pfeile + HUD."""
     assert env.cam is not None
     out = env.cam.render(force_render=force_render)
     rgb = out[0] if isinstance(out, (tuple, list)) else out
     rgb = np.ascontiguousarray(np.asarray(rgb)[..., :3]).astype(np.uint8)
-    unit, cmd_vx, cmd_vy, speed = cmd_overlay_from_env(env)
-    draw_command_arrow(rgb, env, unit, speed)
-    return draw_hud(rgb, cmd_vx, cmd_vy, speed)
+
+    n = env.num_envs
+    env_infos: list[tuple[float, float, float, tuple]] = []
+    for i in range(n):
+        color = ENV_COLORS_BGR[i % len(ENV_COLORS_BGR)]
+        unit, vx, vy, spd = _cmd_info_for_env(env, i)
+        draw_env_markers(rgb, env, i, unit, spd, color)
+        env_infos.append((vx, vy, spd, color))
+
+    return draw_all_hud(rgb, env_infos)
