@@ -222,8 +222,6 @@ def main() -> None:
             train_cfg_yaml,
             run_name,
             wandb_project=wandb_project,
-            wandb_group=args.study_name,
-            wandb_tags=["optuna", f"trial-{trial.number:04d}"],
             logger_class="WandbLogWriter",
         )
         train_cfg["save_interval"] = trial_cfg.get("save_interval", 10000)

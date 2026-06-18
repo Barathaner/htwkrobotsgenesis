@@ -126,7 +126,8 @@ class HeroGhost:
             self.root_quat[t].unsqueeze(0),
         )[0]
 
-        qpos = torch.cat([ghost_pos, ghost_quat, self.dof_full[t]]).unsqueeze(0)
+        n = env.num_envs
+        qpos = torch.cat([ghost_pos, ghost_quat, self.dof_full[t]]).unsqueeze(0).expand(n, -1).contiguous()
         self.entity.set_qpos(qpos, zero_velocity=False, skip_forward=False)
 
         wlv = transform_by_quat(
@@ -137,7 +138,7 @@ class HeroGhost:
             self.root_ang_vel_body[t].unsqueeze(0),
             ghost_quat.unsqueeze(0),
         )[0]
-        vel_full = torch.cat([wlv, ang_world, self.dof_vel_full[t]]).unsqueeze(0)
+        vel_full = torch.cat([wlv, ang_world, self.dof_vel_full[t]]).unsqueeze(0).expand(n, -1).contiguous()
         try:
             self.entity.set_dofs_velocity(vel_full, skip_forward=False)
         except Exception:

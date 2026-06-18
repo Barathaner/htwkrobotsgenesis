@@ -23,8 +23,8 @@ def eval_raw_means(env, policy, n_steps: int = 1000) -> dict[str, float]:
     """Rollout policy and return mean raw reward per term (scale-independent, ∈[0,1])."""
     names = reward_names(env)
     raw_sums = {n: 0.0 for n in names}
-    obs = env.reset()
     with torch.inference_mode():
+        obs = env.reset()
         for _ in range(n_steps):
             actions = policy(obs)
             obs, _, _, _ = env.step(actions)

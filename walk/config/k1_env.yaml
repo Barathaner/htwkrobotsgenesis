@@ -101,8 +101,12 @@ env_cfg:
     follow: true
     follow_smoothing: 0.9
     hero_ghost: true
-    hero_ghost_color: [0.55, 1.0, 0.55]   # hellgrün
+    hero_ghost_color: [0.45, 0.80, 1.0]    # hellblau
     hero_ghost_opacity: 0.42
+    robot_color: [0.82, 0.10, 0.10]       # Vereinsrot / jersey red
+    robot_roughness: 0.6
+    plane_color: [0.18, 0.52, 0.12]       # Rasengrün / grass green
+    plane_roughness: 0.95
     # Multi-env training video: show N envs in a grid to observe episode variety.
     num_envs: 4
     env_spacing: [3.0, 3.0]        # metres between env centres
@@ -192,7 +196,7 @@ reward_cfg:
     tracking_lin_vel: 2.0   # primär: Command-Geschwindigkeit (EMA-geglättet)
     tracking_ang_vel: 0.75  # 0.5→0.75: yaw-Tracking wichtiger, Hero raw≈0.91 wie lin_vel
     #survival: 1.0
-    style: 2.5              # co-primär mit tracking: perfekter Gang = 1.0
+    style: 2.0              # co-primär mit tracking: perfekter Gang = 1.0
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
     # feet_air_time: Impuls-Reward (nur Touchdown-Frames) → raw_mean immer klein (~0.03–0.08).
@@ -200,12 +204,12 @@ reward_cfg:
     feet_air_time: 4.0       # 1.5→4.0: Hero +0.04/s→~+0.10/s; style deckt Schwung mit ab
     feet_slip: -0.5         # -1.0→-0.35: Hero war -0.44/s (dominierte alle Strafen); σ=1.5 mildert tanh
     leg_symmetry: -0.25      # aktiviert: Hero ~0.10 → ~-0.025/s; sanfter Wechselschritt-Nudge
-    gait_clock: 1.0          # ∈[−1,1]×scale×dt; +1 = beide Füße perfekt mit Uhr, −1 = beide falsch
+    gait_clock: 1.5          # ∈[−1,1]×scale×dt; +1 = beide Füße perfekt mit Uhr, −1 = beide falsch
 
     # ── Regularizer (Hero-Ziel: raw_mean ≈ 0.05–0.12, klein vs. Task) ─────────
-    action_rate: -0.15        # Hero ~0.09
-    dof_vel: -0.1            # Hero ~0.11; style matcht dof_vel ohnehin
-    ang_vel_xy: -0.1         # Hero ~0.11
+    action_rate: -0.1        # Hero ~0.09
+    dof_vel: -0.05            # Hero ~0.11; style matcht dof_vel ohnehin
+    ang_vel_xy: -0.05        # Hero ~0.11
     # ang_vel_z: deaktiviert — redundant zu tracking_ang_vel (EMA)
     orientation: -0.5         # -1.0→-0.5: Hero ~0.03, style deckt Rumpf-Orientierung ab
     base_height: -1.0         # Hocken/Aufbäumen bestrafen; raw ≈0 bei gutem Gehen, steigt bei Sturz

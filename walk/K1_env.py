@@ -69,16 +69,27 @@ class K1Env:
         if record_camera:
             scene_kwargs["vis_options"] = gs.options.VisOptions(rendered_envs_idx=list(range(num_envs)))
         self.scene = gs.Scene(**scene_kwargs)
-        self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+        vcfg_vis = env_cfg.get("video", {})
+        self.scene.add_entity(
+            gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True),
+            surface=gs.surfaces.Default(
+                color=tuple(float(c) for c in vcfg_vis.get("plane_color", [0.18, 0.52, 0.12])),
+                roughness=float(vcfg_vis.get("plane_roughness", 0.95)),
+            ),
+        )
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="models/K1/K1_22dof.urdf",
                 pos=env_cfg["base_init_pos"],
                 quat=env_cfg["base_init_quat"],
-            )
+            ),
+            surface=gs.surfaces.Default(
+                color=tuple(float(c) for c in vcfg_vis.get("robot_color", [0.82, 0.10, 0.10])),
+                roughness=float(vcfg_vis.get("robot_roughness", 0.6)),
+            ),
         )
         self.hero_ghost = None
-        if record_camera and num_envs == 1 and env_cfg.get("video", {}).get("hero_ghost", True):
+        if record_camera and env_cfg.get("video", {}).get("hero_ghost", True):
             from k1_hero_ghost import HeroGhost
 
             self.hero_ghost = HeroGhost(self.scene, env_cfg, reward_cfg)
