@@ -737,10 +737,10 @@ class K1Env:
             else:
                 ep_sum = value[envs_idx].sum() / n_envs.clamp(min=1)
                 per_s = (value[envs_idx] / durations_s).sum() / n_envs.clamp(min=1)
-            # raw episode sum: multiply by (1-style_weight) to get contribution to Mean reward
-            self.extras["episode"][f"rew/{key}"] = ep_sum
-            # per-second rate: used by curriculum advancement check
-            self.extras["episode"][f"rew_rate/{key}"] = per_s
+            # rew_ep_*: raw episode sum (float); × (1−style_weight) = contribution to Mean reward
+            self.extras["episode"][f"rew_ep_{key}"] = ep_sum.item()
+            # rew_*: per-second rate (float) for curriculum and human readability
+            self.extras["episode"][f"rew_{key}"] = per_s.item()
             if envs_idx is None:
                 value.zero_()
             else:

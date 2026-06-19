@@ -156,8 +156,8 @@ env_cfg:
           lin_vel_y_range: [-0.4, 0.4]
           ang_vel_range:   [-0.5, 0.5]
         advance_when:
-          min_iterations: 500
-          tracking_rew_per_sec: 2.0    # ~50% of max (scale=4.0 → max=4.0/s)
+          min_iterations: 2000
+          tracking_rew_per_sec: 2.2    # ~50% of max (scale=4.0 → max=4.0/s)
 
       - name: jog
         style_motion_file: walk/data/motions/k1_jogging_motion.npz
@@ -167,7 +167,7 @@ env_cfg:
           ang_vel_range:   [-0.7, 0.7]
         advance_when:
           min_iterations: 500
-          tracking_rew_per_sec: 2.5    # ~62% of max
+          tracking_rew_per_sec: 2.2    # ~62% of max
 
       - name: all
         style_motion_file: walk/data/motions/k1_jogging_motion.npz
@@ -233,9 +233,9 @@ reward_cfg:
     # ── Task ──────────────────────────────────────────────────────────────────────
     # All functions output [0,1] per step. rew_rate/NAME = fn_avg × scale (the /s metric).
     # With amp.reward_scale=0.1: AMP per step ≈ 0.026, task per step ≈ 0.04–0.08 → balanced.
-    tracking_lin_vel: 4.0   # primär; max rew_rate = 4.0/s at perfect tracking
+    tracking_lin_vel: 2.5   # primär; max rew_rate = 4.0/s at perfect tracking
     tracking_ang_vel: 1.5   # yaw-Tracking; max = 1.5/s
-    survival: 2.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
+    #survival: 2.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
     # feet_air_time: ×2 vs. old 7.0 to compensate for mean() normalisation fix (was sum() → 0–2)

@@ -15,7 +15,6 @@ import torch
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import check_nan
 
-from k1_reward_log import build_step_reward_row, episode_summary, reward_names
 from k1_video_overlay import render_annotated_frame, update_camera_centroid
 
 
@@ -144,33 +143,15 @@ class K1TrainRunner(OnPolicyRunner):
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict.get("infos")
 
-    def _log_video_rollout(
-        self,
-        it: int,
-        step_rows: list[dict[str, float]],
-        summary: dict[str, float],
-        video_path: str,
-    ) -> None:
-        """Video-Rollout getrennt vom PPO-Logging — ein einziger wandb.log @ step=it."""
+    def _log_video_rollout(self, it: int, video_path: str) -> None:
+        """Log video to wandb @ step=it."""
         try:
             import wandb
         except ImportError:
             return
         if wandb.run is None:
             return
-        payload: dict = {
-            "video_rollout/train_iteration": float(it),
-            "video_rollout/video": wandb.Video(video_path, fps=self.video_fps, format="mp4"),
-        }
-        for k, v in summary.items():
-            payload[k] = v
-        if step_rows:
-            columns = ["frame", *step_rows[0].keys()]
-            table = wandb.Table(columns=columns)
-            for t, row in enumerate(step_rows):
-                table.add_data(t, *[row[c] for c in step_rows[0].keys()])
-            payload["video_rollout/step_rewards"] = table
-        wandb.log(payload, step=it)
+        wandb.log({"video_rollout/video": wandb.Video(video_path, fps=self.video_fps, format="mp4")}, step=it)
 
     def _get_video_env(self):
         if self._video_env is None:
@@ -201,24 +182,12 @@ class K1TrainRunner(OnPolicyRunner):
 
         policy = self.get_inference_policy(device=self.device)
         frames: list = []
-        step_rows: list[dict[str, float]] = []
-        names = reward_names(video_env)
-        episode_sums = {n: 0.0 for n in names}
-        raw_sums = {n: 0.0 for n in names}
-        duration_s = self.video_steps / self.video_fps
 
         with torch.inference_mode():
             obs = video_env.reset()
-            for frame_idx in range(self.video_steps):
+            for _ in range(self.video_steps):
                 actions = policy(obs)
                 obs, _, _, _ = video_env.step(actions)
-
-                row = build_step_reward_row(video_env, names)
-                step_rows.append(row)
-                for n in names:
-                    raw_sums[n] += row[f"reward_raw/{n}"]
-                    if n in video_env.reward_scales:
-                        episode_sums[n] += row.get(f"reward_step/{n}", 0.0)
 
                 if video_env.hero_ghost is not None:
                     video_env.hero_ghost.set_frame(video_env)
@@ -236,11 +205,9 @@ class K1TrainRunner(OnPolicyRunner):
             codec="libx264",
             pixelformat="yuv420p",
             macro_block_size=1,
-            output_params=["-crf", "18"],  # high-quality H.264 (lower = better, 18 ≈ visually lossless)
+            output_params=["-crf", "18"],
         )
-        summary = episode_summary(raw_sums, episode_sums, self.video_steps, duration_s)
-
-        self._pending_video_log = (it, step_rows, summary, path)
+        self._pending_video_log = (it, path)
         print(f"Recorded rollout video: {path}")
         return path
 
@@ -248,10 +215,10 @@ class K1TrainRunner(OnPolicyRunner):
         pending = getattr(self, "_pending_video_log", None)
         if pending is None:
             return
-        it, step_rows, summary, path = pending
+        it, path = pending
         self._pending_video_log = None
-        self._log_video_rollout(it, step_rows, summary, path)
-        print(f"  → video_rollout/* logged @ train step {it}")
+        self._log_video_rollout(it, path)
+        print(f"  → video_rollout logged @ train step {it}")
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         if init_at_random_ep_len:
@@ -263,9 +230,11 @@ class K1TrainRunner(OnPolicyRunner):
         amp_obs = obs["amp"].clone()
         self.alg.train_mode()
 
-        # Per-env reward accumulators for exact Mean reward breakdown
+        # Per-env accumulators + deques for exact Mean reward breakdown logged to wandb
         _task_ep_buf = torch.zeros(self.env.num_envs, device=self.device)
         _style_ep_buf = torch.zeros(self.env.num_envs, device=self.device)
+        _task_ep_deque: collections.deque[float] = collections.deque(maxlen=200)
+        _style_ep_deque: collections.deque[float] = collections.deque(maxlen=200)
 
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
@@ -301,19 +270,16 @@ class K1TrainRunner(OnPolicyRunner):
                     style_reward = self.discriminator.predict_reward(amp_obs, next_amp_obs)
                     rewards = (1.0 - self.style_weight) * task_rewards + self.style_weight * style_reward
 
-                    # Accumulate per-env episode totals for reward breakdown
+                    # Accumulate per-env episode totals for exact reward breakdown
                     _task_ep_buf += task_rewards.detach()
                     _style_ep_buf += style_reward.detach()
 
-                    # When episodes end: inject exact weighted breakdown into extras["episode"]
                     done_mask = dones.bool()
                     if done_mask.any():
-                        n_done = done_mask.sum().item()
-                        task_contrib = ((1.0 - self.style_weight) * _task_ep_buf[done_mask]).sum().item() / n_done
-                        style_contrib = (self.style_weight * _style_ep_buf[done_mask]).sum().item() / n_done
-                        extras.setdefault("episode", {})
-                        extras["episode"]["reward/task"] = task_contrib
-                        extras["episode"]["reward/style"] = style_contrib
+                        for v in ((1.0 - self.style_weight) * _task_ep_buf[done_mask]).tolist():
+                            _task_ep_deque.append(v)
+                        for v in (self.style_weight * _style_ep_buf[done_mask]).tolist():
+                            _style_ep_deque.append(v)
                         _task_ep_buf[done_mask] = 0.0
                         _style_ep_buf[done_mask] = 0.0
 
@@ -324,7 +290,7 @@ class K1TrainRunner(OnPolicyRunner):
 
                     # Collect per-episode tracking metric for curriculum advancement
                     if self.env.curriculum_active:
-                        val = extras.get("episode", {}).get("rew_rate/tracking_lin_vel")
+                        val = extras.get("episode", {}).get("rew_tracking_lin_vel")
                         if val is not None and not math.isnan(float(val)):
                             _curr_track.append(float(val))
 
@@ -361,6 +327,11 @@ class K1TrainRunner(OnPolicyRunner):
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+
+            # ── Reward breakdown: task vs AMP style (exact ingredients of Mean reward) ──
+            if _task_ep_deque:
+                loss_dict["reward_task"] = sum(_task_ep_deque) / len(_task_ep_deque)
+                loss_dict["reward_style"] = sum(_style_ep_deque) / len(_style_ep_deque)
 
             # ── Curriculum advancement check ──────────────────────────────────
             if self.env.curriculum_active and not self.env.curriculum_at_final_phase:

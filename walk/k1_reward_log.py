@@ -37,15 +37,22 @@ def prefix_row(row: dict[str, float], prefix: str) -> dict[str, float]:
 
 
 def episode_summary(
-    raw_sums: dict[str, float],
     episode_sums: dict[str, float],
-    n_steps: int,
-    duration_s: float,
-    prefix: str = "video_rollout/episode",
+    style_ep_sum: float,
+    style_weight: float,
 ) -> dict[str, float]:
-    summary = {f"{prefix}/return_total": sum(episode_sums.values())}
+    """Clean reward breakdown matching the train logging structure.
+
+    Returns keys ready to be prefixed with 'video_rollout/' before wandb.log:
+      reward/task          = (1−sw) × Σ task terms   ← comparable to Loss/reward_task
+      reward/style         = sw × disc episode sum    ← comparable to Loss/reward_style
+      reward_ingredients/* = per-term task episode sums (before style_weight scaling)
+    """
+    task_total = sum(episode_sums.values())
+    out: dict[str, float] = {
+        "reward/task": (1.0 - style_weight) * task_total,
+        "reward/style": style_weight * style_ep_sum,
+    }
     for n, s in episode_sums.items():
-        summary[f"{prefix}/rew_{n}"] = s / duration_s
-    for n, s in raw_sums.items():
-        summary[f"{prefix}/raw_mean_{n}"] = s / n_steps
-    return summary
+        out[f"reward_ingredients/{n}"] = s
+    return out
