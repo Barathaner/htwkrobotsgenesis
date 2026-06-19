@@ -18,7 +18,7 @@ trial:
   save_interval: 10000   # effectively no checkpoints during tuning
   wandb_project: k1-optuna-tune
   # Two Genesis scenes in one process is unsupported — keep video disabled for Optuna trials.
-  enable_video: true
+  enable_video: false
 
 # Scales listed here are NOT tuned (baseline from k1_env.yaml kept).
 fixed_scales: []
