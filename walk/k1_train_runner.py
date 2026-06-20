@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import collections
 import copy
-import math
 import os
 import time
 from collections.abc import Callable
@@ -243,15 +242,22 @@ class K1TrainRunner(OnPolicyRunner):
         self.logger.init_logging_writer()
         self._pending_video_log = None
 
-        # ── Curriculum setup ──────────────────────────────────────────────────
-        curr_cfg = getattr(self.env, "env_cfg", {}).get("curriculum", {})
-        eval_window = curr_cfg.get("eval_window", 150)
-        _curr_track: collections.deque[float] = collections.deque(maxlen=eval_window)
-        _phase_start_it = self.current_learning_iteration
+        # ── Style weight linear warmup ────────────────────────────────────────
+        _sw_target = self.cfg.get("style_weight", 0.5)
+        _sw_start = self.cfg.get("style_warmup_start", 0)
+        _sw_duration = max(1, self.cfg.get("style_warmup_duration", 1))
 
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
+            # Linear style weight warmup: 0 before _sw_start, ramp to target, then flat
+            if it < _sw_start:
+                self.style_weight = 0.0
+            elif it < _sw_start + _sw_duration:
+                self.style_weight = _sw_target * (it - _sw_start) / _sw_duration
+            else:
+                self.style_weight = _sw_target
+
             start = time.time()
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
@@ -287,12 +293,6 @@ class K1TrainRunner(OnPolicyRunner):
                     self.alg.process_amp_step(next_amp_obs)
                     self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards=None)
                     amp_obs = next_amp_obs
-
-                    # Collect per-episode tracking metric for curriculum advancement
-                    if self.env.curriculum_active:
-                        val = extras.get("episode", {}).get("rew_tracking_lin_vel")
-                        if val is not None and not math.isnan(float(val)):
-                            _curr_track.append(float(val))
 
                 stop = time.time()
                 collect_time = stop - start
@@ -333,30 +333,7 @@ class K1TrainRunner(OnPolicyRunner):
                 loss_dict["reward_task"] = sum(_task_ep_deque) / len(_task_ep_deque)
                 loss_dict["reward_style"] = sum(_style_ep_deque) / len(_style_ep_deque)
 
-            # ── Curriculum advancement check ──────────────────────────────────
-            if self.env.curriculum_active and not self.env.curriculum_at_final_phase:
-                phase_cfg = self.env.curriculum_phase_cfg or {}
-                adv = phase_cfg.get("advance_when", {})
-                if adv:
-                    mean_track = sum(_curr_track) / len(_curr_track) if _curr_track else 0.0
-                    min_its = adv.get("min_iterations", 0)
-                    threshold = adv.get("tracking_rew_per_sec", float("inf"))
-                    if (it - _phase_start_it >= min_its
-                            and len(_curr_track) >= min(eval_window, 30)
-                            and mean_track >= threshold):
-                        new_phase = self.env.advance_curriculum_phase()
-                        _phase_start_it = it
-                        _curr_track.clear()
-                        msg = (f"[curriculum] → '{new_phase}' at it={it}  "
-                               f"mean_tracking={mean_track:.1f}/s")
-                        print(msg)
-                        loss_dict["curriculum/phase_idx"] = float(self.env._curriculum_phase_idx)
-
-            # Log curriculum phase name and tracking metric
-            if self.env.curriculum_active:
-                loss_dict["curriculum/phase_idx"] = float(self.env._curriculum_phase_idx)
-                if _curr_track:
-                    loss_dict["curriculum/tracking_rew_per_sec"] = sum(_curr_track) / len(_curr_track)
+            loss_dict["style_weight"] = self.style_weight
 
             record_video = (
                 self.enable_video

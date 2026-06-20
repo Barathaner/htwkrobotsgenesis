@@ -139,43 +139,8 @@ env_cfg:
     randomize_motor_strength: true
     motor_strength_range: [0.8, 1.2]  # multiplicative scale on kp & kd
 
-  # ── Curriculum learning ─────────────────────────────────────────────────────
-  # Phases advance when advance_when.min_iterations have passed AND the rolling
-  # mean of rew_rate/tracking_lin_vel (per second) crosses advance_when.tracking_rew_per_sec.
-  # rew_rate = fn_avg × scale  (dt cancels). With scale=4.0: perfect tracking = 4.0/s.
-  # The final phase has no advance_when → stays there.
   curriculum:
-    enabled: true
-    eval_window: 150   # episodes to average for the advancement check
-
-    phases:
-      - name: slow_walk
-        style_motion_file: walk/data/motions/slow.npz
-        command_ranges:
-          lin_vel_x_range: [-0.2, 0.8]
-          lin_vel_y_range: [-0.4, 0.4]
-          ang_vel_range:   [-0.5, 0.5]
-        advance_when:
-          min_iterations: 2000
-          tracking_rew_per_sec: 2.2    # ~50% of max (scale=4.0 → max=4.0/s)
-
-      - name: jog
-        style_motion_file: walk/data/motions/k1_jogging_motion.npz
-        command_ranges:
-          lin_vel_x_range: [-0.4, 1.6]
-          lin_vel_y_range: [-0.6, 0.6]
-          ang_vel_range:   [-0.7, 0.7]
-        advance_when:
-          min_iterations: 500
-          tracking_rew_per_sec: 2.2    # ~62% of max
-
-      - name: all
-        style_motion_file: walk/data/motions/k1_jogging_motion.npz
-        command_ranges:
-          lin_vel_x_range: [-0.8, 2.0]
-          lin_vel_y_range: [-0.8, 1.0]
-          ang_vel_range:   [-0.8, 0.8]
-        # no advance_when → final phase
+    enabled: false
 
 obs_cfg:
   obs_scales:
@@ -208,7 +173,7 @@ reward_cfg:
   leg_symmetry_flight_allow_s: 0.20  # [s] erlaubte Flugphase je Schritt (Lauf/Jog hat natürliche Flugphasen ~0.1–0.2s); nur Überdauer bestraft
 
   # style (feature-matching Style-Reward gegen eine NPZ-Referenzmotion, siehe K1_env._reward_style)
-  style_motion_file: walk/data/motions/k1_jogging_motion.npz  # relativ zur Repo-Root
+  style_motion_file: walk/data/motions/slow.npz  # relativ zur Repo-Root
   style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); feature-distance fallback (non-AMP path)
 
   # Gebundene Strafterme: jeder gibt tanh(quantity / σ) ∈ [0,1) zurück (0 = sauber, →1 = starke
@@ -233,31 +198,31 @@ reward_cfg:
     # ── Task ──────────────────────────────────────────────────────────────────────
     # All functions output [0,1] per step. rew_rate/NAME = fn_avg × scale (the /s metric).
     # With amp.reward_scale=0.1: AMP per step ≈ 0.026, task per step ≈ 0.04–0.08 → balanced.
-    tracking_lin_vel: 2.5   # primär; max rew_rate = 4.0/s at perfect tracking
-    tracking_ang_vel: 1.5   # yaw-Tracking; max = 1.5/s
+    tracking_lin_vel: 2.05013524950466
+    tracking_ang_vel: 1.3024718326485832
     #survival: 2.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
     # feet_air_time: ×2 vs. old 7.0 to compensate for mean() normalisation fix (was sum() → 0–2)
-    feet_air_time: 14.0      # event reward; mean() per step ∈ [0, 0.5] → max 0.14/step
-    feet_slip: -0.5          # σ=1.5; mild at normal slip levels
-    #leg_symmetry: -0.25
-    gait_phase: -0.8         # Off-Beat penalty ∈ [0,1]; -0.8 gives max -0.016/step
-    #pose_symmetry: -0.5
+    feet_air_time: 7.648323784933377
+    feet_slip: -0.5245741022950857
+    leg_symmetry: -0.25
+    gait_phase: -0.8327349383363509
+    pose_symmetry: -0.5
 
     # ── Regularizer ──────────────────────────────────────────────────────────────
-    action_rate: -0.15       # smoother actions
+    action_rate: -0.4
     #dof_vel: -0.05
-    ang_vel_xy: -0.1         # roll/pitch rate damping
+    ang_vel_xy: -0.049734938378067084
     #orientation: -0.5
-    base_height: -1.0        # crouching/falling penalty; ≈0 when upright
-    lin_vel_z: -0.3          # bounce damping; was -0.5
+    base_height: -0.735161857480981
+    lin_vel_z: -0.1284855233447638
 
 command_cfg:
   num_commands: 3
-  lin_vel_x_range: [-0.8, 2.0]   # negative: occasional backward walking
-  lin_vel_y_range: [-0.8, 1.0]   # lateral stepping
-  ang_vel_range: [-0.8, 0.8]     # turning
+  lin_vel_x_range: [-0.2, 1.0]
+  lin_vel_y_range: [-0.4, 0.5]
+  ang_vel_range: [-0.5, 0.5]
 
 # PPO / rsl-rl — obs_dim & num_actions kommen automatisch aus K1Env
 train_cfg:
@@ -297,14 +262,16 @@ train_cfg:
   # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
   # style_weight: fraction of the total reward that comes from the discriminator.
   # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
-  style_weight: 0.5
+  style_weight: 0.5              # target weight after warmup
+  style_warmup_start: 500        # iterations before style weight begins ramping
+  style_warmup_duration: 200     # iterations to ramp from 0 → style_weight
 
   amp:
     # Discriminator hidden layer sizes (amp_rsl_rl.networks.Discriminator)
     hidden_dims: [256, 128]
     # Reward scale applied to discriminator output before mixing.
     # softplus(logit) ≈ 0.26/step early training → ×0.1 = 0.026/step ≈ task magnitude.
-    reward_scale: 0.1
+    reward_scale: 0.15
     # Loss type: BCEWithLogits (standard) or Wasserstein (experimental)
     loss_type: BCEWithLogits
     # Paths to .npz motion reference files (relative to repo root).

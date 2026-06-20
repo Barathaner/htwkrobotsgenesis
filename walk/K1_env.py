@@ -502,8 +502,15 @@ class K1Env:
             self.reward_cfg["style_motion_file"] = style_file
             self._setup_style_reference()
 
+        # ── style weight override ─────────────────────────────────────────────
+        if "style_weight" in phase:
+            self.curriculum_style_weight: float | None = float(phase["style_weight"])
+        else:
+            self.curriculum_style_weight = None
+
         print(f"[curriculum] phase {phase_idx}: '{phase['name']}' | "
               f"vx={self.command_cfg['lin_vel_x_range']}  "
+              f"style_weight={self.curriculum_style_weight}  "
               f"style={os.path.basename(phase.get('style_motion_file', '?'))}")
 
     def advance_curriculum_phase(self) -> str:
