@@ -27,15 +27,17 @@ search_space:
   # ── Task (positiv) — Baseline in k1_env.yaml in Klammern ─────────────────
   tracking_lin_vel: {low: 1.0,  high: 8.0,  log: true}   # (4.0)  primär
   tracking_ang_vel: {low: 0.3,  high: 3.0,  log: true}   # (1.5)
-  survival:         {low: 0.5,  high: 5.0,  log: true}   # (2.0)  alive anchor
+  #survival:         {low: 0.5,  high: 5.0,  log: true}   # (2.0)  alive anchor
   feet_air_time:    {low: 4.0,  high: 30.0, log: true}   # (14.0) event; mean() ∈ [0,0.5]/step
 
   # ── Kontakt / Schritt ─────────────────────────────────────────────────────
-  feet_slip:        {low: -1.0,  high: -0.05}             # (-0.5)
-  gait_phase:       {low: -2.0,  high: -0.1}              # (-0.8)
+  feet_slip:        {low: -4.0,  high: -0.05}             # (-0.5)
+  gait_phase:       {low: -3.0,  high: -0.1}              # (-0.8)
+  leg_symmetry:     {low: -3.0,  high: -0.05}             # (-0.25)
+  pose_symmetry:    {low: -3.0,  high: -0.05}             # (-0.5)
 
   # ── Regularizer ──────────────────────────────────────────────────────────
-  action_rate:      {low: -0.5,  high: -0.02}             # (-0.15)
+  action_rate:      {low: -0.8,  high: -0.02}             # (-0.15)
   ang_vel_xy:       {low: -0.5,  high: -0.02}             # (-0.1)
   base_height:      {low: -3.0,  high: -0.1}              # (-1.0)
   lin_vel_z:        {low: -1.0,  high: -0.05}             # (-0.3)
@@ -53,5 +55,7 @@ objective:
     feet_air_time: 1.0
     feet_slip: -0.3
     gait_phase: -0.3
+    leg_symmetry: -0.3
+    pose_symmetry: -0.2
     base_height: -0.2
     lin_vel_z: -0.1

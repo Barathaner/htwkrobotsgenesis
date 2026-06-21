@@ -198,25 +198,25 @@ reward_cfg:
     # ── Task ──────────────────────────────────────────────────────────────────────
     # All functions output [0,1] per step. rew_rate/NAME = fn_avg × scale (the /s metric).
     # With amp.reward_scale=0.1: AMP per step ≈ 0.026, task per step ≈ 0.04–0.08 → balanced.
-    tracking_lin_vel: 2.05013524950466
-    tracking_ang_vel: 1.3024718326485832
+    tracking_lin_vel: 2.6
+    tracking_ang_vel: 0.4
     #survival: 2.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
     # feet_air_time: ×2 vs. old 7.0 to compensate for mean() normalisation fix (was sum() → 0–2)
-    feet_air_time: 7.648323784933377
-    feet_slip: -0.5245741022950857
-    leg_symmetry: -0.25
-    gait_phase: -0.8327349383363509
-    pose_symmetry: -0.5
+    feet_air_time: 15.848510755474946
+    feet_slip: -3.8641653415948873
+    leg_symmetry: -1.0
+    gait_phase: -2.249538053359951
+    pose_symmetry: -1.5
 
     # ── Regularizer ──────────────────────────────────────────────────────────────
-    action_rate: -0.4
+    action_rate: -0.5568653606502595
     #dof_vel: -0.05
-    ang_vel_xy: -0.049734938378067084
+    ang_vel_xy: -0.2503673498346508
     #orientation: -0.5
-    base_height: -0.735161857480981
-    lin_vel_z: -0.1284855233447638
+    base_height: -1.4145401899044892
+    lin_vel_z: -0.8243882672507493
 
 command_cfg:
   num_commands: 3
@@ -262,7 +262,7 @@ train_cfg:
   # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
   # style_weight: fraction of the total reward that comes from the discriminator.
   # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
-  style_weight: 0.5              # target weight after warmup
+  style_weight: 0.66              # target weight after warmup
   style_warmup_start: 500        # iterations before style weight begins ramping
   style_warmup_duration: 200     # iterations to ramp from 0 → style_weight
 
@@ -271,7 +271,7 @@ train_cfg:
     hidden_dims: [256, 128]
     # Reward scale applied to discriminator output before mixing.
     # softplus(logit) ≈ 0.26/step early training → ×0.1 = 0.026/step ≈ task magnitude.
-    reward_scale: 0.15
+    reward_scale: 0.3
     # Loss type: BCEWithLogits (standard) or Wasserstein (experimental)
     loss_type: BCEWithLogits
     # Paths to .npz motion reference files (relative to repo root).
