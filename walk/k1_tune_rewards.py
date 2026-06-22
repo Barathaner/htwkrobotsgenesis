@@ -80,20 +80,57 @@ def apply_amp_params(train_cfg: dict, amp_params: dict[str, float]) -> dict:
     return cfg
 
 
+def sample_curriculum_params(
+    trial,
+    curriculum_search_space: dict[str, dict],
+) -> dict[str, float]:
+    """Sample env_cfg.velocity_curriculum params (expansion aggressiveness) from the search space.
+
+    Supports int knobs via {type: int} (e.g. check_interval); everything else is a float (log
+    optional). Keys map directly onto velocity_curriculum entries in env_cfg.
+    """
+    sampled: dict[str, float] = {}
+    for name, bounds in curriculum_search_space.items():
+        low, high = bounds["low"], bounds["high"]
+        if bounds.get("type") == "int":
+            sampled[name] = trial.suggest_int(f"curr/{name}", int(low), int(high))
+        else:
+            use_log = bool(bounds.get("log", low > 0 and high > 0))
+            sampled[name] = trial.suggest_float(f"curr/{name}", float(low), float(high), log=use_log)
+    return sampled
+
+
+def apply_curriculum_params(env_cfg: dict, curriculum_params: dict[str, float]) -> dict:
+    """Inject sampled velocity-curriculum params into a copy of env_cfg."""
+    cfg = copy.deepcopy(env_cfg)
+    if curriculum_params:
+        vc = cfg.setdefault("velocity_curriculum", {})
+        for key, val in curriculum_params.items():
+            vc[key] = val
+    return cfg
+
+
 def export_best_params(
     study,
     baseline_scales: dict[str, float],
     amp_search_space: dict[str, dict],
     out_path: str,
+    curriculum_search_space: dict[str, dict] | None = None,
 ) -> dict:
     best = study.best_trial
     scales = sample_reward_scales_from_params(best.params, baseline_scales)
     amp_params = {name: best.params[f"amp/{name}"] for name in amp_search_space if f"amp/{name}" in best.params}
+    curriculum_params = {
+        name: best.params[f"curr/{name}"]
+        for name in (curriculum_search_space or {})
+        if f"curr/{name}" in best.params
+    }
     payload = {
         "best_value": best.value,
         "best_trial": best.number,
         "reward_scales": scales,
         "amp_params": amp_params,
+        "curriculum_params": curriculum_params,
     }
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
@@ -117,6 +154,7 @@ def print_top_trials(
     baseline_scales: dict[str, float],
     amp_search_space: dict[str, dict],
     n: int = 5,
+    curriculum_search_space: dict[str, dict] | None = None,
 ) -> None:
     trials = sorted(study.trials, key=lambda t: t.value if t.value is not None else float("-inf"), reverse=True)
     print(f"\nTop {n} trials:")
@@ -125,6 +163,8 @@ def print_top_trials(
             continue
         scales = sample_reward_scales_from_params(t.params, baseline_scales)
         amp_params = {name: t.params[f"amp/{name}"] for name in amp_search_space if f"amp/{name}" in t.params}
+        curr_params = {name: t.params[f"curr/{name}"]
+                       for name in (curriculum_search_space or {}) if f"curr/{name}" in t.params}
         vc_level = t.user_attrs.get("vc_level")
         vc_str = f"  vc_level={vc_level:.2f}" if vc_level is not None else ""
         print(f"  trial {t.number:3d}  score={t.value:.4f}{vc_str}")
@@ -132,6 +172,8 @@ def print_top_trials(
             print(f"    scale/{k:20s} {v:+.4f}")
         for k, v in sorted(amp_params.items()):
             print(f"    amp/{k:20s} {v:+.4f}")
+        for k, v in sorted(curr_params.items()):
+            print(f"    curr/{k:20s} {v:+.4f}")
 
 
 def trial_run_name(study_name: str, trial_number: int) -> str:
@@ -168,6 +210,7 @@ def main() -> None:
     trial_cfg = optuna_cfg["trial"]
     search_space = optuna_cfg["search_space"]
     amp_search_space = optuna_cfg.get("amp_search_space", {})
+    curriculum_search_space = optuna_cfg.get("curriculum_search_space", {})
     objective_weights = optuna_cfg["objective"]["weights"]
     fixed_scales = optuna_cfg.get("fixed_scales", [])
 
@@ -186,6 +229,7 @@ def main() -> None:
         trial_cfg = optuna_cfg["trial"]
         search_space = optuna_cfg["search_space"]
         amp_search_space = optuna_cfg.get("amp_search_space", {})
+        curriculum_search_space = optuna_cfg.get("curriculum_search_space", {})
         objective_weights = optuna_cfg["objective"]["weights"]
         fixed_scales = optuna_cfg.get("fixed_scales", [])
 
@@ -250,7 +294,9 @@ def main() -> None:
     def objective(trial: optuna.Trial) -> float:
         scales = sample_reward_scales(trial, baseline_scales, search_space, fixed_scales)
         amp_params = sample_amp_params(trial, amp_search_space)
+        curriculum_params = sample_curriculum_params(trial, curriculum_search_space)
         trial_reward_cfg = apply_reward_scales(reward_cfg, scales)
+        trial_env_cfg = apply_curriculum_params(env_cfg, curriculum_params)
         run_name = trial_run_name(args.study_name, trial.number)
 
         log_dir = os.path.join("logs", "optuna", args.study_name, f"trial_{trial.number:04d}")
@@ -270,11 +316,11 @@ def main() -> None:
         enable_video = bool(trial_cfg.get("enable_video", False))
 
         save_session_cfgs(
-            log_dir, env_cfg, obs_cfg, trial_reward_cfg, command_cfg, train_cfg, video_opts
+            log_dir, trial_env_cfg, obs_cfg, trial_reward_cfg, command_cfg, train_cfg, video_opts
         )
 
         env = create_k1_env(
-            env_cfg,
+            trial_env_cfg,
             obs_cfg,
             trial_reward_cfg,
             command_cfg,
@@ -295,7 +341,7 @@ def main() -> None:
             env,
             train_cfg,
             log_dir,
-            (env_cfg, obs_cfg, trial_reward_cfg, command_cfg),
+            (trial_env_cfg, obs_cfg, trial_reward_cfg, command_cfg),
             video_opts,
             enable_video=enable_video,
             on_iteration_end=on_iteration_end,
@@ -304,11 +350,12 @@ def main() -> None:
         def _fmt(v):
             return f"{v:.3f}" if isinstance(v, (int, float)) else str(v)
 
+        curr_str = "  ".join(f"{k}={_fmt(v)}" for k, v in curriculum_params.items())
         try:
             print(
                 f"\n[optuna] trial {trial.number}: style_weight={_fmt(amp_params.get('style_weight'))}  "
                 f"amp_reward_scale={_fmt(amp_params.get('amp_reward_scale'))}  "
-                f"wandb='{run_name}'"
+                f"{curr_str}  wandb='{run_name}'"
             )
             try:
                 run_training(runner, max_iterations)
@@ -330,6 +377,7 @@ def main() -> None:
             trial.set_user_attr("raw_means", raw_means)
             trial.set_user_attr("reward_scales", scales)
             trial.set_user_attr("amp_params", amp_params)
+            trial.set_user_attr("curriculum_params", curriculum_params)
             trial.set_user_attr("wandb_run_name", run_name)
             # How far the velocity curriculum expanded (1.0 = full range). Low values explain a
             # low score: the policy never earned the harder commands it was then evaluated on.
@@ -347,17 +395,21 @@ def main() -> None:
     )
     if amp_search_space:
         print(f"AMP params in search space: {list(amp_search_space.keys())}")
+    if curriculum_search_space:
+        print(f"Curriculum params in search space: {list(curriculum_search_space.keys())}")
     study.optimize(objective, n_trials=args.n_trials)
 
     out_path = os.path.join("logs", "optuna", f"{args.study_name}_best.yaml")
-    best = export_best_params(study, baseline_scales, amp_search_space, out_path)
+    best = export_best_params(study, baseline_scales, amp_search_space, out_path, curriculum_search_space)
     print(f"\nBest trial {study.best_trial.number}: score={study.best_value:.4f}")
     print(f"Best params written to {out_path}")
     for k, v in sorted(best.get("reward_scales", {}).items()):
         print(f"  scale/{k:20s} {v:+.4f}")
     for k, v in sorted(best.get("amp_params", {}).items()):
         print(f"  amp/{k:20s} {v:+.4f}")
-    print_top_trials(study, baseline_scales, amp_search_space)
+    for k, v in sorted(best.get("curriculum_params", {}).items()):
+        print(f"  curr/{k:20s} {v:+.4f}")
+    print_top_trials(study, baseline_scales, amp_search_space, curriculum_search_space=curriculum_search_space)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,15 @@ amp_search_space:
   style_weight:     {low: 0.5,  high: 4.0,  log: true}   # (2.5)  multiplicative style strength
   amp_reward_scale: {low: 0.3,  high: 3.0,  log: true}   # (1.5)  discriminator reward scale
 
+# ── Velocity-curriculum knobs (env_cfg.velocity_curriculum) ─────────────────
+# Controls how aggressively the commanded speed range widens. Since eval is pinned to the FULL
+# range, the objective rewards reaching+mastering full speed within the trial budget: too slow =
+# never trains at full range, too fast = destabilizes. Keys map onto velocity_curriculum entries.
+curriculum_search_space:
+  advance_tracking_frac: {low: 0.55, high: 0.9}              # (0.8)  stricter → slower, cleaner expansion
+  level_step:            {low: 0.02, high: 0.2,  log: true}  # (0.05) bigger → faster expansion
+  check_interval:        {low: 10,   high: 50,   type: int}  # (25)   iters between advance checks
+
 objective:
   weights:
     tracking_lin_vel: 2.5
