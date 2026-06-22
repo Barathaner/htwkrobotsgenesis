@@ -13,6 +13,20 @@ def gs_rand(lower, upper, batch_shape):
     return (upper - lower) * torch.rand(size=(*batch_shape, *lower.shape), dtype=gs.tc_float, device=gs.device) + lower
 
 
+def _heading_frame_vel_xy_np(quat_wxyz: np.ndarray, vel_world: np.ndarray) -> np.ndarray:
+    """Yaw-only rotation of a world-frame linear velocity into the heading frame → [vx, vy].
+
+    NumPy twin of env.base_lin_vel_heading (transform_by_quat with the yaw-only inv_heading_quat);
+    used to build the reference AMP velocity feature from mocap. Matches k1_amp_loader._heading_frame_vel_xy."""
+    q = quat_wxyz.astype(np.float64)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    c, s = np.cos(-yaw), np.sin(-yaw)
+    vx = c * vel_world[:, 0] - s * vel_world[:, 1]
+    vy = s * vel_world[:, 0] + c * vel_world[:, 1]
+    return np.stack([vx, vy], axis=-1).astype(np.float32)
+
+
 class _WandbEnvCfg:
     """Thin wrapper: rsl-rl WandbLogWriter.store_config() requires .to_dict()."""
 
@@ -407,10 +421,17 @@ class K1Env:
         # damit ref dof_pos/dof_vel spaltenweise zu self.dof_pos/self.dof_vel passen.
         ref_jn = [str(n) for n in data["joint_names"]]
         col = [ref_jn.index(n) for n in self.env_cfg["joint_names"]]
+        # Heading-frame (yaw-only) root velocity + yaw rate — same quantities the env exposes live
+        # in _build_amp_obs (base_lin_vel_heading[:2], base_ang_vel.z). Gives the discriminator the
+        # root velocity it needs to score gait speed and bind it to the command channel.
+        ref_vel_heading = _heading_frame_vel_xy_np(data["root_quat"], data["root_lin_vel"])  # (M,2)
+        ref_yaw_rate = data["root_ang_vel_body"][:, 2:3].astype(np.float32)                   # (M,1)
         ref = np.concatenate(
             [
                 data["root_pos"][:, 2:3],          # root height
                 data["projected_gravity"],          # (M,3) Schwerkraft im Body-Frame (Rumpfneigung)
+                ref_vel_heading,                    # (M,2) Heading-Frame Wurzel-Lineargeschw. vx/vy
+                ref_yaw_rate,                       # (M,1) Yaw-Rate (Body-Frame ω_z)
                 data["dof_pos"][:, col],            # (M,16)
                 data["dof_vel"][:, col],            # (M,16) rad/s
                 data["foot_clear"],                 # (M,2) Schwunghöhe je Fuß
@@ -428,6 +449,8 @@ class K1Env:
         w = np.concatenate([
             np.full(1, 0.5, np.float32),    # root_height
             np.full(3, 2.0, np.float32),    # projected_gravity (Rumpf-Orientierung) — hochgewichtet
+            np.full(2, 2.0, np.float32),    # root_lin_vel_xy (Heading-Frame) — hochgewichtet (Gangtempo)
+            np.full(1, 1.0, np.float32),    # root_ang_vel_z (Yaw-Rate)
             np.full(n, 1.0, np.float32),    # dof_pos (Gelenkwinkel) — Hauptfaktor
             np.full(n, 0.25, np.float32),   # dof_vel — runtergewichtet (sonst geschw.-dominiert)
             np.full(2, 2.0, np.float32),    # foot_clear (Füße) — hochgewichtet
@@ -513,17 +536,21 @@ class K1Env:
     def _build_amp_obs(self) -> torch.Tensor:
         """AMP state: normalized motion features + raw velocity commands.
 
-        Motion features (38-dim): [root_height(1), projected_gravity(3), dof_pos(16),
-        dof_vel(16), foot_clear(2)] — normalized with combined stats injected by runner.
-        Commands (3-dim): [lin_vel_x, lin_vel_y, ang_vel_yaw] appended raw so the
-        discriminator can condition its score on what speed was actually commanded.
-        Total: 38 + num_commands dims.
+        Motion features (41-dim): [root_height(1), projected_gravity(3), root_lin_vel_xy(2),
+        root_ang_vel_z(1), dof_pos(16), dof_vel(16), foot_clear(2)] — normalized with combined
+        stats injected by runner. The heading-frame root velocity lets the discriminator see how
+        fast the root is moving (forward speed + yaw rate), which the conditioning binds to.
+        Commands (3-dim): [lin_vel_x, lin_vel_y, ang_vel_yaw] appended raw so the discriminator
+        can condition its score on what speed was actually commanded.
+        Total: 41 + num_commands dims.
         """
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
         foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
         feat = torch.cat([
             self.base_pos[:, 2:3],
             self.projected_gravity,
+            self.base_lin_vel_heading[:, :2],
+            self.base_ang_vel[:, 2:3],
             self.dof_pos,
             self.dof_vel,
             foot_clear,
@@ -1178,7 +1205,9 @@ class K1Env:
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
         foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
         feat = torch.cat(
-            [self.base_pos[:, 2:3], self.projected_gravity, self.dof_pos, self.dof_vel, foot_clear], dim=1
+            [self.base_pos[:, 2:3], self.projected_gravity,
+             self.base_lin_vel_heading[:, :2], self.base_ang_vel[:, 2:3],
+             self.dof_pos, self.dof_vel, foot_clear], dim=1
         )
         feat = (feat - self.style_mean) / self.style_std * self.style_sqrt_w
         min_sq = torch.cdist(feat, self.style_ref_feat).pow(2).min(dim=1).values

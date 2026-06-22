@@ -86,22 +86,43 @@ class K1TrainRunner(OnPolicyRunner):
         motion_paths = amp_cfg.get("motion_paths",
                                    [default_slow] + ([jog_path] if jog_path else []))
 
-        # Per-file command ranges: expert transitions get commands sampled from the
-        # appropriate speed range so the discriminator learns to condition on velocity.
-        # Overlapping ranges: slow covers the full walk command range [-0.2, 1.2];
-        # jog starts at 0.8 so both datasets cover [0.8, 1.2], giving the discriminator
-        # a smooth transition zone instead of a hard cliff at 1.21 m/s.
+        # Command label: each expert transition is labelled with the clip's OWN heading-frame
+        # velocity (computed in K1AMPLoader), so the discriminator learns p_expert(motion | velocity).
+        # cmd_ranges only CLAMP that label to the GLOBAL commandable range (walk ∪ jog) as a safety
+        # bound against finite-difference outliers — NOT the per-style target range, which would
+        # distort the true label (e.g. the jog clip's real ~0.9 m/s is below the jog target's 1.0).
         yaw = cmd_cfg["ang_vel_range"]
-        slow_lo = np.array([cmd_cfg["lin_vel_x_range"][0], cmd_cfg["lin_vel_y_range"][0], yaw[0]], dtype=np.float32)
-        slow_hi = np.array([cmd_cfg["lin_vel_x_range"][1],  cmd_cfg["lin_vel_y_range"][1], yaw[1]], dtype=np.float32)
-        cmd_ranges = [(slow_lo, slow_hi)]
+        x_lo, x_hi = cmd_cfg["lin_vel_x_range"]
+        y_lo, y_hi = cmd_cfg["lin_vel_y_range"]
         if jog_path:
-            jog_lo = np.array([jog_cfg["target_lin_vel_x_range"][0], jog_cfg["target_lin_vel_y_range"][0], yaw[0]], dtype=np.float32)
-            jog_hi = np.array([jog_cfg["target_lin_vel_x_range"][1], jog_cfg["target_lin_vel_y_range"][1], yaw[1]], dtype=np.float32)
-            cmd_ranges.append((jog_lo, jog_hi))
+            x_lo = min(x_lo, jog_cfg["target_lin_vel_x_range"][0]); x_hi = max(x_hi, jog_cfg["target_lin_vel_x_range"][1])
+            y_lo = min(y_lo, jog_cfg["target_lin_vel_y_range"][0]); y_hi = max(y_hi, jog_cfg["target_lin_vel_y_range"][1])
+        glob_lo = np.array([x_lo, y_lo, yaw[0]], dtype=np.float32)
+        glob_hi = np.array([x_hi, y_hi, yaw[1]], dtype=np.float32)
+        cmd_ranges = [(glob_lo, glob_hi)] * len(motion_paths)
 
         joint_names = self.env.env_cfg["joint_names"]
-        amp_data = K1AMPLoader(motion_paths, joint_names, device=self.device, cmd_ranges=cmd_ranges)
+        # Match the env's command-tracking EMA so expert command labels and policy commands
+        # represent the same "mean velocity".
+        ema_window_s = float(getattr(self.env, "tracking_ema_window_s", 0.5))
+        # Time-warp augmentation: synthesize retimed copies of each clip so the discriminator sees
+        # the style across a velocity band instead of one point (~±35–45% stays feasible). The slow
+        # clip (native ~0.09–0.56 m/s) warps UP to meet the jog band's low end (~0.8); the jog clip
+        # (native ~0.96) warps DOWN/UP to span ~0.8–1.27.
+        jog_warps = amp_cfg.get("jog_speed_warps", [1.0])
+        slow_warps = amp_cfg.get("slow_speed_warps", [1.0])
+
+        def _warps_for(p: str) -> list[float]:
+            if jog_path and p == jog_path:
+                return list(jog_warps)
+            if p == default_slow:
+                return list(slow_warps)
+            return [1.0]
+
+        warp_factors = [_warps_for(p) for p in motion_paths]
+        amp_data = K1AMPLoader(motion_paths, joint_names, device=self.device,
+                               cmd_ranges=cmd_ranges, ema_window_s=ema_window_s,
+                               warp_factors=warp_factors)
 
         # Push combined motion normalization stats to the env so _build_amp_obs() uses the
         # same feature space as the expert data (commands are appended raw in both).
