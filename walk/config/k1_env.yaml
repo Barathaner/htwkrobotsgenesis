@@ -142,6 +142,14 @@ env_cfg:
   curriculum:
     enabled: false
 
+  jogging_curriculum:
+    enabled: true
+    start_iter: 2500          # iteration at which the jogging phase triggers
+    ramp_duration: 200        # style_weight re-warmup duration after curriculum switch (not velocity ramp)
+    target_lin_vel_x_range: [1.51, 3.0]
+    target_lin_vel_y_range: [-0.3, 0.3]
+    style_motion_file: walk/data/motions/k1_jogging_motion.npz
+
 obs_cfg:
   obs_scales:
     lin_vel: 2.0
@@ -204,7 +212,7 @@ reward_cfg:
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
     # feet_air_time: ×2 vs. old 7.0 to compensate for mean() normalisation fix (was sum() → 0–2)
-    feet_air_time: 15.848510755474946
+    feet_air_time: 30.848510755474946
     feet_slip: -3.8641653415948873
     leg_symmetry: -1.0
     gait_phase: -2.249538053359951
@@ -220,7 +228,7 @@ reward_cfg:
 
 command_cfg:
   num_commands: 3
-  lin_vel_x_range: [-0.2, 1.0]
+  lin_vel_x_range: [-0.2, 1.5]
   lin_vel_y_range: [-0.4, 0.5]
   ang_vel_range: [-0.5, 0.5]
 
@@ -262,7 +270,7 @@ train_cfg:
   # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
   # style_weight: fraction of the total reward that comes from the discriminator.
   # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
-  style_weight: 0.66              # target weight after warmup
+  style_weight: 0.5              # target weight after warmup
   style_warmup_start: 500        # iterations before style weight begins ramping
   style_warmup_duration: 200     # iterations to ramp from 0 → style_weight
 

@@ -53,6 +53,7 @@ class K1TrainRunner(OnPolicyRunner):
         self.enable_video = enable_video
         self.on_iteration_end = on_iteration_end
         self._video_env = None
+        self._setup_conditioned_amp_data()
 
     def _setup_amp_ppo(self, amp_cfg: dict) -> None:
         """Replace self.alg (PPO) with AMP_PPO, reusing the actor/critic already built."""
@@ -104,6 +105,41 @@ class K1TrainRunner(OnPolicyRunner):
         self.discriminator = discriminator
         print(f"[K1TrainRunner] AMP_PPO active  amp_obs_dim={amp_obs_dim}  "
               f"style_weight={self.style_weight}")
+
+    def _setup_conditioned_amp_data(self) -> None:
+        """Load slow + jog expert pools for speed-conditioned discriminator training.
+
+        A single discriminator is trained with expert data chosen per mini-batch
+        based on the current distribution of commanded speeds: envs above
+        amp_speed_threshold contribute jog expert transitions, envs below contribute
+        slow expert transitions.
+        """
+        from k1_amp_loader import K1AMPLoader
+
+        jog_cfg = self.env.env_cfg.get("jogging_curriculum", {})
+        if not jog_cfg.get("enabled", False):
+            self.amp_slow = None
+            self.amp_jog = None
+            self.opt_disc_cond = None
+            return
+
+        joint_names = self.env.env_cfg["joint_names"]
+        slow_path = self.env.reward_cfg["style_motion_file"]
+        jog_path  = jog_cfg["style_motion_file"]
+
+        self.amp_slow = K1AMPLoader([slow_path], joint_names, device=self.device)
+        self.amp_jog  = K1AMPLoader([jog_path],  joint_names, device=self.device)
+        self.amp_speed_threshold: float = 1.5
+
+        self.opt_disc_cond = torch.optim.Adam(
+            [
+                {"params": self.discriminator.trunk.parameters(),  "weight_decay": 10e-4},
+                {"params": self.discriminator.linear.parameters(), "weight_decay": 10e-2},
+            ],
+            lr=self.alg.learning_rate,
+        )
+        print(f"[cond-amp] speed threshold={self.amp_speed_threshold} m/s  "
+              f"slow={slow_path}  jog={jog_path}")
 
     def get_inference_policy(self, device=None):
         """Return a callable policy for inference (eval mode, deterministic)."""
@@ -169,6 +205,9 @@ class K1TrainRunner(OnPolicyRunner):
                 show_viewer=False,
                 record_camera=True,
             )
+            # If the video env is created after the jogging curriculum already
+            # triggered (lazy init past start_iter), apply it immediately.
+            self._video_env.sync_jogging_curriculum(self.current_learning_iteration)
         return self._video_env
 
     def _record_video(self, it: int) -> str:
@@ -258,6 +297,13 @@ class K1TrainRunner(OnPolicyRunner):
             else:
                 self.style_weight = _sw_target
 
+            # ── Jogging curriculum ────────────────────────────────────────────
+            # Hard-switch command ranges at start_iter (velocity range only; style
+            # conditioning is handled continuously by _setup_conditioned_amp_data).
+            self.env.update_jogging_curriculum(it)
+            if self._video_env is not None:
+                self._video_env.update_jogging_curriculum(it)
+
             start = time.time()
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
@@ -271,7 +317,7 @@ class K1TrainRunner(OnPolicyRunner):
 
                     next_amp_obs = obs["amp"].clone()
 
-                    # Style reward from discriminator, mixed with task reward
+                    # Style reward: single speed-conditioned discriminator
                     task_rewards = rewards.clone()
                     style_reward = self.discriminator.predict_reward(amp_obs, next_amp_obs)
                     rewards = (1.0 - self.style_weight) * task_rewards + self.style_weight * style_reward
@@ -311,6 +357,47 @@ class K1TrainRunner(OnPolicyRunner):
                 mean_kl_divergence,
                 _mean_symmetry_loss,
             ) = self.alg.update()
+
+            # ── Speed-conditioned discriminator training ──────────────────────
+            # Expert data is sampled proportionally: fraction of envs with
+            # cmd_speed > amp_speed_threshold draws from jog NPZ, rest from slow NPZ.
+            if self.amp_slow is not None and self.amp_jog is not None:
+                cmd_speed = torch.norm(self.env.commands[:, :2], dim=1)
+                fast_frac = (cmd_speed > self.amp_speed_threshold).float().mean().item()
+
+                n_mb    = self.alg.num_learning_epochs * self.alg.num_mini_batches
+                mb_size = (self.env.num_envs * self.cfg["num_steps_per_env"]
+                           // self.alg.num_mini_batches)
+                pol_gen = self.alg.amp_storage.feed_forward_generator(
+                    num_mini_batch=n_mb, mini_batch_size=mb_size, allow_replacement=True
+                )
+                for (pol_s, pol_ns) in pol_gen:
+                    pol_s, pol_ns = pol_s.to(self.device), pol_ns.to(self.device)
+
+                    n_fast = max(1, int(mb_size * fast_frac))
+                    n_slow = max(1, mb_size - n_fast)
+                    (slow_s, slow_ns) = next(self.amp_slow.feed_forward_generator(1, n_slow))
+                    (jog_s,  jog_ns)  = next(self.amp_jog.feed_forward_generator(1, n_fast))
+                    exp_s  = torch.cat([slow_s, jog_s],  dim=0).to(self.device)
+                    exp_ns = torch.cat([slow_ns, jog_ns], dim=0).to(self.device)
+
+                    B   = pol_s.size(0)
+                    inp = torch.cat([
+                        torch.cat([pol_s, pol_ns], dim=-1),
+                        torch.cat([exp_s, exp_ns], dim=-1),
+                    ], dim=0)
+                    out = self.discriminator(inp)
+                    pol_d, exp_d = out[:B], out[B:]
+                    amp_loss, gp_loss = self.discriminator.compute_loss(
+                        policy_d=pol_d, expert_d=exp_d,
+                        sample_amp_expert=(exp_s, exp_ns),
+                        sample_amp_policy=(pol_s, pol_ns),
+                    )
+                    self.opt_disc_cond.zero_grad()
+                    (amp_loss + gp_loss).backward()
+                    torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1.0)
+                    self.opt_disc_cond.step()
+                    self.discriminator.update_normalization(exp_s, exp_ns, pol_s, pol_ns)
 
             loss_dict = {
                 "value_function": mean_value_loss,

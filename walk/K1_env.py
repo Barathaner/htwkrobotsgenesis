@@ -380,6 +380,7 @@ class K1Env:
             print(f"[video] hero ghost ON — {os.path.basename(self.hero_ghost._motion_path)}")
 
         self._init_curriculum()
+        self._init_jogging_curriculum()
         self.reset()
 
     def _setup_style_reference(self):
@@ -479,14 +480,12 @@ class K1Env:
         self._apply_curriculum_phase(0)
         print(f"[curriculum] {len(phases)} phases | starting → '{phases[0]['name']}'")
 
-    def _apply_curriculum_phase(self, phase_idx: int) -> None:
-        phase = self._curriculum_phases[phase_idx]
-
-        # ── command ranges ────────────────────────────────────────────────────
-        cmd_ranges = phase.get("command_ranges", {})
-        for key, val in cmd_ranges.items():
-            self.command_cfg[key] = val
-        # Rebuild the pre-computed tensors used by _resample_commands.
+    def _rebuild_command_limits(self, x_range=None, y_range=None) -> None:
+        """Rebuild commands_limits tensors, optionally overriding x/y ranges first."""
+        if x_range is not None:
+            self.command_cfg["lin_vel_x_range"] = list(x_range)
+        if y_range is not None:
+            self.command_cfg["lin_vel_y_range"] = list(y_range)
         self.commands_limits = tuple(
             torch.tensor(values, dtype=gs.tc_float, device=gs.device)
             for values in zip(
@@ -495,6 +494,15 @@ class K1Env:
                 self.command_cfg["ang_vel_range"],
             )
         )
+
+    def _apply_curriculum_phase(self, phase_idx: int) -> None:
+        phase = self._curriculum_phases[phase_idx]
+
+        # ── command ranges ────────────────────────────────────────────────────
+        cmd_ranges = phase.get("command_ranges", {})
+        for key, val in cmd_ranges.items():
+            self.command_cfg[key] = val
+        self._rebuild_command_limits()
 
         # ── style reference ───────────────────────────────────────────────────
         style_file = phase.get("style_motion_file")
@@ -545,6 +553,73 @@ class K1Env:
         if not self.curriculum_active:
             return True
         return self._curriculum_phase_idx >= len(self._curriculum_phases) - 1
+
+    # ── Jogging curriculum (separate from phase-based curriculum above) ───────
+
+    def _init_jogging_curriculum(self) -> None:
+        jog_cfg = self.env_cfg.get("jogging_curriculum", {})
+        self._jog_enabled: bool = jog_cfg.get("enabled", False)
+        if not self._jog_enabled:
+            return
+        self._jog_start_iter: int = int(jog_cfg.get("start_iter", 2500))
+        self._jog_ramp_dur: int = max(1, int(jog_cfg.get("ramp_duration", 200)))
+        self._jog_target_x: list = list(jog_cfg["target_lin_vel_x_range"])
+        self._jog_target_y: list = list(jog_cfg["target_lin_vel_y_range"])
+        self._jog_style_file: str = jog_cfg["style_motion_file"]
+        # _jog_mix_ratio: None = not yet active, 0.5–1.0 = mixing walk/jog ranges
+        self._jog_mix_ratio: float | None = None
+        print(f"[jog-curriculum] armed: trigger iter={self._jog_start_iter}, "
+              f"mix ramp={self._jog_ramp_dur} iters, "
+              f"vx={self._jog_target_x}, vy={self._jog_target_y}")
+
+    def update_jogging_curriculum(self, it: int) -> None:
+        """Call once per training iteration.
+
+        At start_iter: begins 50/50 mix of pre-jog and jog command ranges, switches
+        style reference. Mix ramps linearly from 0.5 → 1.0 over ramp_duration iters,
+        then permanently switches to the jog range.
+        """
+        if not self._jog_enabled:
+            return
+        if it == self._jog_start_iter:
+            # Snapshot the current (pre-jog) command limits for mixed sampling
+            self._pre_jog_commands_limits = self.commands_limits
+            self._jog_commands_limits = tuple(
+                torch.tensor(values, dtype=gs.tc_float, device=gs.device)
+                for values in zip(
+                    self._jog_target_x,
+                    self._jog_target_y,
+                    self.command_cfg["ang_vel_range"],
+                )
+            )
+            self._jog_mix_ratio = 0.0
+            self.reward_cfg["style_motion_file"] = self._jog_style_file
+            self._setup_style_reference()
+            print(f"[jog-curriculum] iter {it}: mix ramp start (0 → 50%)  "
+                  f"jog_vx={self._jog_target_x}  style → {self._jog_style_file}")
+        elif it > self._jog_start_iter and self._jog_mix_ratio is not None:
+            t = min(1.0, (it - self._jog_start_iter) / self._jog_ramp_dur)
+            self._jog_mix_ratio = 0.5 * t  # ramps 0.0 → 0.5, then stays at 0.5
+
+    def sync_jogging_curriculum(self, current_it: int) -> None:
+        """Apply jogging curriculum immediately if current_it is at or past start_iter.
+        Used to bring a lazily-created video env in sync with the training env.
+        Always applies full jog range (no mid-ramp state) for simplicity."""
+        if not self._jog_enabled or current_it < self._jog_start_iter:
+            return
+        # For late-initialized envs apply full 50/50 mix immediately (skip ramp)
+        self._pre_jog_commands_limits = self.commands_limits
+        self._jog_commands_limits = tuple(
+            torch.tensor(values, dtype=gs.tc_float, device=gs.device)
+            for values in zip(
+                self._jog_target_x,
+                self._jog_target_y,
+                self.command_cfg["ang_vel_range"],
+            )
+        )
+        self._jog_mix_ratio = 0.5
+        self.reward_cfg["style_motion_file"] = self._jog_style_file
+        self._setup_style_reference()
 
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
@@ -641,7 +716,14 @@ class K1Env:
                 self.inv_heading_quat[reset_indices] = inv_h[reset_indices]
 
     def _resample_commands(self, envs_idx):
-        commands = gs_rand(*self.commands_limits, (self.num_envs,))
+        if self._jog_mix_ratio is not None:
+            # 50/50 → 100% jog ramp: per-env randomly pick walk or jog range
+            cmds_jog  = gs_rand(*self._jog_commands_limits,     (self.num_envs,))
+            cmds_walk = gs_rand(*self._pre_jog_commands_limits, (self.num_envs,))
+            use_jog   = torch.rand(self.num_envs, device=gs.device) < self._jog_mix_ratio
+            commands  = torch.where(use_jog[:, None], cmds_jog, cmds_walk)
+        else:
+            commands = gs_rand(*self.commands_limits, (self.num_envs,))
         if envs_idx is None:
             self.commands.copy_(commands)
         else:
@@ -967,7 +1049,12 @@ class K1Env:
         )
         feat = (feat - self.style_mean) / self.style_std * self.style_sqrt_w
         min_sq = torch.cdist(feat, self.style_ref_feat).pow(2).min(dim=1).values
-        return torch.exp(-min_sq / self.style_w_sum / (2.0 * self.style_sigma**2))
+        style = torch.exp(-min_sq / self.style_w_sum / (2.0 * self.style_sigma**2))
+        # Multiplicative coupling: style scales with tracking_lin_vel so the agent
+        # cannot earn style reward when failing the velocity command.
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.lin_vel_ema), dim=1)
+        tracking = torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+        return style * tracking
 
     def _reward_leg_symmetry(self):
         """Strafe: Beine laufen nicht alternierend (anti-phasig: ein Fuß schwingt, der andere stützt).
