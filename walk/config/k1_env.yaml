@@ -82,8 +82,8 @@ env_cfg:
     Left_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
     Right_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
 
-  termination_if_roll_greater_than: 40
-  termination_if_pitch_greater_than: 40
+  termination_if_roll_greater_than: 30
+  termination_if_pitch_greater_than: 30
   base_init_pos: [0.0, 0.0, 0.56]
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
   episode_length_s: 20.0
@@ -123,7 +123,7 @@ env_cfg:
     push_enabled: true
     push_interval_s: 5.0            # [s] avg interval (Poisson: p = dt/interval per step)
     push_duration_steps: 5          # consecutive steps to sustain the push force
-    push_force_xy_max: 150.0        # [N] max horizontal force magnitude (per axis)
+    push_force_xy_max: 100.0        # [N] max horizontal force magnitude (per axis)
     push_torque_z_max: 30.0         # [N·m] max yaw torque
 
     # ── Domain randomization (re-sampled every episode reset) ────────────────
@@ -145,8 +145,8 @@ env_cfg:
   jogging_curriculum:
     enabled: true
     start_iter: 2500          # iteration at which the jogging phase triggers
-    ramp_duration: 200        # style_weight re-warmup duration after curriculum switch (not velocity ramp)
-    target_lin_vel_x_range: [1.51, 3.0]
+    ramp_duration: 200        # iters to ramp jog-command mix from 0% → 50% (stays at 50/50 permanently after)
+    target_lin_vel_x_range: [1.21, 2.5]
     target_lin_vel_y_range: [-0.3, 0.3]
     style_motion_file: walk/data/motions/k1_jogging_motion.npz
 
@@ -208,27 +208,27 @@ reward_cfg:
     # With amp.reward_scale=0.1: AMP per step ≈ 0.026, task per step ≈ 0.04–0.08 → balanced.
     tracking_lin_vel: 2.6
     tracking_ang_vel: 0.4
-    #survival: 2.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
+    survival: 1.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
     # feet_air_time: ×2 vs. old 7.0 to compensate for mean() normalisation fix (was sum() → 0–2)
     feet_air_time: 30.848510755474946
     feet_slip: -3.8641653415948873
-    leg_symmetry: -1.0
+    leg_symmetry: -10.0
     gait_phase: -2.249538053359951
-    pose_symmetry: -1.5
+    pose_symmetry: -1.0
 
     # ── Regularizer ──────────────────────────────────────────────────────────────
     action_rate: -0.5568653606502595
     #dof_vel: -0.05
     ang_vel_xy: -0.2503673498346508
-    #orientation: -0.5
+    orientation: -1.5
     base_height: -1.4145401899044892
     lin_vel_z: -0.8243882672507493
 
 command_cfg:
   num_commands: 3
-  lin_vel_x_range: [-0.2, 1.5]
+  lin_vel_x_range: [-0.2, 1.2]
   lin_vel_y_range: [-0.4, 0.5]
   ang_vel_range: [-0.5, 0.5]
 
@@ -270,8 +270,8 @@ train_cfg:
   # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
   # style_weight: fraction of the total reward that comes from the discriminator.
   # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
-  style_weight: 0.5              # target weight after warmup
-  style_warmup_start: 500        # iterations before style weight begins ramping
+  style_weight: 2.5              # target weight after warmup
+  style_warmup_start: 900        # iterations before style weight begins ramping
   style_warmup_duration: 200     # iterations to ramp from 0 → style_weight
 
   amp:
@@ -279,7 +279,7 @@ train_cfg:
     hidden_dims: [256, 128]
     # Reward scale applied to discriminator output before mixing.
     # softplus(logit) ≈ 0.26/step early training → ×0.1 = 0.026/step ≈ task magnitude.
-    reward_scale: 0.3
+    reward_scale: 1.5
     # Loss type: BCEWithLogits (standard) or Wasserstein (experimental)
     loss_type: BCEWithLogits
     # Paths to .npz motion reference files (relative to repo root).

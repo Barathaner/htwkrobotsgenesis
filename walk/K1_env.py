@@ -441,8 +441,9 @@ class K1Env:
         q0 = self.init_qpos.unsqueeze(0).expand(self.num_envs, -1).contiguous()
         links_pos, _ = self.robot.forward_kinematics(q0)
         self.style_ground_z = links_pos[0, self.feet_link_idx, 2].clone()  # (2,)
-        # Initialize AMP obs buffer (used by get_observations)
-        amp_obs_dim = ref.shape[1]
+        # Initialize AMP obs buffer (used by get_observations).
+        # _build_amp_obs() appends self.commands (num_commands dims) after the motion features.
+        amp_obs_dim = ref.shape[1] + self.num_commands
         self._amp_obs_curr = torch.zeros((self.num_envs, amp_obs_dim), dtype=gs.tc_float, device=gs.device)
 
         print(f"[style] ref={self.style_ref_feat.shape[0]} frames  feat_dim={self.style_feat_dim}  "
@@ -450,7 +451,14 @@ class K1Env:
               f"  amp_obs_dim={amp_obs_dim}")
 
     def _build_amp_obs(self) -> torch.Tensor:
-        """38-dim AMP state: same features as style reference, normalized and group-weighted."""
+        """AMP state: normalized motion features + raw velocity commands.
+
+        Motion features (38-dim): [root_height(1), projected_gravity(3), dof_pos(16),
+        dof_vel(16), foot_clear(2)] — normalized with combined stats injected by runner.
+        Commands (3-dim): [lin_vel_x, lin_vel_y, ang_vel_yaw] appended raw so the
+        discriminator can condition its score on what speed was actually commanded.
+        Total: 38 + num_commands dims.
+        """
         foot_z = self.robot.get_links_pos(self.feet_idx_local)[:, :, 2]
         foot_clear = torch.clamp(foot_z - self.style_ground_z, 0.0, 0.5)
         feat = torch.cat([
@@ -460,7 +468,10 @@ class K1Env:
             self.dof_vel,
             foot_clear,
         ], dim=1)
-        return (feat - self.style_mean) / self.style_std * self.style_sqrt_w
+        mean   = getattr(self, "_amp_obs_mean",   self.style_mean)
+        std    = getattr(self, "_amp_obs_std",     self.style_std)
+        sqrt_w = getattr(self, "_amp_obs_sqrt_w",  self.style_sqrt_w)
+        return torch.cat([(feat - mean) / std * sqrt_w, self.commands], dim=1)
 
     # ── Curriculum ────────────────────────────────────────────────────────────
 
@@ -593,10 +604,8 @@ class K1Env:
                 )
             )
             self._jog_mix_ratio = 0.0
-            self.reward_cfg["style_motion_file"] = self._jog_style_file
-            self._setup_style_reference()
             print(f"[jog-curriculum] iter {it}: mix ramp start (0 → 50%)  "
-                  f"jog_vx={self._jog_target_x}  style → {self._jog_style_file}")
+                  f"jog_vx={self._jog_target_x}")
         elif it > self._jog_start_iter and self._jog_mix_ratio is not None:
             t = min(1.0, (it - self._jog_start_iter) / self._jog_ramp_dur)
             self._jog_mix_ratio = 0.5 * t  # ramps 0.0 → 0.5, then stays at 0.5
@@ -607,7 +616,8 @@ class K1Env:
         Always applies full jog range (no mid-ramp state) for simplicity."""
         if not self._jog_enabled or current_it < self._jog_start_iter:
             return
-        # For late-initialized envs apply full 50/50 mix immediately (skip ramp)
+        # For late-initialized envs (e.g. video env) apply full 50/50 mix immediately.
+        # AMP normalization is not touched here — stats are fixed at init by the runner.
         self._pre_jog_commands_limits = self.commands_limits
         self._jog_commands_limits = tuple(
             torch.tensor(values, dtype=gs.tc_float, device=gs.device)
@@ -618,8 +628,6 @@ class K1Env:
             )
         )
         self._jog_mix_ratio = 0.5
-        self.reward_cfg["style_motion_file"] = self._jog_style_file
-        self._setup_style_reference()
 
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
@@ -951,13 +959,17 @@ class K1Env:
         return TensorDict(td, batch_size=[self.num_envs])
 
     def _termination_mask(self):
-        """True je Env, wenn Episode endet (Fall, zu tief, Timeout, Sim-Fehler)."""
-        terminate = self.episode_length_buf > self.max_episode_length
-        terminate = terminate | (torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
-        terminate = terminate | (torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
-        terminate = terminate | (self.base_pos[:, 2] < 0.50)
-        terminate = terminate | self.scene.rigid_solver.get_error_envs_mask()
-        return terminate
+        """True je Env, wenn Episode endet (Fall, zu tief, Timeout, Sim-Fehler).
+
+        Per-reason masks are stored as self._term_* so the runner can read them
+        after step() returns (before the next step resets state again).
+        """
+        self._term_timeout   = self.episode_length_buf > self.max_episode_length
+        self._term_pitch     = torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
+        self._term_roll      = torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        self._term_height    = self.base_pos[:, 2] < 0.42
+        self._term_sim_error = self.scene.rigid_solver.get_error_envs_mask()
+        return self._term_timeout | self._term_pitch | self._term_roll | self._term_height | self._term_sim_error
 
     # ------------ reward functions ----------------
     # Jede Funktion gibt einen Wert pro Env zurück (0..N).

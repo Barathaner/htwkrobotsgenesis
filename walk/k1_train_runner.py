@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import Any
 
 import imageio.v2 as imageio
+import numpy as np
 import torch
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.utils import check_nan
@@ -76,9 +77,34 @@ class K1TrainRunner(OnPolicyRunner):
             device=self.device,
         ).to(self.device)
 
-        motion_paths = amp_cfg.get("motion_paths", [self.env.reward_cfg["style_motion_file"]])
+        # Include jog NPZ alongside slow NPZ when jogging curriculum is enabled so the
+        # single discriminator training pass (via alg.update) covers both motion styles.
+        cmd_cfg = self.env.command_cfg
+        jog_cfg = self.env.env_cfg.get("jogging_curriculum", {})
+        jog_path = jog_cfg.get("style_motion_file") if jog_cfg.get("enabled", False) else None
+        default_slow = self.env.reward_cfg["style_motion_file"]
+        motion_paths = amp_cfg.get("motion_paths",
+                                   [default_slow] + ([jog_path] if jog_path else []))
+
+        # Per-file command ranges: expert transitions get commands sampled from the
+        # appropriate speed range so the discriminator learns to condition on velocity.
+        yaw = cmd_cfg["ang_vel_range"]
+        slow_lo = np.array([cmd_cfg["lin_vel_x_range"][0], cmd_cfg["lin_vel_y_range"][0], yaw[0]], dtype=np.float32)
+        slow_hi = np.array([cmd_cfg["lin_vel_x_range"][1], cmd_cfg["lin_vel_y_range"][1], yaw[1]], dtype=np.float32)
+        cmd_ranges = [(slow_lo, slow_hi)]
+        if jog_path:
+            jog_lo = np.array([jog_cfg["target_lin_vel_x_range"][0], jog_cfg["target_lin_vel_y_range"][0], yaw[0]], dtype=np.float32)
+            jog_hi = np.array([jog_cfg["target_lin_vel_x_range"][1], jog_cfg["target_lin_vel_y_range"][1], yaw[1]], dtype=np.float32)
+            cmd_ranges.append((jog_lo, jog_hi))
+
         joint_names = self.env.env_cfg["joint_names"]
-        amp_data = K1AMPLoader(motion_paths, joint_names, device=self.device)
+        amp_data = K1AMPLoader(motion_paths, joint_names, device=self.device, cmd_ranges=cmd_ranges)
+
+        # Push combined motion normalization stats to the env so _build_amp_obs() uses the
+        # same feature space as the expert data (commands are appended raw in both).
+        self.env._amp_obs_mean   = amp_data.mean
+        self.env._amp_obs_std    = amp_data.std
+        self.env._amp_obs_sqrt_w = amp_data.sqrt_w
 
         ppo = self.alg
         # Filter cfg["algorithm"] to only keys AMP_PPO accepts
@@ -107,39 +133,13 @@ class K1TrainRunner(OnPolicyRunner):
               f"style_weight={self.style_weight}")
 
     def _setup_conditioned_amp_data(self) -> None:
-        """Load slow + jog expert pools for speed-conditioned discriminator training.
-
-        A single discriminator is trained with expert data chosen per mini-batch
-        based on the current distribution of commanded speeds: envs above
-        amp_speed_threshold contribute jog expert transitions, envs below contribute
-        slow expert transitions.
-        """
-        from k1_amp_loader import K1AMPLoader
-
-        jog_cfg = self.env.env_cfg.get("jogging_curriculum", {})
-        if not jog_cfg.get("enabled", False):
-            self.amp_slow = None
-            self.amp_jog = None
-            self.opt_disc_cond = None
-            return
-
-        joint_names = self.env.env_cfg["joint_names"]
-        slow_path = self.env.reward_cfg["style_motion_file"]
-        jog_path  = jog_cfg["style_motion_file"]
-
-        self.amp_slow = K1AMPLoader([slow_path], joint_names, device=self.device)
-        self.amp_jog  = K1AMPLoader([jog_path],  joint_names, device=self.device)
-        self.amp_speed_threshold: float = 1.5
-
-        self.opt_disc_cond = torch.optim.Adam(
-            [
-                {"params": self.discriminator.trunk.parameters(),  "weight_decay": 10e-4},
-                {"params": self.discriminator.linear.parameters(), "weight_decay": 10e-2},
-            ],
-            lr=self.alg.learning_rate,
-        )
-        print(f"[cond-amp] speed threshold={self.amp_speed_threshold} m/s  "
-              f"slow={slow_path}  jog={jog_path}")
+        # Both NPZs are now loaded in _setup_amp_ppo (combined into amp_data) so the
+        # single alg.update() training pass covers both motion styles without a second
+        # optimizer on the same network.  This method is kept as a no-op so external
+        # call sites don't need to change.
+        self.amp_slow = None
+        self.amp_jog = None
+        self.opt_disc_cond = None
 
     def get_inference_policy(self, device=None):
         """Return a callable policy for inference (eval mode, deterministic)."""
@@ -221,11 +221,23 @@ class K1TrainRunner(OnPolicyRunner):
         policy = self.get_inference_policy(device=self.device)
         frames: list = []
 
+        _TERM_REASONS = ("timeout", "pitch", "roll", "height", "sim_error")
+        video_term: dict[str, int] = {r: 0 for r in _TERM_REASONS}
+        video_term_total = 0
+
         with torch.inference_mode():
             obs = video_env.reset()
             for _ in range(self.video_steps):
                 actions = policy(obs)
-                obs, _, _, _ = video_env.step(actions)
+                obs, _, dones, _ = video_env.step(actions)
+
+                done_mask = dones.bool()
+                if done_mask.any():
+                    video_term_total += int(done_mask.sum().item())
+                    for reason in _TERM_REASONS:
+                        rm = getattr(video_env, f"_term_{reason}", None)
+                        if rm is not None:
+                            video_term[reason] += int((rm & done_mask).sum().item())
 
                 if video_env.hero_ghost is not None:
                     video_env.hero_ghost.set_frame(video_env)
@@ -246,7 +258,22 @@ class K1TrainRunner(OnPolicyRunner):
             output_params=["-crf", "18"],
         )
         self._pending_video_log = (it, path)
-        print(f"Recorded rollout video: {path}")
+
+        # Print + wandb-log termination breakdown for this video rollout
+        if video_term_total > 0:
+            parts = [f"{r}={video_term[r]}" for r in _TERM_REASONS if video_term[r] > 0]
+            print(f"Recorded rollout video: {path}  |  resets={video_term_total} ({', '.join(parts)})")
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log(
+                        {f"video_termination/{r}": video_term[r] for r in _TERM_REASONS},
+                        step=it,
+                    )
+            except ImportError:
+                pass
+        else:
+            print(f"Recorded rollout video: {path}  |  no resets in {self.video_steps} steps")
         return path
 
     def _flush_pending_video_log(self) -> None:
@@ -273,6 +300,11 @@ class K1TrainRunner(OnPolicyRunner):
         _style_ep_buf = torch.zeros(self.env.num_envs, device=self.device)
         _task_ep_deque: collections.deque[float] = collections.deque(maxlen=200)
         _style_ep_deque: collections.deque[float] = collections.deque(maxlen=200)
+
+        # Per-reason termination counters (reset each iteration)
+        _TERM_REASONS = ("timeout", "pitch", "roll", "height", "sim_error")
+        _term_counts: dict[str, int] = {r: 0 for r in _TERM_REASONS}
+        _term_total = 0
 
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
@@ -317,23 +349,35 @@ class K1TrainRunner(OnPolicyRunner):
 
                     next_amp_obs = obs["amp"].clone()
 
-                    # Style reward: single speed-conditioned discriminator
+                    # Style reward: multiplicative gating — style is a bonus multiplier on task.
+                    # r_total = task * (1 + style_weight * style_disc)
+                    # When task → 0 (robot fails velocity command) the style bonus collapses too,
+                    # so the agent cannot earn reward by looking stylish while standing still.
                     task_rewards = rewards.clone()
                     style_reward = self.discriminator.predict_reward(amp_obs, next_amp_obs)
-                    rewards = (1.0 - self.style_weight) * task_rewards + self.style_weight * style_reward
+                    rewards = task_rewards * (1.0 + self.style_weight * style_reward)
 
-                    # Accumulate per-env episode totals for exact reward breakdown
+                    # Log actual contributions so rew_ep_task + rew_ep_style ≈ mean_reward.
+                    style_contribution = (task_rewards * self.style_weight * style_reward).detach()
                     _task_ep_buf += task_rewards.detach()
-                    _style_ep_buf += style_reward.detach()
+                    _style_ep_buf += style_contribution
 
                     done_mask = dones.bool()
                     if done_mask.any():
-                        for v in ((1.0 - self.style_weight) * _task_ep_buf[done_mask]).tolist():
+                        for v in _task_ep_buf[done_mask].tolist():
                             _task_ep_deque.append(v)
-                        for v in (self.style_weight * _style_ep_buf[done_mask]).tolist():
+                        for v in _style_ep_buf[done_mask].tolist():
                             _style_ep_deque.append(v)
                         _task_ep_buf[done_mask] = 0.0
                         _style_ep_buf[done_mask] = 0.0
+
+                        # Per-reason termination counts (env stores _term_* from last _termination_mask)
+                        n = done_mask.sum().item()
+                        _term_total += n
+                        for reason in _TERM_REASONS:
+                            reason_mask = getattr(self.env, f"_term_{reason}", None)
+                            if reason_mask is not None:
+                                _term_counts[reason] += int((reason_mask & done_mask).sum().item())
 
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     self.alg.process_amp_step(next_amp_obs)
@@ -358,47 +402,6 @@ class K1TrainRunner(OnPolicyRunner):
                 _mean_symmetry_loss,
             ) = self.alg.update()
 
-            # ── Speed-conditioned discriminator training ──────────────────────
-            # Expert data is sampled proportionally: fraction of envs with
-            # cmd_speed > amp_speed_threshold draws from jog NPZ, rest from slow NPZ.
-            if self.amp_slow is not None and self.amp_jog is not None:
-                cmd_speed = torch.norm(self.env.commands[:, :2], dim=1)
-                fast_frac = (cmd_speed > self.amp_speed_threshold).float().mean().item()
-
-                n_mb    = self.alg.num_learning_epochs * self.alg.num_mini_batches
-                mb_size = (self.env.num_envs * self.cfg["num_steps_per_env"]
-                           // self.alg.num_mini_batches)
-                pol_gen = self.alg.amp_storage.feed_forward_generator(
-                    num_mini_batch=n_mb, mini_batch_size=mb_size, allow_replacement=True
-                )
-                for (pol_s, pol_ns) in pol_gen:
-                    pol_s, pol_ns = pol_s.to(self.device), pol_ns.to(self.device)
-
-                    n_fast = max(1, int(mb_size * fast_frac))
-                    n_slow = max(1, mb_size - n_fast)
-                    (slow_s, slow_ns) = next(self.amp_slow.feed_forward_generator(1, n_slow))
-                    (jog_s,  jog_ns)  = next(self.amp_jog.feed_forward_generator(1, n_fast))
-                    exp_s  = torch.cat([slow_s, jog_s],  dim=0).to(self.device)
-                    exp_ns = torch.cat([slow_ns, jog_ns], dim=0).to(self.device)
-
-                    B   = pol_s.size(0)
-                    inp = torch.cat([
-                        torch.cat([pol_s, pol_ns], dim=-1),
-                        torch.cat([exp_s, exp_ns], dim=-1),
-                    ], dim=0)
-                    out = self.discriminator(inp)
-                    pol_d, exp_d = out[:B], out[B:]
-                    amp_loss, gp_loss = self.discriminator.compute_loss(
-                        policy_d=pol_d, expert_d=exp_d,
-                        sample_amp_expert=(exp_s, exp_ns),
-                        sample_amp_policy=(pol_s, pol_ns),
-                    )
-                    self.opt_disc_cond.zero_grad()
-                    (amp_loss + gp_loss).backward()
-                    torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1.0)
-                    self.opt_disc_cond.step()
-                    self.discriminator.update_normalization(exp_s, exp_ns, pol_s, pol_ns)
-
             loss_dict = {
                 "value_function": mean_value_loss,
                 "surrogate": mean_surrogate_loss,
@@ -421,6 +424,13 @@ class K1TrainRunner(OnPolicyRunner):
                 loss_dict["reward_style"] = sum(_style_ep_deque) / len(_style_ep_deque)
 
             loss_dict["style_weight"] = self.style_weight
+
+            # ── Termination reason breakdown ──────────────────────────────────
+            if _term_total > 0:
+                for reason in _TERM_REASONS:
+                    loss_dict[f"termination/{reason}_pct"] = 100.0 * _term_counts[reason] / _term_total
+            _term_counts = {r: 0 for r in _TERM_REASONS}
+            _term_total = 0
 
             record_video = (
                 self.enable_video
