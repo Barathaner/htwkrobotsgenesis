@@ -88,6 +88,7 @@ env_cfg:
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
   episode_length_s: 20.0
   resampling_time_s: 4.0
+  command_smooth_s: 1.5      # [s] time constant for smoothing command toward target (prevents OOD obs at speed transitions)
   action_scale: 0.25
   simulate_action_latency: true
   clip_actions: 100.0
@@ -144,9 +145,9 @@ env_cfg:
 
   jogging_curriculum:
     enabled: true
-    start_iter: 2500          # iteration at which the jogging phase triggers
-    ramp_duration: 200        # iters to ramp jog-command mix from 0% → 50% (stays at 50/50 permanently after)
-    target_lin_vel_x_range: [1.21, 2.5]
+    start_iter: 1500          # iteration at which the jogging phase triggers
+    ramp_duration: 500        # iters to ramp jog-command mix from 0% → 50% (stays at 50/50 permanently after)
+    target_lin_vel_x_range: [1.0, 2.0]
     target_lin_vel_y_range: [-0.3, 0.3]
     style_motion_file: walk/data/motions/k1_jogging_motion.npz
 
@@ -183,6 +184,11 @@ reward_cfg:
   # style (feature-matching Style-Reward gegen eine NPZ-Referenzmotion, siehe K1_env._reward_style)
   style_motion_file: walk/data/motions/slow.npz  # relativ zur Repo-Root
   style_sigma: 1.0                # exp(-mean_sq_z/(2σ²)); feature-distance fallback (non-AMP path)
+
+  # RSI: at each episode reset, rsi_prob fraction of envs are teleported to a random
+  # reference frame (joint angles + velocities) instead of the default standing pose.
+  # Breaks the AMP cold-start problem: robot starts inside expert distribution → immediate style reward.
+  rsi_prob: 0.5
 
   # Gebundene Strafterme: jeder gibt tanh(quantity / σ) ∈ [0,1) zurück (0 = sauber, →1 = starke
   # Verletzung); Vorzeichen kommt aus reward_scales (negativ = Strafe). Kleineres σ = strenger
@@ -228,7 +234,7 @@ reward_cfg:
 
 command_cfg:
   num_commands: 3
-  lin_vel_x_range: [-0.2, 1.2]
+  lin_vel_x_range: [-0.2, 1.0]
   lin_vel_y_range: [-0.4, 0.5]
   ang_vel_range: [-0.5, 0.5]
 
@@ -271,8 +277,8 @@ train_cfg:
   # style_weight: fraction of the total reward that comes from the discriminator.
   # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
   style_weight: 2.5              # target weight after warmup
-  style_warmup_start: 900        # iterations before style weight begins ramping
-  style_warmup_duration: 200     # iterations to ramp from 0 → style_weight
+  style_warmup_start: 0        # iterations before style weight begins ramping
+  style_warmup_duration: 500     # iterations to ramp from 0 → style_weight
 
   amp:
     # Discriminator hidden layer sizes (amp_rsl_rl.networks.Discriminator)

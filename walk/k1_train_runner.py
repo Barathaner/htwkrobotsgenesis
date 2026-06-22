@@ -88,9 +88,12 @@ class K1TrainRunner(OnPolicyRunner):
 
         # Per-file command ranges: expert transitions get commands sampled from the
         # appropriate speed range so the discriminator learns to condition on velocity.
+        # Overlapping ranges: slow covers the full walk command range [-0.2, 1.2];
+        # jog starts at 0.8 so both datasets cover [0.8, 1.2], giving the discriminator
+        # a smooth transition zone instead of a hard cliff at 1.21 m/s.
         yaw = cmd_cfg["ang_vel_range"]
         slow_lo = np.array([cmd_cfg["lin_vel_x_range"][0], cmd_cfg["lin_vel_y_range"][0], yaw[0]], dtype=np.float32)
-        slow_hi = np.array([cmd_cfg["lin_vel_x_range"][1], cmd_cfg["lin_vel_y_range"][1], yaw[1]], dtype=np.float32)
+        slow_hi = np.array([cmd_cfg["lin_vel_x_range"][1],  cmd_cfg["lin_vel_y_range"][1], yaw[1]], dtype=np.float32)
         cmd_ranges = [(slow_lo, slow_hi)]
         if jog_path:
             jog_lo = np.array([jog_cfg["target_lin_vel_x_range"][0], jog_cfg["target_lin_vel_y_range"][0], yaw[0]], dtype=np.float32)

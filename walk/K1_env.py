@@ -234,6 +234,12 @@ class K1Env:
 
         self.projected_gravity = torch.empty_like(self.base_ang_vel)
         self.commands = torch.empty((num_envs, self.num_commands), dtype=gs.tc_float, device=gs.device)
+        # command_target: desired command (set by _resample_commands).
+        # self.commands smooths toward this each step so velocity jumps don't produce
+        # OOD observations that cause instant falls when the jog curriculum fires.
+        self.command_target = torch.zeros((num_envs, self.num_commands), dtype=gs.tc_float, device=gs.device)
+        _cmd_smooth_s = float(env_cfg.get("command_smooth_s", 1.5))
+        self._cmd_smooth_alpha = math.exp(-self.dt / _cmd_smooth_s)
         self.commands_scale = torch.tensor(
             [
                 obs_cfg["obs_scales"]["lin_vel"],
@@ -336,8 +342,10 @@ class K1Env:
         # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
         self.style_enabled = bool(self.reward_cfg.get("style_motion_file"))
         self._amp_obs_curr: torch.Tensor | None = None  # initialized in _setup_style_reference
+        self._rsi_prob = float(env_cfg.get("rsi_prob", 0.5)) if self.style_enabled else 0.0
         if self.style_enabled:
             self._setup_style_reference()
+            self._setup_rsi_data()
 
         # Obs nur aus deploy-fähigen Größen (IMU + Gelenke + commands + letzte Aktion). base_lin_vel_heading
         # (privilegiert, auf der Hardware nicht messbar) und feet_contact (Deploy liefert nur Fake) sind
@@ -449,6 +457,58 @@ class K1Env:
         print(f"[style] ref={self.style_ref_feat.shape[0]} frames  feat_dim={self.style_feat_dim}  "
               f"sigma={self.style_sigma}  ground_z={np.round(self.style_ground_z.cpu().numpy(), 3)}"
               f"  amp_obs_dim={amp_obs_dim}")
+
+    def _setup_rsi_data(self) -> None:
+        """Load reference frames for Reference State Initialization (RSI).
+
+        At each episode reset, `rsi_prob` fraction of envs are teleported to a random
+        reference frame instead of the default standing pose. The robot starts already
+        inside the expert distribution → discriminator gives high reward immediately →
+        breaks the cold-start bootstrapping problem.
+        """
+        # Genesis joint order for all URDF joints (skipping the base/world joint)
+        gen_joint_names = [j.name for j in self.robot.joints[1:]]
+
+        # DOF index for each URDF joint (used by set_dofs_velocity)
+        self._rsi_gen_dof_idx = torch.tensor(
+            [j.dof_start for j in self.robot.joints[1:]],
+            dtype=gs.tc_int, device=gs.device,
+        )
+
+        # Column mapping: for each policy joint (env_cfg order), its index in the 22-col Genesis tensor
+        policy_joint_names = self.env_cfg["joint_names"]
+        self._rsi_policy_cols = torch.tensor(
+            [gen_joint_names.index(name) for name in policy_joint_names],
+            dtype=torch.long, device=gs.device,
+        )
+
+        # Collect frames from both motion files
+        motion_paths = [self.reward_cfg["style_motion_file"]]
+        jog_cfg = self.env_cfg.get("jogging_curriculum", {})
+        if jog_cfg.get("enabled", False) and jog_cfg.get("style_motion_file"):
+            motion_paths.append(jog_cfg["style_motion_file"])
+
+        all_z, all_quat, all_dof_pos, all_dof_vel = [], [], [], []
+        for path in motion_paths:
+            if not os.path.isabs(path):
+                repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                path = os.path.join(repo_root, path)
+            data = np.load(path, allow_pickle=True)
+            ref_jn = [str(n) for n in data["joint_names"]]
+            # Map NPZ columns to Genesis joint order
+            col = [ref_jn.index(name) for name in gen_joint_names]
+            all_z.append(data["root_pos"][:, 2:3].astype(np.float32))
+            all_quat.append(data["root_quat"].astype(np.float32))          # wxyz
+            all_dof_pos.append(data["dof_pos"][:, col].astype(np.float32)) # (M, 22) Genesis order
+            all_dof_vel.append(data["dof_vel"][:, col].astype(np.float32))
+
+        self._rsi_z       = torch.tensor(np.concatenate(all_z,       axis=0), dtype=gs.tc_float, device=gs.device)
+        self._rsi_quat    = torch.tensor(np.concatenate(all_quat,    axis=0), dtype=gs.tc_float, device=gs.device)
+        self._rsi_dof_pos = torch.tensor(np.concatenate(all_dof_pos, axis=0), dtype=gs.tc_float, device=gs.device)
+        self._rsi_dof_vel = torch.tensor(np.concatenate(all_dof_vel, axis=0), dtype=gs.tc_float, device=gs.device)
+
+        n = int(self._rsi_z.shape[0])
+        print(f"[RSI] {n} reference frames  prob={self._rsi_prob:.0%}  files={len(motion_paths)}")
 
     def _build_amp_obs(self) -> torch.Tensor:
         """AMP state: normalized motion features + raw velocity commands.
@@ -616,7 +676,7 @@ class K1Env:
         Always applies full jog range (no mid-ramp state) for simplicity."""
         if not self._jog_enabled or current_it < self._jog_start_iter:
             return
-        # For late-initialized envs (e.g. video env) apply full 50/50 mix immediately.
+        # For late-initialized envs (e.g. video env) apply full 25% mix immediately.
         # AMP normalization is not touched here — stats are fixed at init by the runner.
         self._pre_jog_commands_limits = self.commands_limits
         self._jog_commands_limits = tuple(
@@ -667,6 +727,10 @@ class K1Env:
         self._symm_buf_R[:, self._symm_ptr] = self.dof_pos[:, self._symm_right_idx]
         self._symm_ptr = (self._symm_ptr + 1) % self._symm_half
         self._update_foot_contact()
+        # Smooth commands toward target — prevents OOD obs spikes when jog commands fire.
+        self.commands.mul_(self._cmd_smooth_alpha).add_(
+            self.command_target, alpha=1.0 - self._cmd_smooth_alpha
+        )
         self._update_command_tracking_ema()
 
         if self._amp_obs_curr is not None:
@@ -723,19 +787,20 @@ class K1Env:
                 reset_indices = envs_idx.nonzero(as_tuple=True)[0]
                 self.inv_heading_quat[reset_indices] = inv_h[reset_indices]
 
-    def _resample_commands(self, envs_idx):
-        if self._jog_mix_ratio is not None:
-            # 50/50 → 100% jog ramp: per-env randomly pick walk or jog range
+    def _resample_commands(self, envs_idx, walk_only: bool = False):
+        if self._jog_mix_ratio is not None and not walk_only:
+            # mid-episode resampling: per-env randomly pick walk or jog range
             cmds_jog  = gs_rand(*self._jog_commands_limits,     (self.num_envs,))
             cmds_walk = gs_rand(*self._pre_jog_commands_limits, (self.num_envs,))
             use_jog   = torch.rand(self.num_envs, device=gs.device) < self._jog_mix_ratio
             commands  = torch.where(use_jog[:, None], cmds_jog, cmds_walk)
         else:
             commands = gs_rand(*self.commands_limits, (self.num_envs,))
+        # Write to command_target; self.commands smooths toward it each step.
         if envs_idx is None:
-            self.commands.copy_(commands)
+            self.command_target.copy_(commands)
         else:
-            torch.where(envs_idx[:, None], commands, self.commands, out=self.commands)
+            torch.where(envs_idx[:, None], commands, self.command_target, out=self.command_target)
 
     def reset(self):
         self._reset_idx()
@@ -751,7 +816,48 @@ class K1Env:
 
         # reset state with init-state noise + random yaw
         noisy_qpos, init_quats_batch = self._build_noisy_init_qpos(envs_idx)
+
+        # ── RSI: teleport a fraction of reset envs to a random reference frame ──
+        # Local vars (rsi_mask etc.) persist to the buffer-correction block below.
+        rsi_mask = rsi_ref_dof_pos = rsi_ref_dof_vel = rsi_z_vals = None
+        if self._rsi_prob > 0.0:
+            if envs_idx is None:
+                rsi_mask = torch.rand(self.num_envs, device=gs.device) < self._rsi_prob
+            else:
+                rsi_mask = envs_idx & (torch.rand(self.num_envs, device=gs.device) < self._rsi_prob)
+            if not rsi_mask.any():
+                rsi_mask = None
+
+        if rsi_mask is not None:
+            n_rsi = int(rsi_mask.sum().item())
+            frame_idx = torch.randint(len(self._rsi_z), (n_rsi,), device=gs.device)
+
+            # Apply random yaw on top of the reference quat so RSI envs face random directions
+            yaw_range = self.rand_cfg.get("init_yaw_range", [0.0, 0.0])
+            yaw_lo, yaw_hi = float(yaw_range[0]), float(yaw_range[1])
+            yaw = (yaw_lo + (yaw_hi - yaw_lo) * torch.rand(n_rsi, device=gs.device)
+                   if yaw_lo != yaw_hi
+                   else torch.zeros(n_rsi, dtype=gs.tc_float, device=gs.device))
+            spawn_rpy = torch.zeros(n_rsi, 3, dtype=gs.tc_float, device=gs.device)
+            spawn_rpy[:, 2] = yaw
+            rsi_quat = transform_quat_by_quat(xyz_to_quat(spawn_rpy), self._rsi_quat[frame_idx])
+
+            rsi_z_vals = self._rsi_z[frame_idx, 0]                   # (n_rsi,)
+            rsi_pos = torch.zeros(n_rsi, 3, dtype=gs.tc_float, device=gs.device)
+            rsi_pos[:, 2] = rsi_z_vals
+
+            rsi_ref_dof_pos = self._rsi_dof_pos[frame_idx]           # (n_rsi, 22) Genesis order
+            rsi_ref_dof_vel = self._rsi_dof_vel[frame_idx]           # (n_rsi, 22)
+
+            noisy_qpos[rsi_mask] = torch.cat([rsi_pos, rsi_quat, rsi_ref_dof_pos], dim=1)
+            init_quats_batch[rsi_mask] = rsi_quat  # heading reference will be set correctly below
+
         self.robot.set_qpos(noisy_qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=True)
+
+        # Restore reference joint velocities that set_qpos zeroed out
+        if rsi_mask is not None:
+            rsi_idx = rsi_mask.nonzero(as_tuple=True)[0]
+            self.robot.set_dofs_velocity(rsi_ref_dof_vel, self._rsi_gen_dof_idx, envs_idx=rsi_idx)
 
         # reset buffers
         if envs_idx is None:
@@ -820,6 +926,14 @@ class K1Env:
             if self._amp_obs_curr is not None:
                 self._amp_obs_curr.masked_fill_(envs_idx[:, None], 0.0)
 
+        # RSI buffer correction: override default-pose values with reference state so the
+        # first observation after reset is consistent with what the physics engine has.
+        if rsi_mask is not None:
+            rsi_idx = rsi_mask.nonzero(as_tuple=True)[0]
+            self.dof_pos[rsi_idx] = rsi_ref_dof_pos[:, self._rsi_policy_cols]
+            self.dof_vel[rsi_idx] = rsi_ref_dof_vel[:, self._rsi_policy_cols]
+            self.base_pos[rsi_idx, 2] = rsi_z_vals
+
         # fill extras
         n_envs = envs_idx.sum() if envs_idx is not None else self.num_envs
 
@@ -843,8 +957,15 @@ class K1Env:
             else:
                 value.masked_fill_(envs_idx, 0.0)
 
-        # random sample command upon reset
-        self._resample_commands(envs_idx)
+        # On reset always assign walk commands so the robot starts stable.
+        # Jog commands are introduced only during mid-episode resampling (every
+        # resampling_time_s), where the robot has time to be upright first.
+        self._resample_commands(envs_idx, walk_only=True)
+        # Snap commands immediately to target on reset — no ramp needed at episode start.
+        if envs_idx is None:
+            self.commands.copy_(self.command_target)
+        else:
+            torch.where(envs_idx[:, None], self.command_target, self.commands, out=self.commands)
         # domain randomization: re-sample physics per episode
         self._randomize_domain(envs_idx)
 

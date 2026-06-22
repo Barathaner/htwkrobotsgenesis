@@ -48,6 +48,10 @@ def main() -> None:
         type=str,
         default=train_cfg_yaml.get("wandb_project", "k1-locomotion"),
     )
+    parser.add_argument(
+        "--checkpoint", type=str, default=None,
+        help="Path to a model_*.pt checkpoint to resume from (skips log dir wipe).",
+    )
     args = parser.parse_args()
 
     log_dir = os.path.join("logs", args.exp_name)
@@ -55,7 +59,7 @@ def main() -> None:
         train_cfg_yaml, args.exp_name, wandb_project=args.wandb_project
     )
 
-    if os.path.exists(log_dir):
+    if args.checkpoint is None and os.path.exists(log_dir):
         shutil.rmtree(log_dir)
 
     save_session_cfgs(log_dir, env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg, video_opts)
@@ -79,6 +83,15 @@ def main() -> None:
         video_opts,
         enable_video=True,
     )
+
+    if args.checkpoint is not None:
+        runner.load(args.checkpoint)
+        print(f"Resumed from {args.checkpoint} at iteration {runner.current_learning_iteration}")
+        # Sync jogging curriculum — _jog_mix_ratio is None after env init and only
+        # activates via update_jogging_curriculum(it). When resuming past start_iter
+        # that call never fires for the trigger iteration, so sync manually.
+        env.sync_jogging_curriculum(runner.current_learning_iteration)
+
     run_training(runner, args.max_iterations)
 
 
