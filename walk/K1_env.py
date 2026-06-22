@@ -1,3 +1,4 @@
+import collections
 import math
 import os
 
@@ -402,7 +403,7 @@ class K1Env:
             print(f"[video] hero ghost ON — {os.path.basename(self.hero_ghost._motion_path)}")
 
         self._init_curriculum()
-        self._init_jogging_curriculum()
+        self._init_velocity_curriculum()
         self.reset()
 
     def _setup_style_reference(self):
@@ -505,11 +506,13 @@ class K1Env:
             dtype=torch.long, device=gs.device,
         )
 
-        # Collect frames from both motion files
+        # Collect frames from both motion files (the discriminator + RSI cover the full speed
+        # range from iter 0; the velocity curriculum only gates which commands are sampled).
         motion_paths = [self.reward_cfg["style_motion_file"]]
-        jog_cfg = self.env_cfg.get("jogging_curriculum", {})
-        if jog_cfg.get("enabled", False) and jog_cfg.get("style_motion_file"):
-            motion_paths.append(jog_cfg["style_motion_file"])
+        vc_cfg = self.env_cfg.get("velocity_curriculum", {})
+        jog_file = vc_cfg.get("jog_style_motion_file")
+        if jog_file:
+            motion_paths.append(jog_file)
 
         all_z, all_quat, all_dof_pos, all_dof_vel = [], [], [], []
         for path in motion_paths:
@@ -654,67 +657,99 @@ class K1Env:
 
     # ── Jogging curriculum (separate from phase-based curriculum above) ───────
 
-    def _init_jogging_curriculum(self) -> None:
-        jog_cfg = self.env_cfg.get("jogging_curriculum", {})
-        self._jog_enabled: bool = jog_cfg.get("enabled", False)
-        if not self._jog_enabled:
-            return
-        self._jog_start_iter: int = int(jog_cfg.get("start_iter", 2500))
-        self._jog_ramp_dur: int = max(1, int(jog_cfg.get("ramp_duration", 200)))
-        self._jog_target_x: list = list(jog_cfg["target_lin_vel_x_range"])
-        self._jog_target_y: list = list(jog_cfg["target_lin_vel_y_range"])
-        self._jog_style_file: str = jog_cfg["style_motion_file"]
-        # _jog_mix_ratio: None = not yet active, 0.5–1.0 = mixing walk/jog ranges
-        self._jog_mix_ratio: float | None = None
-        print(f"[jog-curriculum] armed: trigger iter={self._jog_start_iter}, "
-              f"mix ramp={self._jog_ramp_dur} iters, "
-              f"vx={self._jog_target_x}, vy={self._jog_target_y}")
+    def _init_velocity_curriculum(self) -> None:
+        """Adaptive command-range curriculum (Rudin et al. 2022, performance-gated).
 
-    def update_jogging_curriculum(self, it: int) -> None:
-        """Call once per training iteration.
-
-        At start_iter: begins 50/50 mix of pre-jog and jog command ranges, switches
-        style reference. Mix ramps linearly from 0.5 → 1.0 over ramp_duration iters,
-        then permanently switches to the jog range.
+        The conditional discriminator already covers the full speed range from iter 0, so this is
+        purely a TASK curriculum: it widens the sampled command range from a narrow START toward
+        the full command_cfg range (level 0→1) whenever recent episodes track velocity well.
+        Style is not curriculumed — only which commands the policy is asked to achieve.
         """
-        if not self._jog_enabled:
+        vc = self.env_cfg.get("velocity_curriculum", {})
+        self._vc_enabled: bool = vc.get("enabled", False)
+        # level 1.0 = full command_cfg range; when disabled we stay at full immediately.
+        self._vc_level: float = 0.0 if self._vc_enabled else 1.0
+        if not self._vc_enabled:
             return
-        if it == self._jog_start_iter:
-            # Snapshot the current (pre-jog) command limits for mixed sampling
-            self._pre_jog_commands_limits = self.commands_limits
-            self._jog_commands_limits = tuple(
-                torch.tensor(values, dtype=gs.tc_float, device=gs.device)
-                for values in zip(
-                    self._jog_target_x,
-                    self._jog_target_y,
-                    self.command_cfg["ang_vel_range"],
-                )
-            )
-            self._jog_mix_ratio = 0.0
-            print(f"[jog-curriculum] iter {it}: mix ramp start (0 → 50%)  "
-                  f"jog_vx={self._jog_target_x}")
-        elif it > self._jog_start_iter and self._jog_mix_ratio is not None:
-            t = min(1.0, (it - self._jog_start_iter) / self._jog_ramp_dur)
-            self._jog_mix_ratio = 0.5 * t  # ramps 0.0 → 0.5, then stays at 0.5
 
-    def sync_jogging_curriculum(self, current_it: int) -> None:
-        """Apply jogging curriculum immediately if current_it is at or past start_iter.
-        Used to bring a lazily-created video env in sync with the training env.
-        Always applies full jog range (no mid-ramp state) for simplicity."""
-        if not self._jog_enabled or current_it < self._jog_start_iter:
+        self._vc_track_max = self.reward_scales.get("tracking_lin_vel")
+        if self._vc_track_max is None or self._vc_track_max <= 0.0:
+            print("[vel-curriculum] disabled: needs a positive tracking_lin_vel reward scale.")
+            self._vc_enabled = False
+            self._vc_level = 1.0
             return
-        # For late-initialized envs (e.g. video env) apply full 25% mix immediately.
-        # AMP normalization is not touched here — stats are fixed at init by the runner.
-        self._pre_jog_commands_limits = self.commands_limits
-        self._jog_commands_limits = tuple(
-            torch.tensor(values, dtype=gs.tc_float, device=gs.device)
-            for values in zip(
-                self._jog_target_x,
-                self._jog_target_y,
-                self.command_cfg["ang_vel_range"],
-            )
+
+        self._vc_start_iter = int(vc.get("start_iter", 0))
+        self._vc_frac = float(vc.get("advance_tracking_frac", 0.8))
+        self._vc_step = float(vc.get("level_step", 0.05))
+        self._vc_check_interval = max(1, int(vc.get("check_interval", 25)))
+        self._vc_min_episodes = int(vc.get("min_episodes", 20))
+
+        def _rng(key, full):
+            v = vc.get(key)
+            return (float(v[0]), float(v[1])) if v else (float(full[0]), float(full[1]))
+
+        self._vc_full = (tuple(map(float, self.command_cfg["lin_vel_x_range"])),
+                         tuple(map(float, self.command_cfg["lin_vel_y_range"])),
+                         tuple(map(float, self.command_cfg["ang_vel_range"])))
+        self._vc_start = (_rng("start_lin_vel_x_range", self._vc_full[0]),
+                          _rng("start_lin_vel_y_range", self._vc_full[1]),
+                          _rng("start_ang_vel_range",  self._vc_full[2]))
+        self._vc_track_deque: collections.deque[float] = collections.deque(
+            maxlen=int(vc.get("track_window", 200)))
+        self._vc_last_check = self._vc_start_iter
+        self._apply_velocity_curriculum_level()
+        print(f"[vel-curriculum] adaptive: start_iter={self._vc_start_iter}, "
+              f"start_x={self._vc_start[0]} → full_x={self._vc_full[0]}, "
+              f"advance when mean tracking ≥ {self._vc_frac:.2f}×max, step={self._vc_step}")
+
+    def _apply_velocity_curriculum_level(self) -> None:
+        """Set commands_limits = lerp(start, full, level)."""
+        lvl = self._vc_level
+        lo, hi = [], []
+        for (s_lo, s_hi), (f_lo, f_hi) in zip(self._vc_start, self._vc_full):
+            lo.append(s_lo + (f_lo - s_lo) * lvl)
+            hi.append(s_hi + (f_hi - s_hi) * lvl)
+        self.commands_limits = (
+            torch.tensor(lo, dtype=gs.tc_float, device=gs.device),
+            torch.tensor(hi, dtype=gs.tc_float, device=gs.device),
         )
-        self._jog_mix_ratio = 0.5
+
+    def _record_curriculum_tracking(self, envs_idx, saved_ep_lengths) -> None:
+        """Push terminated envs' episodic tracking quality into the curriculum deque.
+
+        Metric = Σ tracking_lin_vel reward over the episode / max_episode_length (Rudin form),
+        which couples tracking accuracy with survival: advancing requires both."""
+        if not self._vc_enabled or self._vc_level >= 1.0:
+            return
+        ts = self.episode_sums["tracking_lin_vel"]
+        vals = (ts if envs_idx is None else ts[envs_idx]) / float(self.max_episode_length)
+        self._vc_track_deque.extend(vals.tolist())
+
+    def update_velocity_curriculum(self, it: int) -> None:
+        """Call once per training iteration: advance the command range when tracking is good."""
+        if not self._vc_enabled or self._vc_level >= 1.0 or it < self._vc_start_iter:
+            return
+        if it - self._vc_last_check < self._vc_check_interval:
+            return
+        self._vc_last_check = it
+        if len(self._vc_track_deque) < self._vc_min_episodes:
+            return
+        mean_track = sum(self._vc_track_deque) / len(self._vc_track_deque)
+        if mean_track >= self._vc_frac * self._vc_track_max:
+            self._vc_level = min(1.0, self._vc_level + self._vc_step)
+            self._apply_velocity_curriculum_level()
+            self._vc_track_deque.clear()  # re-measure at the new, harder range
+            print(f"[vel-curriculum] iter {it}: tracking {mean_track:.4f} ≥ "
+                  f"{self._vc_frac * self._vc_track_max:.4f} → level={self._vc_level:.2f} "
+                  f"x=[{self.commands_limits[0][0]:.2f}, {self.commands_limits[1][0]:.2f}]")
+
+    def set_velocity_level(self, level: float) -> None:
+        """Force the curriculum level (used to sync the video env and to restore on resume)."""
+        if not getattr(self, "_vc_enabled", False):
+            return
+        self._vc_level = float(max(0.0, min(1.0, level)))
+        self._apply_velocity_curriculum_level()
 
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
@@ -814,15 +849,10 @@ class K1Env:
                 reset_indices = envs_idx.nonzero(as_tuple=True)[0]
                 self.inv_heading_quat[reset_indices] = inv_h[reset_indices]
 
-    def _resample_commands(self, envs_idx, walk_only: bool = False):
-        if self._jog_mix_ratio is not None and not walk_only:
-            # mid-episode resampling: per-env randomly pick walk or jog range
-            cmds_jog  = gs_rand(*self._jog_commands_limits,     (self.num_envs,))
-            cmds_walk = gs_rand(*self._pre_jog_commands_limits, (self.num_envs,))
-            use_jog   = torch.rand(self.num_envs, device=gs.device) < self._jog_mix_ratio
-            commands  = torch.where(use_jog[:, None], cmds_jog, cmds_walk)
-        else:
-            commands = gs_rand(*self.commands_limits, (self.num_envs,))
+    def _resample_commands(self, envs_idx):
+        # Sample from the current curriculum command range (commands_limits is widened over
+        # training by the adaptive velocity curriculum). self.commands smooths toward the target.
+        commands = gs_rand(*self.commands_limits, (self.num_envs,))
         # Write to command_target; self.commands smooths toward it each step.
         if envs_idx is None:
             self.command_target.copy_(commands)
@@ -967,6 +997,10 @@ class K1Env:
         # episode_length_buf was already zeroed above — use saved lengths
         durations_s = (saved_ep_lengths.float() * self.dt).clamp(min=self.dt)
 
+        # Velocity curriculum: record the terminated episodes' tracking quality (before the
+        # episode_sums are zeroed below) so update_velocity_curriculum() can gate range expansion.
+        self._record_curriculum_tracking(envs_idx, saved_ep_lengths)
+
         self.extras["episode"] = {}
         for key, value in self.episode_sums.items():
             if envs_idx is None:
@@ -984,10 +1018,9 @@ class K1Env:
             else:
                 value.masked_fill_(envs_idx, 0.0)
 
-        # On reset always assign walk commands so the robot starts stable.
-        # Jog commands are introduced only during mid-episode resampling (every
-        # resampling_time_s), where the robot has time to be upright first.
-        self._resample_commands(envs_idx, walk_only=True)
+        # Resample commands from the current curriculum range. Command smoothing (command_smooth_s)
+        # + the gradual curriculum widening keep speed transitions in-distribution.
+        self._resample_commands(envs_idx)
         # Snap commands immediately to target on reset — no ramp needed at episode start.
         if envs_idx is None:
             self.commands.copy_(self.command_target)

@@ -87,10 +87,8 @@ def main() -> None:
     if args.checkpoint is not None:
         runner.load(args.checkpoint)
         print(f"Resumed from {args.checkpoint} at iteration {runner.current_learning_iteration}")
-        # Sync jogging curriculum — _jog_mix_ratio is None after env init and only
-        # activates via update_jogging_curriculum(it). When resuming past start_iter
-        # that call never fires for the trigger iteration, so sync manually.
-        env.sync_jogging_curriculum(runner.current_learning_iteration)
+        # runner.load() restores the adaptive velocity-curriculum level from the checkpoint
+        # (it is performance-driven, so it can't be recomputed from the iteration number).
 
     run_training(runner, args.max_iterations)
 

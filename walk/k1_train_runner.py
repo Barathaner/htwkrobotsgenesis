@@ -77,28 +77,23 @@ class K1TrainRunner(OnPolicyRunner):
             device=self.device,
         ).to(self.device)
 
-        # Include jog NPZ alongside slow NPZ when jogging curriculum is enabled so the
-        # single discriminator training pass (via alg.update) covers both motion styles.
+        # Include jog NPZ alongside slow NPZ so the single discriminator training pass (via
+        # alg.update) covers both motion styles. The discriminator covers the full speed range
+        # from iter 0 — the velocity curriculum only gates which commands the policy is asked for.
         cmd_cfg = self.env.command_cfg
-        jog_cfg = self.env.env_cfg.get("jogging_curriculum", {})
-        jog_path = jog_cfg.get("style_motion_file") if jog_cfg.get("enabled", False) else None
+        vc_cfg = self.env.env_cfg.get("velocity_curriculum", {})
+        jog_path = vc_cfg.get("jog_style_motion_file")
         default_slow = self.env.reward_cfg["style_motion_file"]
         motion_paths = amp_cfg.get("motion_paths",
                                    [default_slow] + ([jog_path] if jog_path else []))
 
         # Command label: each expert transition is labelled with the clip's OWN heading-frame
         # velocity (computed in K1AMPLoader), so the discriminator learns p_expert(motion | velocity).
-        # cmd_ranges only CLAMP that label to the GLOBAL commandable range (walk ∪ jog) as a safety
-        # bound against finite-difference outliers — NOT the per-style target range, which would
-        # distort the true label (e.g. the jog clip's real ~0.9 m/s is below the jog target's 1.0).
+        # cmd_ranges only CLAMP that label to the full commandable range (= command_cfg, which is the
+        # curriculum's level-1 target) as a safety bound against finite-difference outliers.
         yaw = cmd_cfg["ang_vel_range"]
-        x_lo, x_hi = cmd_cfg["lin_vel_x_range"]
-        y_lo, y_hi = cmd_cfg["lin_vel_y_range"]
-        if jog_path:
-            x_lo = min(x_lo, jog_cfg["target_lin_vel_x_range"][0]); x_hi = max(x_hi, jog_cfg["target_lin_vel_x_range"][1])
-            y_lo = min(y_lo, jog_cfg["target_lin_vel_y_range"][0]); y_hi = max(y_hi, jog_cfg["target_lin_vel_y_range"][1])
-        glob_lo = np.array([x_lo, y_lo, yaw[0]], dtype=np.float32)
-        glob_hi = np.array([x_hi, y_hi, yaw[1]], dtype=np.float32)
+        glob_lo = np.array([cmd_cfg["lin_vel_x_range"][0], cmd_cfg["lin_vel_y_range"][0], yaw[0]], dtype=np.float32)
+        glob_hi = np.array([cmd_cfg["lin_vel_x_range"][1], cmd_cfg["lin_vel_y_range"][1], yaw[1]], dtype=np.float32)
         cmd_ranges = [(glob_lo, glob_hi)] * len(motion_paths)
 
         joint_names = self.env.env_cfg["joint_names"]
@@ -181,6 +176,7 @@ class K1TrainRunner(OnPolicyRunner):
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "discriminator_state_dict": self.alg.discriminator.state_dict(),
             "iter": self.current_learning_iteration,
+            "vc_level": getattr(self.env, "_vc_level", None),
             "infos": infos,
         }
         torch.save(saved_dict, path)
@@ -200,6 +196,9 @@ class K1TrainRunner(OnPolicyRunner):
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if "iter" in loaded_dict:
             self.current_learning_iteration = loaded_dict["iter"]
+        # Restore the adaptive velocity-curriculum level (performance-driven, not iteration-derived).
+        if loaded_dict.get("vc_level") is not None:
+            self.env.set_velocity_level(loaded_dict["vc_level"])
         return loaded_dict.get("infos")
 
     def _log_video_rollout(self, it: int, video_path: str) -> None:
@@ -229,9 +228,8 @@ class K1TrainRunner(OnPolicyRunner):
                 show_viewer=False,
                 record_camera=True,
             )
-            # If the video env is created after the jogging curriculum already
-            # triggered (lazy init past start_iter), apply it immediately.
-            self._video_env.sync_jogging_curriculum(self.current_learning_iteration)
+            # Match the lazily-created video env to the training env's current curriculum level.
+            self._video_env.set_velocity_level(getattr(self.env, "_vc_level", 1.0))
         return self._video_env
 
     def _record_video(self, it: int) -> str:
@@ -353,12 +351,12 @@ class K1TrainRunner(OnPolicyRunner):
             else:
                 self.style_weight = _sw_target
 
-            # ── Jogging curriculum ────────────────────────────────────────────
-            # Hard-switch command ranges at start_iter (velocity range only; style
-            # conditioning is handled continuously by _setup_conditioned_amp_data).
-            self.env.update_jogging_curriculum(it)
+            # ── Adaptive velocity curriculum ──────────────────────────────────
+            # Widen the commanded velocity range when recent episodes track well (performance-gated,
+            # Rudin-style). The discriminator already covers all speeds, so no style curriculum.
+            self.env.update_velocity_curriculum(it)
             if self._video_env is not None:
-                self._video_env.update_jogging_curriculum(it)
+                self._video_env.set_velocity_level(getattr(self.env, "_vc_level", 1.0))
 
             start = time.time()
             with torch.inference_mode():
