@@ -3,7 +3,6 @@
 Usage:
   .venv/bin/python walk/test_k1_env.py --test a
   .venv/bin/python walk/test_k1_env.py --test b
-  .venv/bin/python walk/test_k1_env.py --test c --reward base_height
   .venv/bin/python walk/test_k1_env.py --test c --reward action_rate
   .venv/bin/python walk/test_k1_env.py --test d --num-envs 64
   .venv/bin/python walk/test_k1_env.py --test all
@@ -24,28 +23,22 @@ from K1_env import K1Env
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "k1_env.yaml")
 ALL_REWARDS = [
-    "base_height",
-    "similar_to_default",
     "lin_vel_z",
     "action_rate",
     "tracking_lin_vel",
-    "command_accuracy",
     "tracking_ang_vel",
-    "contact_stride",
     "feet_air_time",
-    "no_alternation",
+    "feet_slip",
+    "leg_symmetry",
 ]
 REWARD_SCALE_DEFAULTS = {
-    "base_height": -50.0,
-    "similar_to_default": -0.1,
     "lin_vel_z": -1.0,
     "action_rate": -0.005,
     "tracking_lin_vel": 1.0,
-    "command_accuracy": 1.0,
     "tracking_ang_vel": 0.2,
-    "contact_stride": -0.3,
     "feet_air_time": 0.5,
-    "no_alternation": -1.0,
+    "feet_slip": -1.0,
+    "leg_symmetry": -2.0,
 }
 
 
@@ -103,10 +96,9 @@ def print_reward_breakdown(env: K1Env, step_i: int, rew_total: float) -> None:
     vz = float(env.base_lin_vel[0, 2])
     vx, vy = float(env.base_lin_vel[0, 0]), float(env.base_lin_vel[0, 1])
     roll, pitch = float(env.base_euler[0, 0]), float(env.base_euler[0, 1])
-    pose_dev = float(env._reward_similar_to_default()[0])
     lines.append(
         f"    state: z={z:.4f}  vz={vz:.4f}  vx={vx:.4f}  vy={vy:.4f}  "
-        f"roll={roll:.1f}° pitch={pitch:.1f}°  pose_dev={pose_dev:.4f}"
+        f"roll={roll:.1f}° pitch={pitch:.1f}°"
     )
     print("\n".join(lines))
 
@@ -141,10 +133,10 @@ def test_a(steps: int = 500) -> bool:
 
     z_min, z_max = min(z_history), max(z_history)
     z_final = z_history[-1]
-    target = env.reward_cfg["base_height_target"]
+    target = env.env_cfg["base_init_pos"][2]
 
     print("\nErgebnis:")
-    print(f"  z: min={z_min:.4f}  max={z_max:.4f}  final={z_final:.4f}  target={target}")
+    print(f"  z: min={z_min:.4f}  max={z_max:.4f}  final={z_final:.4f}  init={target}")
     print(f"  Episode-Ende (Umfallen/Timeout): step {done_at if done_at is not None else 'keins'}")
     print("  NaNs: keine")
 
@@ -217,16 +209,13 @@ def test_c(reward_name: str | None = None, steps: int = 200) -> bool:
     print("Was passiert: Nur EIN Reward aktiv, wir prüfen ob contrib sinnvoll reagiert.\n")
 
     action_plan = {
-        "base_height": ("zero", "z nahe 0.53 → contrib≈0; z weit weg → contrib negativer"),
-        "similar_to_default": ("zero", "pose_dev≈0 → contrib≈0; beim Kippen pose_dev steigt"),
         "lin_vel_z": ("zero", "vz≈0 → contrib≈0; beim Fallen vz groß → contrib negativ"),
         "action_rate": ("random", "jeder Step neue Random-Aktion → contrib < 0; bei zero = 0"),
-        "tracking_lin_vel": ("zero", "cmd=[0.5,0], vx≈0 → raw≈exp(-0.25)≈0.37; vx=0.5 → raw≈1.0"),
-        "command_accuracy": ("zero", "cmd=[0.5,0], Heading-vx≈0 → raw≈0.37; Heading-vx=0.5 → raw≈1.0"),
+        "tracking_lin_vel": ("zero", "cmd=[0.5,0], Heading-vx≈0 → raw≈exp(-0.25)≈0.37; Heading-vx=0.5 → raw≈1.0"),
         "tracking_ang_vel": ("zero", "cmd=0, yaw_rate≈0 → raw≈1.0"),
-        "contact_stride": ("random", "Touchdowns/s vs cmd/L; raw≥0, nur bei cmd>0.2 m/s aktiv"),
-        "feet_air_time": ("random", "raw>0 beim Aufsetzen nach >0.12s Luft; 0 bei cmd≈0 / Schlurfen"),
-        "no_alternation": ("random", "raw>0 wenn ein Fuß >0.5s in der Luft festhängt, sonst 0"),
+        "feet_air_time": ("random", "Bonus = (air_time − target) beim Aufsetzen; >0 bei langen Schritten, 0 bei cmd≈0"),
+        "feet_slip": ("random", "raw>0 wenn Stützfuß im Kontakt horizontal rutscht; 0 bei stillem Stützfuß"),
+        "leg_symmetry": ("random", "raw>0 bei both_air/zu langer Doppelstütze; 0 bei sauberer Alternation/cmd≈0"),
     }
 
     all_ok = True
@@ -304,67 +293,35 @@ def test_d(num_envs: int = 64, steps: int = 50) -> bool:
 # Test E — feet_air_time landing reward (deterministisch)
 # ---------------------------------------------------------------------------
 def test_e() -> bool:
-    print("\n=== Test E: feet_air_time + Alternations-Gate + no_alternation ===")
-    print("Idee: stehen lassen bis gewünschte Fußkonfiguration, dann (ohne scene.step!) den")
-    print("vorherigen Zustand auf 'in der Luft' setzen und _update_foot_contact() auslösen.")
-    print("Da keine Physik dazwischen läuft, sind die Fußpositionen identisch → deterministisch.\n")
+    print("\n=== Test E: feet_air_time (phasen-gekoppelt: On-Beat + Kadenz) ===")
+    print("Idee: Touchdown nur wenn _desired_stance() und Luftzeit nahe gait_swing_time.\n")
 
-    env = make_env(num_envs=1, reward_names=["feet_air_time", "no_alternation"])
-    min_air = env.reward_cfg["feet_air_time_min"]
-    cap = env.reward_cfg["feet_air_time_max"]
+    env = make_env(num_envs=1, reward_names=["feet_air_time"])
+    swing = env.gait_swing_time
     fwd = torch.tensor([0.6, 0.0, 0.0], device=gs.device)
 
-    def settle_until(n_target: int, max_steps: int = 150) -> bool:
-        env.reset()
-        for _ in range(max_steps):
-            env.step(zero_actions(env))
-            if int(env.foot_in_contact[0].sum()) == n_target:
-                return True
-        return False
-
-    def land_with(cmd, air_time):
+    def land_with(cmd, air_time, phase=0.05, step_quality=1.0):
         env.commands[:] = cmd
-        env.foot_in_contact[:] = False  # vorheriger Step: alle Füße galten als 'in der Luft'
+        env.gait_phase[:] = phase
+        env.foot_in_contact[:] = False
         env.foot_air_time[:] = air_time
-        env._update_foot_contact()  # liest aktuelle (unveränderte) Fußhöhen → Touchdown
+        env.foot_step_quality[:] = step_quality
+        env._update_foot_contact()
         return float(env._reward_feet_air_time()[0]), int(env.foot_in_contact[0].sum())
 
-    ok = True
+    # On-beat bei φ=0.05 (Doppelstütz-Fenster), swing_time≈0.32 s
+    rew_good, n = land_with(fwd, swing - env.dt, phase=0.05, step_quality=1.0)
+    rew_short, _ = land_with(fwd, 0.05, phase=0.05, step_quality=1.0)
+    rew_offbeat, _ = land_with(fwd, swing - env.dt, phase=0.75, step_quality=1.0)
+    rew0, _ = land_with(torch.zeros(3, device=gs.device), swing - env.dt, phase=0.05, step_quality=1.0)
 
-    # --- feet_air_time positiv: BEIDE Füße am Boden → Alternation erfüllt → Reward > 0 ---
-    if settle_until(2):
-        rew, n = land_with(fwd, 0.30)
-        expected = min(0.30 + env.dt - min_air, cap) * n
-        print(f"  Landung beide Füße (cmd=0.6): raw={rew:.4f} (≈{expected:.4f}), in_contact={n}")
-        ok &= rew > 0.0 and n == 2
-        rew0, _ = land_with(torch.zeros(3, device=gs.device), 0.30)
-        print(f"  Landung bei cmd=0 (Stehen):   raw={rew0:.4f} (erwartet 0)")
-        ok &= rew0 == 0.0
-        rews, _ = land_with(fwd, 0.05)
-        print(f"  Landung nach 0.05s (< min):   raw={rews:.4f} (erwartet 0)")
-        ok &= rews == 0.0
-    else:
-        print("  HINWEIS: kein Frame mit beiden Füßen in Kontakt — feet_air_time-Test übersprungen.")
+    print(f"  on-beat, air≈swing ({swing:.2f}s): raw={rew_good:.4f} (>0)")
+    print(f"  on-beat, kurze Luft:              raw={rew_short:.4f} (< good)")
+    print(f"  off-beat:                          raw={rew_offbeat:.4f} (=0)")
+    print(f"  cmd=0:                             raw={rew0:.4f} (=0)")
 
-    # --- Alternations-Gate: nur EIN Fuß am Boden → Landung NICHT belohnt (kein Einbein-Hüpfen) ---
-    if settle_until(1):
-        rew, n = land_with(fwd, 0.30)
-        print(f"  Landung nur EIN Fuß (cmd=0.6): raw={rew:.4f} (erwartet 0 = Gate), in_contact={n}")
-        ok &= rew == 0.0 and n == 1
-    else:
-        print("  HINWEIS: kein Frame mit genau einem Fuß in Kontakt — Alternations-Test übersprungen.")
-
-    # --- no_alternation: Strafe für festgehaltenen Fuß (liest nur foot_air_time, deterministisch) ---
-    stuck = env.reward_cfg["feet_air_time_stuck"]
-    env.foot_air_time[:] = 0.0
-    env.foot_air_time[0, 0] = 0.40  # normaler Schwung < stuck
-    normal = float(env._reward_no_alternation()[0])
-    env.foot_air_time[0, 0] = stuck + 0.30  # Fuß hängt 0.30 s über der Schwelle fest
-    held = float(env._reward_no_alternation()[0])
-    print(f"  no_alternation: Schwung 0.40s={normal:.3f} (erw. 0), festgehalten={held:.3f} (erw. 0.30)")
-    ok &= normal == 0.0 and abs(held - 0.30) < 1e-5
-
-    print(f"  {'PASS' if ok else 'FAIL'}: Reward nur bei Wechselschritt; festgehaltener Fuß wird bestraft.")
+    ok = rew_good > rew_short > 0 and rew_offbeat == 0.0 and rew0 == 0.0
+    print(f"  {'PASS' if ok else 'FAIL'}: On-Beat-Gating + Gauß-Luftzeit.")
     return ok
 
 

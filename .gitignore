@@ -9,7 +9,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-
+rltrainingvenv/
 # --- Genesis & MuJoCo Runtime ---
 # MuJoCo generiert oft temporäre XMLs oder Cache-Files
 *.mjb
@@ -25,7 +25,7 @@ models/flat/*.dae
 # Aber die Konfigurationsdateien für die Generierung behalten!
 !models/field_generator.py
 !configs/*.json
-
+*.csv
 # --- Training Outputs (Heavy Data) ---
 checkpoints/
 logs/
