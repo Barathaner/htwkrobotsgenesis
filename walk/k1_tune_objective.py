@@ -45,11 +45,31 @@ def hero_composite_score(
     return score
 
 
-def intermediate_training_metric(runner) -> float:
-    """Proxy for pruning: mean completed episode length from logger or env."""
+def _mean_episode_length(runner) -> float:
     logger = runner.logger
     for attr in ("episode_length_buffer", "lenbuffer", "episode_lengths"):
         buf = getattr(logger, attr, None)
         if buf is not None and len(buf) > 0:
             return float(sum(buf) / len(buf))
     return float(runner.env.episode_length_buf.float().mean().item())
+
+
+def intermediate_training_metric(runner) -> float:
+    """Proxy for pruning.
+
+    Raw episode length is confounded by the adaptive velocity curriculum: episodes briefly shorten
+    right after an expansion (harder commands), which could prune a good trial. Raw tracking reward
+    is confounded the OTHER way: a trial whose curriculum stayed narrow is only commanded easy slow
+    speeds, so its tracking looks great — pruning on it would reward trials for not progressing.
+
+    So when the curriculum is active we use a progress-aware metric: the curriculum LEVEL
+    (competence — monotonic, so expansions never cause a dip) plus the survival fraction (which
+    differentiates trials once the level saturates at 1.0). Falls back to episode length otherwise.
+    """
+    env = runner.env
+    ep_len = _mean_episode_length(runner)
+    if getattr(env, "_vc_enabled", False):
+        max_len = float(getattr(env, "max_episode_length", 0) or 0)
+        survival = (ep_len / max_len) if max_len > 0 else 0.0
+        return float(getattr(env, "_vc_level", 1.0)) + survival
+    return ep_len

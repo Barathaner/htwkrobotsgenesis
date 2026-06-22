@@ -125,7 +125,9 @@ def print_top_trials(
             continue
         scales = sample_reward_scales_from_params(t.params, baseline_scales)
         amp_params = {name: t.params[f"amp/{name}"] for name in amp_search_space if f"amp/{name}" in t.params}
-        print(f"  trial {t.number:3d}  score={t.value:.4f}")
+        vc_level = t.user_attrs.get("vc_level")
+        vc_str = f"  vc_level={vc_level:.2f}" if vc_level is not None else ""
+        print(f"  trial {t.number:3d}  score={t.value:.4f}{vc_str}")
         for k, v in sorted(scales.items()):
             print(f"    scale/{k:20s} {v:+.4f}")
         for k, v in sorted(amp_params.items()):
@@ -299,10 +301,13 @@ def main() -> None:
             on_iteration_end=on_iteration_end,
         )
 
+        def _fmt(v):
+            return f"{v:.3f}" if isinstance(v, (int, float)) else str(v)
+
         try:
             print(
-                f"\n[optuna] trial {trial.number}: style_weight={amp_params.get('style_weight', '?'):.3f}  "
-                f"amp_reward_scale={amp_params.get('amp_reward_scale', '?'):.3f}  "
+                f"\n[optuna] trial {trial.number}: style_weight={_fmt(amp_params.get('style_weight'))}  "
+                f"amp_reward_scale={_fmt(amp_params.get('amp_reward_scale'))}  "
                 f"wandb='{run_name}'"
             )
             try:
@@ -314,6 +319,11 @@ def main() -> None:
                 except Exception:
                     pass
                 raise
+            # Evaluate every trial on the FULL command range (velocity curriculum level 1.0) so all
+            # trials are scored on the same distribution. A policy whose curriculum never expanded is
+            # judged on the speeds it would actually face — not just the easy slow ones it trained on.
+            if hasattr(env, "set_velocity_level"):
+                env.set_velocity_level(1.0)
             policy = runner.get_inference_policy(device=runner.device)
             raw_means = eval_raw_means(env, policy, n_steps=eval_steps)
             score = hero_composite_score(raw_means, objective_weights)
@@ -321,6 +331,9 @@ def main() -> None:
             trial.set_user_attr("reward_scales", scales)
             trial.set_user_attr("amp_params", amp_params)
             trial.set_user_attr("wandb_run_name", run_name)
+            # How far the velocity curriculum expanded (1.0 = full range). Low values explain a
+            # low score: the policy never earned the harder commands it was then evaluated on.
+            trial.set_user_attr("vc_level", float(getattr(env, "_vc_level", 1.0)))
             return score
         finally:
             del runner, env
