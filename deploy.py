@@ -55,14 +55,10 @@ def control_position(robot, values, dofs_idx, order):
 
 def prepare_to_default(robot, motor_dofs, motor_order, motor_default,
                        fixed_dofs, fixed_order, fixed_target, n_steps=100):
-    """Smoothly PD-ramp the policy and fixed joints from their current angles to the default pose,
-    like the real robot's bring-up. Uses split motor/fixed control so each target lands on the right
-    joint (see control_position). The robot must already be standing — ramping from a non-standing
-    pose topples it, since only the policy can balance the marginally-stable bent-knee pose.
-
-    n_steps is intentionally short: with no policy active and no physical support, the default pose is
-    only marginally stable in sim and topples after ~15-20 open-loop steps (it survives much longer on
-    the real robot's flat feet). 10 steps is a smooth settle that hands off to the policy in time."""
+    """Smoothly PD-ramp the policy and fixed joints from their current angles (the URDF rest pose at
+    spawn) to the default pose over n_steps, like the real robot's bring-up, then hand to the policy.
+    Ramping all joints together — crucially the arms to their non-zero defaults (shoulder roll ±1.5),
+    not left at the T-pose zero — keeps the robot balanced through the whole ramp."""
     q_motor = robot.get_dofs_position(motor_dofs).clone()
     q_fixed = robot.get_dofs_position(fixed_dofs).clone()
     for i in range(n_steps):
@@ -144,7 +140,7 @@ if __name__ == "__main__":
         proj_grav = geom.transform_by_quat(g_world, geom.inv_quat(base_quat))
 
 
-        commands = torch.tensor([1.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
+        commands = torch.tensor([0.5, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
         commands_scale = torch.tensor(
             [
                 config["policy"]["commands_scales"]["lin_vel_x"],
