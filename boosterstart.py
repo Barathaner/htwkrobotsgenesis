@@ -1,6 +1,6 @@
-import booster
+import booster_robotics_sdk_python
 
-client = booster.BoosterClient("127.0.0.1")
+client = booster_robotics_sdk_python.BoosterClient("127.0.0.1")
 status = client.get_robot_status()
 
 print(f"Mode:    {status.mode}")
