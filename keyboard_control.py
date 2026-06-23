@@ -13,11 +13,8 @@ Keys:
   + or =       increase selected joint target by step
   - or _       decrease selected joint target by step
   [ / ]        halve / double step size
-r            reset targets back to startup positions (current at launch)
-  g            go to DEFAULT_POS (standing pose)
+  r            reset ALL joints to defaults
   q or ESC     quit — sends damp + kDamping mode
-
-Targets ramp toward user-set values at MAX_VEL rad/s to avoid sudden jumps.
 """
 
 from __future__ import annotations
@@ -228,15 +225,11 @@ def damp_cmd() -> LowCmd:
 HEADER_LINES = 6   # title + IMU + step/status + separator + column header + separator
 FOOTER_LINES = 2   # separator + help line
 
-# Max rate the *sent* command ramps toward user target (rad/s); prevents sudden jumps.
-MAX_VEL = 0.5  # rad/s → 0.01 rad per 50 Hz tick
-
 
 def _draw(
     stdscr,
     state_buf: RobotStateBuffer,
     targets: list[float],
-    sent: list[float],
     selected: int,
     scroll: int,
     step: float,
@@ -255,9 +248,9 @@ def _draw(
         f"yaw={math.degrees(rpy[2]):+6.1f}°",
     )
     stdscr.addstr(2, 0, f"Step: {step:.4f} rad    {status}")
-    stdscr.addstr(3, 0, "─" * min(w - 1, 84))
-    stdscr.addstr(4, 0, f"  {'#':>2}  {'Joint':<18}  {'Target':>10}  {'Sent':>10}  {'Current':>10}  {'Δ sent':>8}  Type")
-    stdscr.addstr(5, 0, "─" * min(w - 1, 84))
+    stdscr.addstr(3, 0, "─" * min(w - 1, 72))
+    stdscr.addstr(4, 0, f"  {'#':>2}  {'Joint':<18}  {'Target':>10}  {'Current':>10}  {'Δ':>8}  Type")
+    stdscr.addstr(5, 0, "─" * min(w - 1, 72))
 
     # ── joint rows (scrollable viewport) ─────────────────────────────────────
     viewport = h - HEADER_LINES - FOOTER_LINES
@@ -267,17 +260,15 @@ def _draw(
             break
         screen_row = HEADER_LINES + row_idx
         cur_q = state_buf.q(joint_idx)
-        delta = sent[joint_idx] - cur_q
+        delta = targets[joint_idx] - cur_q
         is_crank = joint_idx in K1_CRANK_INDICES
         ctrl_type = "CRANK(τ)" if is_crank else "pos"
-        ramping = abs(targets[joint_idx] - sent[joint_idx]) > 0.001
         line = (
             f"  {joint_idx:>2}  {JOINT_NAMES[joint_idx]:<18}"
             f"  {targets[joint_idx]:>+10.4f}"
-            f"  {sent[joint_idx]:>+10.4f}"
             f"  {cur_q:>+10.4f}"
             f"  {delta:>+8.4f}"
-            f"  {ctrl_type}{'  >' if ramping else ''}"
+            f"  {ctrl_type}"
         )
         attr = curses.color_pair(0)
         if joint_idx == selected:
@@ -292,10 +283,10 @@ def _draw(
     # ── footer ────────────────────────────────────────────────────────────────
     footer_row = h - FOOTER_LINES
     try:
-        stdscr.addstr(footer_row, 0, "─" * min(w - 1, 84))
+        stdscr.addstr(footer_row, 0, "─" * min(w - 1, 72))
         stdscr.addstr(
             footer_row + 1, 0,
-            "↑↓:select  PgUp/PgDn:jump5  +/-:nudge  [/]:step  r:reset  g:go-to-defaults  q/ESC:quit",
+            "↑↓:select  PgUp/PgDn:jump5  +/-:nudge  [/]:step  r:reset  q/ESC:quit",
         )
     except curses.error:
         pass
@@ -312,17 +303,13 @@ def _tui(stdscr, args: argparse.Namespace, state_buf: RobotStateBuffer,
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selected
     curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # crank
 
-    # Start from wherever the robot currently is — no sudden jump on launch.
-    init_pos = [state_buf.q(i) for i in range(K1_JOINT_CNT)]
-    targets  = list(init_pos)   # user-commanded goal
-    sent     = list(init_pos)   # what's actually sent (ramps toward targets)
+    targets  = list(DEFAULT_POS)
     selected = 0
     scroll   = 0
     step     = 0.05
-    status   = "Ready — nudge joints with + / -"
+    status   = "Ready — robot in Custom mode"
     low_cmd  = alloc_low_cmd()
     t_next   = time.monotonic()
-    max_delta = MAX_VEL * DT    # max change per 50 Hz tick
 
     while True:
         h, _ = stdscr.getmaxyx()
@@ -355,11 +342,8 @@ def _tui(stdscr, args: argparse.Namespace, state_buf: RobotStateBuffer,
             step = min(1.0, step * 2.0)
             status = f"Step size: {step:.4f} rad"
         elif key == ord('r'):
-            targets[:] = list(init_pos)
-            status = "Targets reset to startup positions"
-        elif key == ord('g'):
             targets[:] = list(DEFAULT_POS)
-            status = "Going to DEFAULT_POS (standing pose) — watch the robot!"
+            status = "All joints reset to defaults"
         elif key in (ord('q'), 27):  # q or ESC
             break
 
@@ -369,11 +353,6 @@ def _tui(stdscr, args: argparse.Namespace, state_buf: RobotStateBuffer,
         elif selected >= scroll + viewport:
             scroll = selected - viewport + 1
 
-        # ── ramp sent toward targets ──────────────────────────────────────────
-        for i in range(K1_JOINT_CNT):
-            diff = targets[i] - sent[i]
-            sent[i] += max(-max_delta, min(max_delta, diff))
-
         # ── fall detection ────────────────────────────────────────────────────
         if state_buf.is_fallen():
             rpy = state_buf.rpy
@@ -381,15 +360,15 @@ def _tui(stdscr, args: argparse.Namespace, state_buf: RobotStateBuffer,
                 f"FALL DETECTED  roll={math.degrees(rpy[0]):+.1f}°  "
                 f"pitch={math.degrees(rpy[1]):+.1f}°"
             )
-            _draw(stdscr, state_buf, targets, sent, selected, scroll, step, status)
+            _draw(stdscr, state_buf, targets, selected, scroll, step, status)
             break
 
         # ── send command ──────────────────────────────────────────────────────
-        update_low_cmd(low_cmd, sent, state_buf)
+        update_low_cmd(low_cmd, targets, state_buf)
         publisher.Write(low_cmd)
 
         # ── draw ──────────────────────────────────────────────────────────────
-        _draw(stdscr, state_buf, targets, sent, selected, scroll, step, status)
+        _draw(stdscr, state_buf, targets, selected, scroll, step, status)
 
         # ── pace to 50 Hz ─────────────────────────────────────────────────────
         t_next += DT
