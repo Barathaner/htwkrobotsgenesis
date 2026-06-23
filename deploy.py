@@ -7,6 +7,7 @@ import genesis as gs
 import os
 import yaml
 import genesis.utils.geom as geom
+from genesis.vis.keybindings import Key, KeyAction, Keybind
 with open("deploy.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -127,9 +128,41 @@ if __name__ == "__main__":
     prepare_to_default(robot, motor_dofs_robot, motor_order, default_motor,
                        fixed_dofs_robot, fixed_order, fixed_target)
 
+    # --- kill switch: cut all actuation so the robot collapses limp instead of twitching ----------
+    # Triggered either by a detected fall or by pressing 'q' in the viewer. Once limp, the loop just
+    # steps physics so the robot settles on the ground and stays there.
+    FALL_HEIGHT = 0.30   # base height [m] below which it counts as fallen (standing ~0.56)
+    FALL_TILT = -0.4     # projected-gravity z above this ⇒ tilted >~65° (upright ≈ -1.0)
+    killed = {"pending": False, "on": False}
+
+    def go_limp():
+        """Zero every joint's stiffness, damping and effort so the robot goes fully passive."""
+        zeros = [0.0] * len(dofs_idx)
+        robot.set_dofs_kp(zeros, dofs_idx)
+        robot.set_dofs_kv(zeros, dofs_idx)
+        robot.set_dofs_force_range(zeros, zeros, dofs_idx)
+
+    def request_kill():
+        killed["pending"] = True   # set from the viewer key-callback thread; applied in the loop
+
+    # 'q' in the Genesis viewer triggers the kill switch (overwrite=False keeps the camera controls).
+    if scene.viewer is not None:
+        scene.viewer.register_keybinds(
+            Keybind("kill_switch", Key.Q, KeyAction.PRESS, callback=request_kill),
+        )
+
     step = 0
     last_actions = torch.zeros((16,), dtype=gs.tc_float, device=gs.device)
     while True:
+        # Kill switch ('q' pressed): cut actuation once, then just let the robot settle limp.
+        if killed["pending"] and not killed["on"]:
+            killed["on"] = True
+            go_limp()
+            print("[kill] q pressed → motors off, robot limp")
+        if killed["on"]:
+            scene.step()
+            continue
+
         q = robot.get_dofs_position(motor_dofs_robot)
         dq = robot.get_dofs_velocity(motor_dofs_robot)
         base_ang_vel = robot.get_ang()
@@ -139,8 +172,17 @@ if __name__ == "__main__":
         g_world = torch.tensor([0.0, 0.0, -1.0], dtype=gs.tc_float, device=gs.device)
         proj_grav = geom.transform_by_quat(g_world, geom.inv_quat(base_quat))
 
+        # Fall detection: if the base drops or tilts too far, kill the policy and go limp so the
+        # robot collapses to the ground instead of twitching under continued inference.
+        if robot.get_pos()[2].item() < FALL_HEIGHT or proj_grav[2].item() > FALL_TILT:
+            killed["on"] = True
+            go_limp()
+            print("[kill] fall detected → motors off, robot limp")
+            scene.step()
+            continue
 
-        commands = torch.tensor([0.5, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
+
+        commands = torch.tensor([1.5, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
         commands_scale = torch.tensor(
             [
                 config["policy"]["commands_scales"]["lin_vel_x"],
