@@ -582,9 +582,9 @@ def update_low_cmd(
     All other joints: position control, kp/kd already set in alloc_low_cmd.
 
     ``fixed`` overrides the non-policy "fixed" joints (head, shoulder roll, elbow pitch). It
-    defaults to FIXED_JOINT_DEFAULTS, but the prepare/warmup phases pass MEASURED / ramped values
-    so these high-stiffness joints (shoulder roll = ±1.5!) never SNAP to their training default
-    when custom mode engages — that snap throws the arms up violently.
+    defaults to FIXED_JOINT_DEFAULTS, but the prepare phase passes MEASURED values so these
+    high-stiffness joints (shoulder roll = ±1.5!) never SNAP to their training default when custom
+    mode engages — that snap throws the arms up violently.
     """
     fx = fixed if fixed is not None else FIXED_JOINT_DEFAULTS
     (
@@ -726,40 +726,9 @@ def log_initial_state(state_buf: "RobotStateBuffer") -> None:
         print("  WARNING: every measured joint position is ~0 — the state feed or joint "
               "mapping is wrong (robot is not really at zero). Fix this before commanding torque.")
     elif max_dev > 0.5:
-        print("  WARNING: robot is far from the policy's default pose. Use --warmup to ramp in, "
-              "or place it at the default stance before starting, or it will fall immediately.")
+        print("  WARNING: robot is far from the policy's default pose. The policy commands targets "
+              "relative to that default, so it will pull the joints toward it once it starts.")
     print("--------------------------------------------------------------------")
-
-
-def warmup_to_default(
-    publisher, state_buf: "RobotStateBuffer", seconds: float, publish_dt: float = 0.002
-) -> None:
-    """Linearly ramp the WHOLE robot from its measured pose to the training default over *seconds*.
-
-    Ramps BOTH the 16 policy joints (→DEFAULT_DOF_POS) and the 6 fixed joints (→FIXED_JOINT_DEFAULTS,
-    incl. shoulder roll ±1.5). The fixed joints are high-stiffness and were previously snapped to
-    their default on the very first frame, which threw the arms up. Ramping them from the measured
-    pose removes that jump. Publishes at *publish_dt* (500 Hz) so the robot's watchdog stays happy.
-    """
-    steps = max(1, round(seconds / publish_dt))
-    start_pos, _ = state_buf.get_dof_pos_vel()           # 16 policy joints, measured
-    start_fixed = state_buf.get_fixed_pos()              # 6 fixed joints, measured
-    defaults = DEFAULT_DOF_POS.tolist()
-    low_cmd = alloc_low_cmd()
-    print(f"Warmup: ramping WHOLE pose (incl. arms) to default over {seconds:.1f}s "
-          f"({steps} frames @ {1/publish_dt:.0f} Hz)…")
-    t_next = time.monotonic()
-    for i in range(steps):
-        a = (i + 1) / steps
-        target = [(1.0 - a) * s + a * d for s, d in zip(start_pos, defaults)]
-        fixed = {k: (1.0 - a) * start_fixed[k] + a * FIXED_JOINT_DEFAULTS[k] for k in FIXED_JOINT_DEFAULTS}
-        update_low_cmd(low_cmd, target, state_buf.get_crank_pos(), fixed=fixed)
-        publisher.Write(low_cmd)
-        t_next += publish_dt
-        sl = t_next - time.monotonic()
-        if sl > 0:
-            time.sleep(sl)
-    print("Warmup done — robot at default pose (arms included).")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -809,7 +778,7 @@ def run(args: argparse.Namespace) -> None:
 
     # Stream a valid frame that HOLDS THE CURRENT MEASURED POSE (no jump) before the mode switch.
     # NEVER command the training default here: the high-stiffness fixed shoulder-roll joints (±1.5)
-    # would snap and throw the arms up. The warmup below ramps smoothly to the default afterwards.
+    # would snap and throw the arms up. The policy then runs straight from the measured pose.
     prepare_cmd = alloc_low_cmd()
     print("Streaming prepare frames (HOLDING current pose) at 500 Hz before mode switch…")
     t_p = time.monotonic()
@@ -832,26 +801,21 @@ def run(args: argparse.Namespace) -> None:
            "Check that the robot is in a state that allows SDK control (RC/operator handover).")
     )
 
-    # Mandatory smooth ramp from the measured pose to the training default (arms included). A fast
-    # snap to the default is dangerous, so enforce a minimum ramp time even if the user lowers it.
-    warmup_s = args.warmup if args.warmup >= 0.5 else 1.5
-    if warmup_s != args.warmup:
-        print(f"NOTE: raising warmup to {warmup_s:.1f}s — a fast snap to the default pose throws the arms.")
-
     print(
         f"Run config: interface={args.interface}  commands(vx,vy,wz)={commands}  "
         f"duration={args.duration}s  gait_period={GAIT_PERIOD_S}s ({GAIT_PERIOD_STEPS} steps)  "
-        f"action_scale={ACTION_SCALE}  warmup={warmup_s}s  "
-        f"publish={1/PUBLISH_DT:.0f}Hz infer={1/DT:.0f}Hz"
+        f"action_scale={ACTION_SCALE}  publish={1/PUBLISH_DT:.0f}Hz infer={1/DT:.0f}Hz"
     )
 
-    warmup_to_default(publisher, state_buf, warmup_s, PUBLISH_DT)
-
-    print("Starting policy loop.")
+    # NO default-pose ramp: the policy runs straight from the robot's CURRENT measured pose. The
+    # command filter therefore starts at the measured pose (not DEFAULT_DOF_POS), so nothing is
+    # driven toward a default stance. NOTE: the policy's own targets = action*scale + DEFAULT_DOF_POS
+    # (intrinsic to how it was trained), so once it runs it still pulls the joints toward that.
+    print("Starting policy loop (running from current measured pose; no default-pose ramp).")
     last_actions: list[float] = [0.0] * NUM_ACTIONS
-    # Filter/target start at the default pose so the first frames hold the prepared stance.
-    raw_dof_pos: list[float] = DEFAULT_DOF_POS.tolist()
-    filtered_dof_pos: list[float] = DEFAULT_DOF_POS.tolist()
+    start_pose = state_buf.get_dof_pos_vel()[0]
+    raw_dof_pos: list[float] = list(start_pose)
+    filtered_dof_pos: list[float] = list(start_pose)
     actions = torch.zeros(NUM_ACTIONS)
     obs = None
     roll = pitch = 0.0
@@ -993,10 +957,6 @@ def main() -> None:
     parser.add_argument("--vx",        type=float, default=0.0,  help="Commanded forward velocity [m/s]")
     parser.add_argument("--vy",        type=float, default=0.0,  help="Commanded lateral velocity [m/s]")
     parser.add_argument("--wz",        type=float, default=0.0,  help="Commanded yaw rate [rad/s]")
-    parser.add_argument("--warmup",    type=float, default=2.0,
-                        help="Seconds to smoothly ramp the WHOLE robot (incl. arms) from its measured "
-                             "pose to the training default before the policy runs. A minimum of 1.5s "
-                             "is enforced — a fast snap to the default throws the arms up.")
     parser.add_argument("--verbose-steps", dest="verbose_steps", type=int, default=50,
                         help="Log every step for this many steps at startup (50 steps = 1 s), "
                              "then drop to 1 Hz. Useful when the robot falls in under a second.")
