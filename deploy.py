@@ -1,13 +1,11 @@
 
 
 import math
-from utils import make_dummy_student_obs
 import torch
 import torch.nn as nn
 import genesis as gs
 import os
 import yaml
-import numpy as np
 import genesis.utils.geom as geom
 with open("deploy.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -45,17 +43,14 @@ def load_model(checkpoint_path: str) -> tuple[ActorMLP, int, bool]:
 # create genesis environment
 
 
-def prepare_to_default(robot,dofs_idx,default_targets,n_steps=100):
-    "smooth drive joints to default pose"
-    q_start = robot.get_dofs_position(dofs_idx).clone()
-    for i in range(n_steps):
-        alpha = (i + 1) / n_steps
-        target = (1 - alpha) * q_start + alpha * default_targets
-        robot.control_dofs_position(target, dofs_idx)
-        scene.step()
-    for i in range(n_steps):
-        robot.control_dofs_position(default_targets, dofs_idx)
-        scene.step()
+# Genesis quirk: control_dofs_position(values, dofs_idx) assigns `values` in ASCENDING dof-index
+# order, NOT in the order of `dofs_idx` (the boolean-mask assignment in rigid_solver sorts the
+# indices). So the values must be pre-permuted by argsort(dofs_idx) for each target to land on the
+# right joint. get_dofs_position, by contrast, returns positionally (in dofs_idx order). Training
+# does exactly this (K1_env.py: actions_dof_idx = argsort(motors_dof_idx)). Skipping this scrambles
+# every joint target onto the wrong joint → the robot twitches and collapses.
+def control_position(robot, values, dofs_idx, order):
+    robot.control_dofs_position(values[order], dofs_idx)
 
 
 if __name__ == "__main__":
@@ -66,7 +61,7 @@ if __name__ == "__main__":
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(3.0, -2.0, 1.5), camera_lookat=(0.0, 0.0, 0.5), camera_fov=30,
         ),
-        sim_options=gs.options.SimOptions(dt=0.02),
+        sim_options=gs.options.SimOptions(dt=0.02, substeps=2),  # match training (K1_env.py)
     )
     plane = scene.add_entity(gs.morphs.Plane())
     robot = scene.add_entity(
@@ -78,12 +73,7 @@ if __name__ == "__main__":
 
     p = config["policy"]
     all_names= p["joint_names"] + p["fixed_joint_names"]
-    dofs_idx = [robot.get_joint(name).dof_idx_local for name in all_names]
-    default_pose = torch.tensor(
-        [p["default_joint_angles"][name] for name in all_names],
-        dtype=gs.tc_float,
-        device=gs.device,
-    )
+    dofs_idx = [idx for name in all_names for idx in robot.get_joint(name).dofs_idx_local]
 
     kp = [p["joint_gains"][name]["kp"] for name in all_names]
     kd = [p["joint_gains"][name]["kd"] for name in all_names]
@@ -93,18 +83,43 @@ if __name__ == "__main__":
     robot.set_dofs_force_range([-e for e in effort], effort, dofs_idx)
     model = load_model(config["policy"]["model"])
     print(model)
-    prepare_to_default(robot,dofs_idx,default_pose)
-    # qpos layout: 7 base (xyz + quat wxyz) followed by the URDF joints in urdf_joint_names order.
-    base = np.array([0.0, 0.0, 0.56, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    urdf_joint_names = config["policy"]["urdf_joint_names"]
-    joint_names = config["policy"]["joint_names"]
-    default_pose = np.array(
-        [config["policy"]["default_joint_angles"][name] for name in urdf_joint_names],
-        dtype=np.float32,
+
+    # Spawn the robot directly in the default (bent-knee) pose, like the training env does at reset.
+    # The URDF rest pose has straight legs, so at base height 0.56 the feet penetrate the ground —
+    # PD-ramping out of that penetration makes the robot collapse. robot.joints[1:] are in ascending
+    # dof order, so no reorder is needed here (unlike control_dofs_position).
+    init_dofs = [d for j in robot.joints[1:] for d in j.dofs_idx_local]
+    init_pose = torch.tensor(
+        [config["policy"]["default_joint_angles"].get(j.name, 0.0) for j in robot.joints[1:]],
+        dtype=gs.tc_float, device=gs.device,
     )
-    # Map each policy action (joint_names order) to its slot in the URDF qpos (urdf_joint_names order).
-    action_to_urdf = [urdf_joint_names.index(name) for name in joint_names]
-    motor_dofs_robot = [robot.get_joint(name).dof_idx_local for name in joint_names]
+    robot.set_dofs_position(init_pose, init_dofs)
+    robot.zero_all_dofs_velocity()
+
+    joint_names = p["joint_names"]
+    # 16-entry default for the policy joints (joint_names order), used to centre the obs.
+    default_motor = torch.tensor(
+        [p["default_joint_angles"][name] for name in joint_names],
+        dtype=gs.tc_float,
+        device=gs.device,
+    )
+    motor_dofs_robot = [idx for name in joint_names for idx in robot.get_joint(name).dofs_idx_local]
+    motor_order = torch.argsort(torch.tensor(motor_dofs_robot))
+
+    # Fixed joints (head etc.) are PD-held at their default every step, exactly like training.
+    fixed_names = p["fixed_joint_names"]
+    fixed_dofs_robot = [idx for name in fixed_names for idx in robot.get_joint(name).dofs_idx_local]
+    fixed_order = torch.argsort(torch.tensor(fixed_dofs_robot))
+    fixed_target = torch.tensor(
+        [p["default_joint_angles"][name] for name in fixed_names],
+        dtype=gs.tc_float,
+        device=gs.device,
+    )
+    clip_actions = p["clip_actions"]
+
+    # No passive settle: the bent-knee default pose is only marginally stable under PD, so holding it
+    # open-loop topples the robot. The robot is already placed at the default pose above (feet on the
+    # ground, zero velocity); hand control straight to the policy, which actively balances.
     step = 0
     last_actions = torch.zeros((16,), dtype=gs.tc_float, device=gs.device)
     while True:
@@ -130,31 +145,34 @@ if __name__ == "__main__":
         )
         commands = commands * commands_scale
 
-        obs_dof_pos = q - default_pose
-        #TODO: measure default pose on robot in prep mode adn correct order of dofs
-        dof_vel = dq * 0.05
-        #init with zeros
-        
+        obs_dof_pos = (q - default_motor) * config["policy"]["obs_scales"]["dof_pos"]
+        dof_vel = dq * config["policy"]["obs_scales"]["dof_vel"]
+
         phase = (step % config["policy"]["gait_period_steps"]) / config["policy"]["gait_period_steps"]
-        clock = [math.sin(phase * 2.0 * math.pi), math.cos(phase * 2.0 * math.pi)]
-        
-        # all together in right order
-        obs = torch.cat([obs_ang_vel, proj_grav, commands, obs_dof_pos, dof_vel, last_actions, torch.tensor(clock, dtype=gs.tc_float, device=gs.device)], dim=0)
+        clock = torch.tensor(
+            [math.sin(phase * 2.0 * math.pi), math.cos(phase * 2.0 * math.pi)],
+            dtype=gs.tc_float, device=gs.device,
+        )
+
+        # obs layout must match the training proprio group (K1_env.py _update_observation):
+        # ang_vel, projected_gravity, commands, dof_pos, dof_vel, last_actions, gait_clock
+        obs = torch.cat(
+            [obs_ang_vel, proj_grav, commands, obs_dof_pos, dof_vel, last_actions, clock], dim=0
+        )
         step += 1
 
 
         with torch.no_grad():
-            actions = model(obs)
-            actions_scaled = model(obs).squeeze(0).cpu().numpy() * config["policy"]["action_scale"]
-        print("motor_commands:", actions_scaled)
-        joint_angles = default_pose.copy()
-        for i, urdf_idx in enumerate(action_to_urdf):
-            joint_angles[urdf_idx] += actions_scaled[i]
+            actions = torch.clip(model(obs), -clip_actions, clip_actions)
+        # One-step action latency, matching training's simulate_action_latency=True: the motors
+        # execute the PREVIOUS action (last_actions) — the same value carried in the observation —
+        # while the freshly computed action is applied next step. Applying the current action
+        # immediately changes the closed-loop dynamics the policy was trained for and destabilises it.
+        targets = default_motor + last_actions * config["policy"]["action_scale"]
+        control_position(robot, targets, motor_dofs_robot, motor_order)
+        # Hold the non-policy joints at their default, like training does every step.
+        control_position(robot, fixed_target, fixed_dofs_robot, fixed_order)
 
-        qpos = np.concatenate([base, joint_angles], axis=0)
-        robot.set_qpos(torch.as_tensor(qpos, dtype=gs.tc_float, device=gs.device))
-
-
-        #clean for next iter
+        # carry the clipped action to the next step (executed then, and fed back into the obs)
         last_actions = actions
         scene.step()

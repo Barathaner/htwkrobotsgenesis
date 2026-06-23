@@ -3,6 +3,7 @@ policy:
   obs_dim: 59
   action_dim: 16
   action_scale: 0.25
+  clip_actions: 100.0
   dt: 0.02
   gait_period_s: 0.80
   gait_period_steps: 40
