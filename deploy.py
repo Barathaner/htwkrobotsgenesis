@@ -290,10 +290,22 @@ def crank_to_ankle(crank_up: float, crank_down: float) -> tuple[float, float]:
 # ---------------------------------------------------------------------------
 
 def rpy_to_projected_gravity(roll: float, pitch: float) -> list[float]:
-    """Gravity vector [0,0,-1] projected into body frame from roll/pitch (yaw-independent)."""
+    """Gravity unit vector [0,0,-1] expressed in the body frame from roll/pitch (yaw-independent).
+
+    MUST match the training convention. The env builds this as
+    ``transform_by_quat([0,0,-1], inv_quat(base_quat))`` (K1_env.py:796) which, for body roll φ
+    and pitch θ, evaluates to ``[sinθ, -sinφ·cosθ, -cosφ·cosθ]`` — the same as the standard
+    Unitree/legged-gym quaternion gravity formula. An earlier version here returned
+    ``[-sinθ, +sinφ·cosθ, -cosφ·cosθ]`` (x and y negated), feeding the policy a roll/pitch-mirrored
+    gravity → it corrected the wrong way and fell instantly.
+
+    NOTE: assumes the Booster IMU reports roll/pitch with the standard right-handed sign
+    convention. If a tilt test shows the logged gravity x/y move the wrong way, negate roll/pitch
+    here (do NOT just flip the formula back — that desyncs from training).
+    """
     cr, sr = math.cos(roll), math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
-    return [-sp, sr * cp, -cr * cp]
+    return [sp, -sr * cp, -cr * cp]
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +650,60 @@ def build_obs(
     return torch.tensor(flat, dtype=torch.float32).unsqueeze(0)
 
 
+def log_initial_state(state_buf: "RobotStateBuffer") -> None:
+    """Print the first decoded robot state so the joint mapping / starting pose is visible.
+
+    The single biggest cause of an instant fall is the robot NOT being at (or near) the
+    policy's default standing pose, or the joint mapping reading zeros/garbage. This surfaces
+    both BEFORE any torque is commanded, so you can tell a control bug from a setup problem.
+    """
+    pos, _vel = state_buf.get_dof_pos_vel()
+    gyro, roll, pitch = state_buf.get_imu()
+    defaults = DEFAULT_DOF_POS.tolist()
+    print("Initial robot state ------------------------------------------------")
+    print(f"  raw serial_len={state_buf._raw_serial_len} parallel_len={state_buf._raw_parallel_len} "
+          f"(serial must be >= {K1_JOINT_CNT})")
+    print(f"  roll={math.degrees(roll):+6.1f}°  pitch={math.degrees(pitch):+6.1f}°  "
+          f"gyro=[{gyro[0]:+.2f}, {gyro[1]:+.2f}, {gyro[2]:+.2f}] rad/s")
+    max_dev = max(abs(p - d) for p, d in zip(pos, defaults))
+    print(f"  measured vs default joint pos (max dev = {max_dev:.3f} rad):")
+    for name, p, d in zip(JOINT_NAMES, pos, defaults):
+        flag = "  <-- FAR from default" if abs(p - d) > 0.3 else ""
+        print(f"    {name:<22} meas={p:+.3f}  default={d:+.3f}{flag}")
+    if all(abs(p) < 1e-4 for p in pos):
+        print("  WARNING: every measured joint position is ~0 — the state feed or joint "
+              "mapping is wrong (robot is not really at zero). Fix this before commanding torque.")
+    elif max_dev > 0.5:
+        print("  WARNING: robot is far from the policy's default pose. Use --warmup to ramp in, "
+              "or place it at the default stance before starting, or it will fall immediately.")
+    print("--------------------------------------------------------------------")
+
+
+def warmup_to_default(publisher, state_buf: "RobotStateBuffer", seconds: float) -> None:
+    """Linearly ramp from the current measured pose to DEFAULT_DOF_POS over *seconds*.
+
+    Runs at 50 Hz through the same position-control LowCmd path as the policy, so the robot
+    eases into the stance the policy was trained to start from instead of snapping to it
+    (a snap, or starting far from the default pose, is a common instant-fall cause).
+    """
+    steps = max(1, round(seconds / DT))
+    start_pos, _ = state_buf.get_dof_pos_vel()
+    defaults = DEFAULT_DOF_POS.tolist()
+    low_cmd = alloc_low_cmd()
+    print(f"Warmup: ramping to default pose over {seconds:.1f}s ({steps} steps)…")
+    t_next = time.monotonic()
+    for i in range(steps):
+        a = (i + 1) / steps
+        target = [(1.0 - a) * s + a * d for s, d in zip(start_pos, defaults)]
+        update_low_cmd(low_cmd, target, state_buf.get_crank_pos())
+        publisher.Write(low_cmd)
+        t_next += DT
+        sl = t_next - time.monotonic()
+        if sl > 0:
+            time.sleep(sl)
+    print("Warmup done — robot at default pose.")
+
+
 def run(args: argparse.Namespace) -> None:
     model_path = resolve_model(args.model)
     print(f"Loading model: {model_path}")
@@ -672,14 +738,26 @@ def run(args: argparse.Namespace) -> None:
             sys.exit(1)
         time.sleep(0.01)
     print("State received.")
+    log_initial_state(state_buf)
 
     # --- Roboter in Custom-Modus schalten (wie altes Script) ---
     print("Switching to Custom mode…")
     client.ChangeMode(RobotMode.kCustom)
     time.sleep(0.5)
-    print("Custom mode active. Starting policy loop.")
+    print("Custom mode active.")
 
-    commands   = [args.vx, args.vy, args.wz]
+    commands = [args.vx, args.vy, args.wz]
+    print(
+        f"Run config: interface={args.interface}  commands(vx,vy,wz)={commands}  "
+        f"duration={args.duration}s  gait_period={GAIT_PERIOD_S}s ({GAIT_PERIOD_STEPS} steps)  "
+        f"action_scale={ACTION_SCALE}  warmup={args.warmup}s"
+    )
+
+    # Optional smooth ramp to the policy's default stance before the policy takes over.
+    if args.warmup > 0.0:
+        warmup_to_default(publisher, state_buf, args.warmup)
+
+    print("Starting policy loop.")
     last_actions: list[float] = [0.0] * NUM_ACTIONS
     # Glättungsfilter-Startwert: Standardposition des Roboters
     filtered_dof_pos: list[float] = DEFAULT_DOF_POS.tolist()
@@ -689,6 +767,8 @@ def run(args: argparse.Namespace) -> None:
     t_start = time.monotonic()
     t_next  = t_start
     low_cmd = alloc_low_cmd()   # allocate once; updated in-place each step
+    write_count = 0
+    write_errors = 0
 
     while running:
         now = time.monotonic()
@@ -703,8 +783,9 @@ def run(args: argparse.Namespace) -> None:
         # --- Sturzdetektor (wie altes Script: |rpy| > 1.0 rad) ---
         if state_buf.is_fallen():
             print(
-                f"\nFALL DETECTED: roll={math.degrees(roll):+.1f}°  "
-                f"pitch={math.degrees(pitch):+.1f}° — Notabbruch!",
+                f"\nFALL DETECTED at step={step} ({now - t_start:.2f}s): "
+                f"roll={math.degrees(roll):+.1f}°  pitch={math.degrees(pitch):+.1f}° — Notabbruch! "
+                f"(commands written so far: {write_count}, write errors: {write_errors})",
                 file=sys.stderr,
             )
             fall_detected = True
@@ -742,7 +823,15 @@ def run(args: argparse.Namespace) -> None:
 
         # --- send command ---
         update_low_cmd(low_cmd, filtered_dof_pos, state_buf.get_crank_pos())
-        publisher.Write(low_cmd)
+        try:
+            publisher.Write(low_cmd)
+            write_count += 1
+            if write_count == 1:
+                print("First LowCmd written to robot OK.")
+        except Exception as exc:  # SDK raises if the publisher channel is bad / disconnected
+            write_errors += 1
+            if write_errors <= 3:
+                print(f"  WARNING: publisher.Write failed: {exc}", file=sys.stderr)
 
         # --- one-shot debug dump on first step ---
         if step == 0:
@@ -752,17 +841,33 @@ def run(args: argparse.Namespace) -> None:
         gait_phase = (gait_phase + 1.0 / GAIT_PERIOD_STEPS) % 1.0
         step += 1
 
-        if step % 50 == 0:
+        # On the very first step, prove obs/policy are actually producing signal.
+        if step == 1:
+            proj_g = rpy_to_projected_gravity(roll, pitch)
+            print(
+                f"  obs[{obs_dim}] norm={float(obs.norm()):.2f}  "
+                f"grav=[{proj_g[0]:+.2f},{proj_g[1]:+.2f},{proj_g[2]:+.2f}]  "
+                f"cmd_scaled=[{commands[0] * OBS_SCALE_LIN_VEL:+.2f},"
+                f"{commands[1] * OBS_SCALE_LIN_VEL:+.2f},{commands[2] * OBS_SCALE_ANG_VEL:+.2f}]"
+            )
+            if float(actions.abs().mean()) < 1e-3:
+                print("  WARNING: policy output is ~0 — obs is probably wrong or the wrong "
+                      "checkpoint is loaded; the robot will just sag and fall.")
+
+        # Verbose every step for the first args.verbose_steps (default ~1 s), then 1 Hz.
+        # Without this you see nothing if the robot falls in under a second.
+        if step <= args.verbose_steps or step % 50 == 0:
             elapsed = now - t_start
             act_max  = float(actions.abs().max())
             act_mean = float(actions.abs().mean())
+            vel_max  = max(abs(v) for v in dof_vel)
             # delta between current filtered target and default pose (key leg joints)
             d = [filtered_dof_pos[i] - DEFAULT_DOF_POS[i].item() for i in range(NUM_ACTIONS)]
             print(
-                f"[{elapsed:6.1f}s] step={step:5d} "
-                f"roll={math.degrees(roll):+.1f}° pitch={math.degrees(pitch):+.1f}° "
+                f"[{elapsed:6.2f}s] step={step:5d} wr={write_count:5d} "
+                f"roll={math.degrees(roll):+5.1f}° pitch={math.degrees(pitch):+5.1f}° "
                 f"phase={gait_phase:.2f} | "
-                f"act max={act_max:.3f} mean={act_mean:.3f} | "
+                f"act max={act_max:.3f} mean={act_mean:.3f}  dq_max={vel_max:.2f} | "
                 f"Δhip_L={d[4]:+.3f} Δknee_L={d[7]:+.3f} "
                 f"Δhip_R={d[10]:+.3f} Δknee_R={d[13]:+.3f}"
             )
@@ -774,6 +879,7 @@ def run(args: argparse.Namespace) -> None:
             time.sleep(sleep_remaining)
 
     # --- safe stop ---
+    print(f"Loop ended: {step} steps, {write_count} commands written, {write_errors} write errors.")
     print("Sending damp commands…")
     for _ in range(10):
         publisher.Write(damp_cmd())
@@ -797,6 +903,12 @@ def main() -> None:
     parser.add_argument("--vx",        type=float, default=0.0,  help="Commanded forward velocity [m/s]")
     parser.add_argument("--vy",        type=float, default=0.0,  help="Commanded lateral velocity [m/s]")
     parser.add_argument("--wz",        type=float, default=0.0,  help="Commanded yaw rate [rad/s]")
+    parser.add_argument("--warmup",    type=float, default=0.0,
+                        help="Seconds to smoothly ramp to the default stance before the policy "
+                             "runs (0 = off). Try 2.0 if the robot falls instantly.")
+    parser.add_argument("--verbose-steps", dest="verbose_steps", type=int, default=50,
+                        help="Log every step for this many steps at startup (50 steps = 1 s), "
+                             "then drop to 1 Hz. Useful when the robot falls in under a second.")
     args = parser.parse_args()
     run(args)
 
