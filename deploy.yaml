@@ -1,0 +1,115 @@
+policy:
+  model: "logs/k1-distill/model_1999.pt"
+  obs_dim: 59
+  action_dim: 16
+  action_scale: 0.25
+  dt: 0.02
+  gait_period_s: 0.80
+  gait_period_steps: 40
+  obs_scales:
+    ang_vel: 0.25
+    lin_vel: 2.0
+    dof_pos: 1.0
+    dof_vel: 0.05
+  commands_scales:
+    lin_vel_x: 2.0
+    lin_vel_y: 2.0
+    ang_vel_yaw: 0.25
+  urdf_joint_names:
+    - AAHead_yaw
+    - Head_pitch
+    - ALeft_Shoulder_Pitch
+    - Left_Shoulder_Roll
+    - Left_Elbow_Pitch
+    - Left_Elbow_Yaw
+    - ARight_Shoulder_Pitch
+    - Right_Shoulder_Roll
+    - Right_Elbow_Pitch
+    - Right_Elbow_Yaw
+    - Left_Hip_Pitch
+    - Left_Hip_Roll
+    - Left_Hip_Yaw
+    - Left_Knee_Pitch
+    - Left_Ankle_Pitch
+    - Left_Ankle_Roll
+    - Right_Hip_Pitch
+    - Right_Hip_Roll
+    - Right_Hip_Yaw
+    - Right_Knee_Pitch
+    - Right_Ankle_Pitch
+    - Right_Ankle_Roll
+  # Policy-gesteuerte Gelenke (Reihenfolge = Action-Order)
+  joint_names:
+    - ALeft_Shoulder_Pitch
+    - Left_Elbow_Yaw
+    - ARight_Shoulder_Pitch
+    - Right_Elbow_Yaw
+    - Left_Hip_Pitch
+    - Left_Hip_Roll
+    - Left_Hip_Yaw
+    - Left_Knee_Pitch
+    - Left_Ankle_Pitch
+    - Left_Ankle_Roll
+    - Right_Hip_Pitch
+    - Right_Hip_Roll
+    - Right_Hip_Yaw
+    - Right_Knee_Pitch
+    - Right_Ankle_Pitch
+    - Right_Ankle_Roll
+
+  # Per PD auf Default-Pose fixiert (nicht von der Policy gesteuert)
+  fixed_joint_names:
+    - AAHead_yaw
+    - Head_pitch
+    - Left_Shoulder_Roll
+    - Right_Shoulder_Roll
+    - Left_Elbow_Pitch
+    - Right_Elbow_Pitch
+  
+  default_joint_angles:
+    AAHead_yaw: 0.0
+    Head_pitch: 0.2
+    ALeft_Shoulder_Pitch: 0.0
+    ARight_Shoulder_Pitch: 0.0
+    Left_Shoulder_Roll: -1.5
+    Right_Shoulder_Roll: 1.5
+    Left_Elbow_Pitch: 0.1
+    Right_Elbow_Pitch: 0.1
+    Left_Elbow_Yaw: -1.0
+    Right_Elbow_Yaw: 1.0
+    Left_Hip_Pitch: -0.30
+    Right_Hip_Pitch: -0.30
+    Left_Hip_Roll: 0.0
+    Right_Hip_Roll: 0.0
+    Left_Hip_Yaw: 0.0
+    Right_Hip_Yaw: 0.0
+    Left_Knee_Pitch: 0.60
+    Right_Knee_Pitch: 0.60
+    Left_Ankle_Pitch: -0.30
+    Right_Ankle_Pitch: -0.30
+    Left_Ankle_Roll: 0.0
+    Right_Ankle_Roll: 0.0
+
+  joint_gains:
+    AAHead_yaw: {kp: 40.0, kd: 1.0, effort: 6.0}
+    Head_pitch: {kp: 40.0, kd: 1.0, effort: 6.0}
+    ALeft_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    ARight_Shoulder_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Shoulder_Roll: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Right_Shoulder_Roll: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Elbow_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Right_Elbow_Pitch: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Elbow_Yaw: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Right_Elbow_Yaw: {kp: 40.0, kd: 1.0, effort: 14.0}
+    Left_Hip_Pitch: {kp: 200.0, kd: 5.0, effort: 68.0}
+    Right_Hip_Pitch: {kp: 200.0, kd: 5.0, effort: 68.0}
+    Left_Hip_Roll: {kp: 200.0, kd: 5.0, effort: 76.0}
+    Right_Hip_Roll: {kp: 200.0, kd: 5.0, effort: 76.0}
+    Left_Hip_Yaw: {kp: 150.0, kd: 4.0, effort: 38.3}
+    Right_Hip_Yaw: {kp: 150.0, kd: 4.0, effort: 38.3}
+    Left_Knee_Pitch: {kp: 250.0, kd: 6.0, effort: 112.0}
+    Right_Knee_Pitch: {kp: 250.0, kd: 6.0, effort: 112.0}
+    Left_Ankle_Pitch: {kp: 120.0, kd: 3.0, effort: 38.3}
+    Right_Ankle_Pitch: {kp: 120.0, kd: 3.0, effort: 38.3}
+    Left_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
+    Right_Ankle_Roll: {kp: 120.0, kd: 3.0, effort: 38.3}
