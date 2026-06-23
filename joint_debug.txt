@@ -1,0 +1,71 @@
+======================================================================
+SECTION 1 — motor_state_serial (all 22 K1 joints)
+  raw len at last callback: serial=22  parallel=22
+  K1Ji_idx  K1Ji_name                    q          dq
+  K1Ji[ 0]   HeadYaw                +0.0000     +0.0000
+  K1Ji[ 1]   HeadPitch              +0.0000     +0.0000
+  K1Ji[ 2]   L_ShoulderPitch        +0.0000     +0.0000
+  K1Ji[ 3]   L_ShoulderRoll         +0.0000     +0.0000
+  K1Ji[ 4]   L_ElbowPitch           +0.0000     +0.0000
+  K1Ji[ 5]   L_ElbowYaw             +0.0000     +0.0000
+  K1Ji[ 6]   R_ShoulderPitch        +0.0000     +0.0000
+  K1Ji[ 7]   R_ShoulderRoll         +0.0000     +0.0000
+  K1Ji[ 8]   R_ElbowPitch           +0.0000     +0.0000
+  K1Ji[ 9]   R_ElbowYaw             +0.0000     +0.0000
+  K1Ji[10]   L_HipPitch             +0.0000     +0.0000
+  K1Ji[11]   L_HipRoll              +0.0000     +0.0000
+  K1Ji[12]   L_HipYaw               +0.0000     +0.0000
+  K1Ji[13]   L_KneePitch            +0.0000     +0.0000
+  K1Ji[14]   L_CrankUp              +0.0000     +0.0000
+  K1Ji[15]   L_CrankDown            +0.0000     +0.0000
+  K1Ji[16]   R_HipPitch             +0.0000     +0.0000
+  K1Ji[17]   R_HipRoll              +0.0000     +0.0000
+  K1Ji[18]   R_HipYaw               +0.0000     +0.0000
+  K1Ji[19]   R_KneePitch            +0.0000     +0.0000
+  K1Ji[20]   R_CrankUp              +0.0000     +0.0000
+  K1Ji[21]   R_CrankDown            +0.0000     +0.0000
+
+SECTION 2 — URDF policy joint order (16 joints)
+   #  URDF_name                    obs_pos     default  filtered_tgt
+   0  ALeft_Shoulder_Pitch         +0.0000     +0.0000       +0.0000
+   1  Left_Elbow_Yaw               +0.0000     -1.0000       -1.0000
+   2  ARight_Shoulder_Pitch        +0.0000     +0.0000       +0.0000
+   3  Right_Elbow_Yaw              +0.0000     +1.0000       +1.0000
+   4  Left_Hip_Pitch               +0.0000     -0.3000       -0.3000
+   5  Left_Hip_Roll                +0.0000     +0.0000       +0.0000
+   6  Left_Hip_Yaw                 +0.0000     +0.0000       +0.0000
+   7  Left_Knee_Pitch              +0.0000     +0.6000       +0.6000
+   8  Left_Ankle_Pitch             +0.0000     -0.3000       -0.3000
+   9  Left_Ankle_Roll              +0.0000     +0.0000       +0.0000
+  10  Right_Hip_Pitch              +0.0000     -0.3000       -0.3000
+  11  Right_Hip_Roll               +0.0000     +0.0000       +0.0000
+  12  Right_Hip_Yaw                +0.0000     +0.0000       +0.0000
+  13  Right_Knee_Pitch             +0.0000     +0.6000       +0.6000
+  14  Right_Ankle_Pitch            +0.0000     -0.3000       -0.3000
+  15  Right_Ankle_Roll             +0.0000     +0.0000       +0.0000
+
+SECTION 3 — LowCmd sent to robot (K1Ji order, 22 slots)
+  K1Ji_idx  K1Ji_name                    q         tau      kp      kd  ctrl
+  K1Ji[ 0]   HeadYaw                +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 1]   HeadPitch              +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 2]   L_ShoulderPitch        +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 3]   L_ShoulderRoll         +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 4]   L_ElbowPitch           +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 5]   L_ElbowYaw             +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 6]   R_ShoulderPitch        +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 7]   R_ShoulderRoll         +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 8]   R_ElbowPitch           +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[ 9]   R_ElbowYaw             +0.0000     +0.0000    40.0     1.0  pos
+  K1Ji[10]   L_HipPitch             +0.0000     +0.0000   200.0     5.0  pos
+  K1Ji[11]   L_HipRoll              +0.0000     +0.0000   200.0     5.0  pos
+  K1Ji[12]   L_HipYaw               +0.0000     +0.0000   150.0     4.0  pos
+  K1Ji[13]   L_KneePitch            +0.0000     +0.0000   250.0     6.0  pos
+  K1Ji[14]   L_CrankUp              +0.0000     +0.0000     0.0     1.0  TORQUE
+  K1Ji[15]   L_CrankDown            +0.0000     +0.0000     0.0     1.0  TORQUE
+  K1Ji[16]   R_HipPitch             +0.0000     +0.0000   200.0     5.0  pos
+  K1Ji[17]   R_HipRoll              +0.0000     +0.0000   200.0     5.0  pos
+  K1Ji[18]   R_HipYaw               +0.0000     +0.0000   150.0     4.0  pos
+  K1Ji[19]   R_KneePitch            +0.0000     +0.0000   250.0     6.0  pos
+  K1Ji[20]   R_CrankUp              +0.0000     +0.0000     0.0     1.0  TORQUE
+  K1Ji[21]   R_CrankDown            +0.0000     +0.0000     0.0     1.0  TORQUE
+======================================================================

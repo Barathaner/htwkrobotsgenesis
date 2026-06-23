@@ -38,7 +38,9 @@ from booster_robotics_sdk_python import (
 
 # ── K1 constants (mirrors smoke_test_k1.py) ──────────────────────────────────
 
-DT = 0.02  # 50 Hz
+DT = 0.02            # 50 Hz TUI / input / ramp cadence
+PUBLISH_DT = 0.002   # 500 Hz low-cmd stream — a slower stream trips the robot's stale-cmd watchdog
+DECIMATION = max(1, round(DT / PUBLISH_DT))  # publish 10x per TUI tick
 
 K1_JOINT_CNT = 22
 
@@ -310,72 +312,78 @@ def _tui(stdscr, args: argparse.Namespace, state_buf: RobotStateBuffer,
     status   = "Ready — robot in Custom mode"
     low_cmd  = alloc_low_cmd()
     t_next   = time.monotonic()
+    pub_tick = 0
 
+    # Publish the held targets at 500 Hz (the robot ignores a slower stream); handle keyboard
+    # input + redraw only every DECIMATION-th publish (~50 Hz) so curses isn't hammered.
     while True:
-        h, _ = stdscr.getmaxyx()
-        viewport = max(1, h - HEADER_LINES - FOOTER_LINES)
+        # ===== input + fall-check + draw @ 50 Hz ============================================
+        if pub_tick % DECIMATION == 0:
+            h, _ = stdscr.getmaxyx()
+            viewport = max(1, h - HEADER_LINES - FOOTER_LINES)
 
-        # ── keyboard input ────────────────────────────────────────────────────
-        try:
-            key = stdscr.getch()
-        except Exception:
-            key = -1
+            # ── keyboard input ────────────────────────────────────────────────────
+            try:
+                key = stdscr.getch()
+            except Exception:
+                key = -1
 
-        if key == curses.KEY_UP:
-            selected = (selected - 1) % K1_JOINT_CNT
-        elif key == curses.KEY_DOWN:
-            selected = (selected + 1) % K1_JOINT_CNT
-        elif key == curses.KEY_PPAGE:
-            selected = max(0, selected - 5)
-        elif key == curses.KEY_NPAGE:
-            selected = min(K1_JOINT_CNT - 1, selected + 5)
-        elif key in (ord('+'), ord('=')):
-            targets[selected] += step
-            status = f"[{selected}] {JOINT_NAMES[selected]} → {targets[selected]:+.4f} rad"
-        elif key in (ord('-'), ord('_')):
-            targets[selected] -= step
-            status = f"[{selected}] {JOINT_NAMES[selected]} → {targets[selected]:+.4f} rad"
-        elif key == ord('['):
-            step = max(0.001, step / 2.0)
-            status = f"Step size: {step:.4f} rad"
-        elif key == ord(']'):
-            step = min(1.0, step * 2.0)
-            status = f"Step size: {step:.4f} rad"
-        elif key == ord('r'):
-            targets[:] = list(DEFAULT_POS)
-            status = "All joints reset to defaults"
-        elif key in (ord('q'), 27):  # q or ESC
-            break
+            if key == curses.KEY_UP:
+                selected = (selected - 1) % K1_JOINT_CNT
+            elif key == curses.KEY_DOWN:
+                selected = (selected + 1) % K1_JOINT_CNT
+            elif key == curses.KEY_PPAGE:
+                selected = max(0, selected - 5)
+            elif key == curses.KEY_NPAGE:
+                selected = min(K1_JOINT_CNT - 1, selected + 5)
+            elif key in (ord('+'), ord('=')):
+                targets[selected] += step
+                status = f"[{selected}] {JOINT_NAMES[selected]} → {targets[selected]:+.4f} rad"
+            elif key in (ord('-'), ord('_')):
+                targets[selected] -= step
+                status = f"[{selected}] {JOINT_NAMES[selected]} → {targets[selected]:+.4f} rad"
+            elif key == ord('['):
+                step = max(0.001, step / 2.0)
+                status = f"Step size: {step:.4f} rad"
+            elif key == ord(']'):
+                step = min(1.0, step * 2.0)
+                status = f"Step size: {step:.4f} rad"
+            elif key == ord('r'):
+                targets[:] = list(DEFAULT_POS)
+                status = "All joints reset to defaults"
+            elif key in (ord('q'), 27):  # q or ESC
+                break
 
-        # ── keep selection visible (scroll to follow) ─────────────────────────
-        if selected < scroll:
-            scroll = selected
-        elif selected >= scroll + viewport:
-            scroll = selected - viewport + 1
+            # ── keep selection visible (scroll to follow) ─────────────────────────
+            if selected < scroll:
+                scroll = selected
+            elif selected >= scroll + viewport:
+                scroll = selected - viewport + 1
 
-        # ── fall detection ────────────────────────────────────────────────────
-        if state_buf.is_fallen():
-            rpy = state_buf.rpy
-            status = (
-                f"FALL DETECTED  roll={math.degrees(rpy[0]):+.1f}°  "
-                f"pitch={math.degrees(rpy[1]):+.1f}°"
-            )
+            # ── fall detection ────────────────────────────────────────────────────
+            if state_buf.is_fallen():
+                rpy = state_buf.rpy
+                status = (
+                    f"FALL DETECTED  roll={math.degrees(rpy[0]):+.1f}°  "
+                    f"pitch={math.degrees(rpy[1]):+.1f}°"
+                )
+                _draw(stdscr, state_buf, targets, selected, scroll, step, status)
+                break
+
+            # ── draw ──────────────────────────────────────────────────────────────
             _draw(stdscr, state_buf, targets, selected, scroll, step, status)
-            break
 
-        # ── send command ──────────────────────────────────────────────────────
+        # ===== publish @ 500 Hz ============================================================
         update_low_cmd(low_cmd, targets, state_buf)
         publisher.Write(low_cmd)
+        pub_tick += 1
 
-        # ── draw ──────────────────────────────────────────────────────────────
-        _draw(stdscr, state_buf, targets, selected, scroll, step, status)
-
-        # ── pace to 50 Hz ─────────────────────────────────────────────────────
-        t_next += DT
+        # ── pace to 500 Hz ─────────────────────────────────────────────────────
+        t_next += PUBLISH_DT
         wait = t_next - time.monotonic()
         if wait > 0:
             time.sleep(wait)
-        else:
+        elif wait < -0.05:
             t_next = time.monotonic()
 
 
@@ -402,8 +410,28 @@ def run(args: argparse.Namespace) -> None:
             sys.exit(1)
         time.sleep(0.01)
 
-    print("State received. Switching to Custom mode…")
-    client.ChangeMode(RobotMode.kCustom)
+    # Hand low-level control to the SDK like the working htwk deploy: stream a valid frame (hold the
+    # CURRENT measured pose) at 500 Hz BEFORE switching mode, then verify the switch. Calling
+    # ChangeMode(kCustom) with no prior frame / a 50 Hz stream leaves the robot ignoring commands.
+    print("State received. Streaming prepare frames (hold current pose) at 500 Hz…")
+    prepare_targets = [state_buf.q(i) for i in range(K1_JOINT_CNT)]
+    prepare_cmd = alloc_low_cmd()
+    update_low_cmd(prepare_cmd, prepare_targets, state_buf)
+    t_p = time.monotonic()
+    for _ in range(150):  # ~0.3 s at 500 Hz
+        publisher.Write(prepare_cmd)
+        t_p += PUBLISH_DT
+        sl = t_p - time.monotonic()
+        if sl > 0:
+            time.sleep(sl)
+
+    print("Switching to Custom mode…")
+    mode_ret = client.ChangeMode(RobotMode.kCustom)
+    if mode_ret in (0, None):
+        print("ChangeMode(kCustom) OK — custom mode engaged.")
+    else:
+        print(f"ChangeMode(kCustom) returned {mode_ret!r} — robot REFUSED custom mode; "
+              "motors will ignore commands (needs RC/operator handover).")
     time.sleep(0.5)
 
     try:

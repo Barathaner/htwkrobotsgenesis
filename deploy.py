@@ -707,25 +707,28 @@ def log_initial_state(state_buf: "RobotStateBuffer") -> None:
     print("--------------------------------------------------------------------")
 
 
-def warmup_to_default(publisher, state_buf: "RobotStateBuffer", seconds: float) -> None:
+def warmup_to_default(
+    publisher, state_buf: "RobotStateBuffer", seconds: float, publish_dt: float = 0.002
+) -> None:
     """Linearly ramp from the current measured pose to DEFAULT_DOF_POS over *seconds*.
 
-    Runs at 50 Hz through the same position-control LowCmd path as the policy, so the robot
-    eases into the stance the policy was trained to start from instead of snapping to it
-    (a snap, or starting far from the default pose, is a common instant-fall cause).
+    Publishes at *publish_dt* (default 500 Hz) through the same position-control LowCmd path as
+    the policy, so the robot eases into the stance the policy was trained to start from instead of
+    snapping to it. Must run at the SAME high rate as the main loop — a slow (50 Hz) stream in
+    Custom mode trips the robot's stale-command watchdog and the commands are ignored.
     """
-    steps = max(1, round(seconds / DT))
+    steps = max(1, round(seconds / publish_dt))
     start_pos, _ = state_buf.get_dof_pos_vel()
     defaults = DEFAULT_DOF_POS.tolist()
     low_cmd = alloc_low_cmd()
-    print(f"Warmup: ramping to default pose over {seconds:.1f}s ({steps} steps)…")
+    print(f"Warmup: ramping to default pose over {seconds:.1f}s ({steps} frames @ {1/publish_dt:.0f} Hz)…")
     t_next = time.monotonic()
     for i in range(steps):
         a = (i + 1) / steps
         target = [(1.0 - a) * s + a * d for s, d in zip(start_pos, defaults)]
         update_low_cmd(low_cmd, target, state_buf.get_crank_pos())
         publisher.Write(low_cmd)
-        t_next += DT
+        t_next += publish_dt
         sl = t_next - time.monotonic()
         if sl > 0:
             time.sleep(sl)
@@ -768,89 +771,141 @@ def run(args: argparse.Namespace) -> None:
     print("State received.")
     log_initial_state(state_buf)
 
-    # --- Roboter in Custom-Modus schalten (wie altes Script) ---
-    print("Switching to Custom mode…")
-    client.ChangeMode(RobotMode.kCustom)
-    time.sleep(0.5)
-    print("Custom mode active.")
-
+    # --- Hand low-level control to the SDK (matches the working htwk K1 deploy) -------------
+    # The robot only executes published LowCmds once it is in Custom mode AND a valid command
+    # frame is ALREADY streaming at ~500 Hz. The old flow (ChangeMode then start streaming at
+    # 50 Hz) left the robot ignoring every command. So: stream a "prepare" frame at the default
+    # pose first, THEN switch mode, and check the return code.
     commands = [args.vx, args.vy, args.wz]
+    PUBLISH_DT = 0.002                            # 500 Hz low-cmd stream (rate the robot expects)
+    DECIMATION = max(1, round(DT / PUBLISH_DT))   # run policy inference every Nth publish → 50 Hz
+
+    prepare_cmd = alloc_low_cmd()
+    update_low_cmd(prepare_cmd, DEFAULT_DOF_POS.tolist(), state_buf.get_crank_pos())
+    print("Streaming prepare frames (default pose) at 500 Hz before mode switch…")
+    t_p = time.monotonic()
+    for _ in range(150):                          # ~0.3 s of frames at 500 Hz
+        publisher.Write(prepare_cmd)
+        t_p += PUBLISH_DT
+        sl = t_p - time.monotonic()
+        if sl > 0:
+            time.sleep(sl)
+
+    print("Switching to Custom mode…")
+    mode_ret = client.ChangeMode(RobotMode.kCustom)
+    mode_ok = mode_ret in (0, None)
+    print(
+        f"ChangeMode(kCustom) returned {mode_ret!r} — "
+        + ("OK, custom mode engaged." if mode_ok else
+           "NON-ZERO: robot REFUSED custom mode. The motors will ignore commands. "
+           "Check that the robot is in a state that allows SDK control (RC/operator handover).")
+    )
+    time.sleep(0.5)
+
     print(
         f"Run config: interface={args.interface}  commands(vx,vy,wz)={commands}  "
         f"duration={args.duration}s  gait_period={GAIT_PERIOD_S}s ({GAIT_PERIOD_STEPS} steps)  "
-        f"action_scale={ACTION_SCALE}  warmup={args.warmup}s"
+        f"action_scale={ACTION_SCALE}  warmup={args.warmup}s  "
+        f"publish={1/PUBLISH_DT:.0f}Hz infer={1/DT:.0f}Hz"
     )
 
-    # Optional smooth ramp to the policy's default stance before the policy takes over.
+    # Optional smooth ramp to the policy's default stance before the policy takes over (500 Hz).
     if args.warmup > 0.0:
-        warmup_to_default(publisher, state_buf, args.warmup)
+        warmup_to_default(publisher, state_buf, args.warmup, PUBLISH_DT)
 
     print("Starting policy loop.")
     last_actions: list[float] = [0.0] * NUM_ACTIONS
-    # Glättungsfilter-Startwert: Standardposition des Roboters
+    # Filter/target start at the default pose so the first frames hold the prepared stance.
+    raw_dof_pos: list[float] = DEFAULT_DOF_POS.tolist()
     filtered_dof_pos: list[float] = DEFAULT_DOF_POS.tolist()
+    actions = torch.zeros(NUM_ACTIONS)
+    obs = None
+    roll = pitch = 0.0
+    gyro = [0.0, 0.0, 0.0]
+    dof_vel = [0.0] * NUM_ACTIONS
     gait_phase = 0.0
     step = 0
+    n_at_limit = 0
     fall_detected = False
     t_start = time.monotonic()
     t_next  = t_start
-    low_cmd = alloc_low_cmd()   # allocate once; updated in-place each step
+    low_cmd = alloc_low_cmd()   # allocate once; updated in-place each publish
     write_count = 0
     write_errors = 0
+    pub_tick = 0
 
+    # The robot needs a steady ~500 Hz command stream; the policy only needs ~50 Hz. So we publish
+    # every PUBLISH_DT and run inference once per DECIMATION publishes. The 80/20 filter runs at the
+    # publish rate (like the working htwk deploy), smoothly ramping toward each new inference target.
     while running:
         now = time.monotonic()
         if args.duration > 0 and (now - t_start) >= args.duration:
             print(f"\nSmoke test done ({args.duration} s).")
             break
 
-        # --- read state ---
-        gyro, roll, pitch = state_buf.get_imu()
-        dof_pos, dof_vel  = state_buf.get_dof_pos_vel()
+        # ===== policy inference @ 50 Hz (every DECIMATION-th publish) =====================
+        if pub_tick % DECIMATION == 0:
+            gyro, roll, pitch = state_buf.get_imu()
+            dof_pos, dof_vel  = state_buf.get_dof_pos_vel()
 
-        # --- Sturzdetektor (wie altes Script: |rpy| > 1.0 rad) ---
-        if state_buf.is_fallen():
-            print(
-                f"\nFALL DETECTED at step={step} ({now - t_start:.2f}s): "
-                f"roll={math.degrees(roll):+.1f}°  pitch={math.degrees(pitch):+.1f}° — Notabbruch! "
-                f"(commands written so far: {write_count}, write errors: {write_errors})",
-                file=sys.stderr,
+            # --- Sturzdetektor (|rpy| > 1.0 rad) ---
+            if state_buf.is_fallen():
+                print(
+                    f"\nFALL DETECTED at step={step} ({now - t_start:.2f}s): "
+                    f"roll={math.degrees(roll):+.1f}°  pitch={math.degrees(pitch):+.1f}° — Notabbruch! "
+                    f"(commands written so far: {write_count}, write errors: {write_errors})",
+                    file=sys.stderr,
+                )
+                fall_detected = True
+                break
+
+            # Student: foot_contact omitted entirely. Teacher: faked as both-in-contact.
+            obs = build_obs(
+                gyro=gyro, roll=roll, pitch=pitch, commands=commands,
+                dof_pos=dof_pos, dof_vel=dof_vel, last_actions=last_actions,
+                gait_phase=gait_phase, privileged=not is_student,
+                foot_contact=[1.0, 1.0], expected_dim=obs_dim,
             )
-            fall_detected = True
-            break
+            with torch.no_grad():
+                actions = actor(obs).squeeze(0)  # (16,)
+            actions = torch.clamp(actions, -CLIP_ACTIONS, CLIP_ACTIONS)
+            raw_dof_pos = (actions * ACTION_SCALE + DEFAULT_DOF_POS).tolist()
+            last_actions = actions.tolist()
+            gait_phase = (gait_phase + 1.0 / GAIT_PERIOD_STEPS) % 1.0
+            step += 1
 
-        # --- build observation ---
-        # Student: foot_contact is omitted entirely. Teacher: faked as both-in-contact.
-        obs = build_obs(
-            gyro=gyro,
-            roll=roll,
-            pitch=pitch,
-            commands=commands,
-            dof_pos=dof_pos,
-            dof_vel=dof_vel,
-            last_actions=last_actions,
-            gait_phase=gait_phase,
-            privileged=not is_student,
-            foot_contact=[1.0, 1.0],
-            expected_dim=obs_dim,
-        )
+            if step == 1:
+                dump_debug(state_buf, dof_pos, dof_vel, filtered_dof_pos, low_cmd)
+                proj_g = rpy_to_projected_gravity(roll, pitch)
+                print(
+                    f"  obs[{obs_dim}] norm={float(obs.norm()):.2f}  "
+                    f"grav=[{proj_g[0]:+.2f},{proj_g[1]:+.2f},{proj_g[2]:+.2f}]  "
+                    f"cmd_scaled=[{commands[0] * OBS_SCALE_LIN_VEL:+.2f},"
+                    f"{commands[1] * OBS_SCALE_LIN_VEL:+.2f},{commands[2] * OBS_SCALE_ANG_VEL:+.2f}]"
+                )
+                if float(actions.abs().mean()) < 1e-3:
+                    print("  WARNING: policy output is ~0 — obs is probably wrong or the wrong "
+                          "checkpoint is loaded; the robot will just sag and fall.")
 
-        # --- policy inference ---
-        with torch.no_grad():
-            actions = actor(obs).squeeze(0)  # (16,)
-        actions = torch.clamp(actions, -CLIP_ACTIONS, CLIP_ACTIONS)
+            # Verbose every inference for the first verbose_steps (~1 s), then 1 Hz.
+            if step <= args.verbose_steps or step % 50 == 0:
+                act_max  = float(actions.abs().max())
+                act_mean = float(actions.abs().mean())
+                vel_max  = max(abs(v) for v in dof_vel)
+                d = [filtered_dof_pos[i] - DEFAULT_DOF_POS[i].item() for i in range(NUM_ACTIONS)]
+                print(
+                    f"[{now - t_start:6.2f}s] step={step:5d} wr={write_count:6d} "
+                    f"roll={math.degrees(roll):+5.1f}° pitch={math.degrees(pitch):+5.1f}° "
+                    f"phase={gait_phase:.2f} | "
+                    f"act max={act_max:.3f} mean={act_mean:.3f}  dq_max={vel_max:.2f}  clamp={n_at_limit:2d}/16 | "
+                    f"Δhip_L={d[4]:+.3f} Δknee_L={d[7]:+.3f} "
+                    f"Δhip_R={d[10]:+.3f} Δknee_R={d[13]:+.3f}"
+                )
 
-        # --- action → target joint positions ---
-        raw_dof_pos = (actions * ACTION_SCALE + DEFAULT_DOF_POS).tolist()
-        last_actions = actions.tolist()
-
-        # --- Glättungsfilter: 80 % alt + 20 % neu (wie altes Script) ---
-        filtered_dof_pos = [
-            0.8 * f + 0.2 * r for f, r in zip(filtered_dof_pos, raw_dof_pos)
-        ]
-
-        # --- clamp to physical joint limits (see JOINT_POS_LIMITS) -------------------
-        # The real SDK rejects out-of-range targets, so we pin them at the limit like the sim does.
+        # ===== filter + clamp + publish @ 500 Hz =========================================
+        # 80 % alt + 20 % neu, ramping toward the latest inference target each publish.
+        filtered_dof_pos = [0.8 * f + 0.2 * r for f, r in zip(filtered_dof_pos, raw_dof_pos)]
+        # Clamp to physical joint limits: the real SDK rejects out-of-range mc.q (see JOINT_POS_LIMITS).
         clamped = [
             min(hi, max(lo, q))
             for q, lo, hi in zip(filtered_dof_pos, JOINT_POS_LOWER, JOINT_POS_UPPER)
@@ -858,7 +913,6 @@ def run(args: argparse.Namespace) -> None:
         n_at_limit = sum(1 for q, c in zip(filtered_dof_pos, clamped) if abs(q - c) > 1e-6)
         filtered_dof_pos = clamped
 
-        # --- send command ---
         update_low_cmd(low_cmd, filtered_dof_pos, state_buf.get_crank_pos())
         try:
             publisher.Write(low_cmd)
@@ -870,50 +924,15 @@ def run(args: argparse.Namespace) -> None:
             if write_errors <= 3:
                 print(f"  WARNING: publisher.Write failed: {exc}", file=sys.stderr)
 
-        # --- one-shot debug dump on first step ---
-        if step == 0:
-            dump_debug(state_buf, dof_pos, dof_vel, filtered_dof_pos, low_cmd)
+        pub_tick += 1
 
-        # --- advance phase clock ---
-        gait_phase = (gait_phase + 1.0 / GAIT_PERIOD_STEPS) % 1.0
-        step += 1
-
-        # On the very first step, prove obs/policy are actually producing signal.
-        if step == 1:
-            proj_g = rpy_to_projected_gravity(roll, pitch)
-            print(
-                f"  obs[{obs_dim}] norm={float(obs.norm()):.2f}  "
-                f"grav=[{proj_g[0]:+.2f},{proj_g[1]:+.2f},{proj_g[2]:+.2f}]  "
-                f"cmd_scaled=[{commands[0] * OBS_SCALE_LIN_VEL:+.2f},"
-                f"{commands[1] * OBS_SCALE_LIN_VEL:+.2f},{commands[2] * OBS_SCALE_ANG_VEL:+.2f}]"
-            )
-            if float(actions.abs().mean()) < 1e-3:
-                print("  WARNING: policy output is ~0 — obs is probably wrong or the wrong "
-                      "checkpoint is loaded; the robot will just sag and fall.")
-
-        # Verbose every step for the first args.verbose_steps (default ~1 s), then 1 Hz.
-        # Without this you see nothing if the robot falls in under a second.
-        if step <= args.verbose_steps or step % 50 == 0:
-            elapsed = now - t_start
-            act_max  = float(actions.abs().max())
-            act_mean = float(actions.abs().mean())
-            vel_max  = max(abs(v) for v in dof_vel)
-            # delta between current filtered target and default pose (key leg joints)
-            d = [filtered_dof_pos[i] - DEFAULT_DOF_POS[i].item() for i in range(NUM_ACTIONS)]
-            print(
-                f"[{elapsed:6.2f}s] step={step:5d} wr={write_count:5d} "
-                f"roll={math.degrees(roll):+5.1f}° pitch={math.degrees(pitch):+5.1f}° "
-                f"phase={gait_phase:.2f} | "
-                f"act max={act_max:.3f} mean={act_mean:.3f}  dq_max={vel_max:.2f}  clamp={n_at_limit:2d}/16 | "
-                f"Δhip_L={d[4]:+.3f} Δknee_L={d[7]:+.3f} "
-                f"Δhip_R={d[10]:+.3f} Δknee_R={d[13]:+.3f}"
-            )
-
-        # --- pace to 50 Hz ---
-        t_next += DT
+        # --- pace to 500 Hz ---
+        t_next += PUBLISH_DT
         sleep_remaining = t_next - time.monotonic()
         if sleep_remaining > 0:
             time.sleep(sleep_remaining)
+        elif sleep_remaining < -0.05:
+            t_next = time.monotonic()  # fell behind badly; reset cadence rather than burst-publish
 
     # --- safe stop ---
     print(f"Loop ended: {step} steps, {write_count} commands written, {write_errors} write errors.")
