@@ -9,6 +9,11 @@ Usage (from repo root):
 
 Each trial logs to wandb (unique run name) and records rollout videos.
 Best params are written to logs/optuna/<study_name>_best.yaml for manual merge into k1_env.yaml.
+
+Each trial runs in its own subprocess (the orchestrator re-invokes this script with --worker
+once per trial). This is required for Genesis: its Taichi GPU allocations are not freed by
+torch.cuda.empty_cache() or Python gc, so running many trials in one process leaks GPU memory
+until it OOMs. Letting each trial's process exit is the only reliable way to reclaim that memory.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import copy
 import gc
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -221,6 +227,17 @@ def main() -> None:
     parser.add_argument("--config", type=str, default=OPTUNA_CONFIG_PATH)
     parser.add_argument("--resume", action="store_true", help="Resume existing study in storage")
     parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="Internal: run exactly one trial in this process, then exit (spawned by the orchestrator).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Internal: override sampler/Genesis seed for this worker (orchestrator sets per-trial).",
+    )
     args = parser.parse_args()
 
     if args.config != OPTUNA_CONFIG_PATH:
@@ -246,7 +263,9 @@ def main() -> None:
     storage_url = f"sqlite:///{storage_path.resolve()}"
 
     sampler_name = study_cfg.get("sampler", "TPE").upper()
-    seed = trial_cfg.get("seed", 1)
+    # Each worker gets a distinct seed so TPE's random startup trials don't collide across the
+    # independent subprocesses (a fresh process re-seeded identically would draw the same sample).
+    seed = args.seed if args.seed is not None else trial_cfg.get("seed", 1)
     if sampler_name == "TPE":
         sampler = optuna.samplers.TPESampler(seed=seed)
     elif sampler_name == "CMA":
@@ -260,7 +279,15 @@ def main() -> None:
     if study_cfg.get("pruner", "").lower() == "median":
         pruner = optuna.pruners.MedianPruner()
 
-    if args.resume:
+    if args.worker:
+        # Orchestrator already created the study; just attach to shared storage and run one trial.
+        study = optuna.load_study(
+            study_name=args.study_name,
+            storage=storage_url,
+            sampler=sampler,
+            pruner=pruner,
+        )
+    elif args.resume:
         study = optuna.load_study(
             study_name=args.study_name,
             storage=storage_url,
@@ -287,9 +314,6 @@ def main() -> None:
     num_envs = trial_cfg["num_envs"]
     eval_steps = trial_cfg["eval_steps"]
     report_interval = trial_cfg.get("report_interval", 100)
-    base_seed = trial_cfg.get("seed", 1)
-
-    init_genesis(base_seed)
 
     def objective(trial: optuna.Trial) -> float:
         scales = sample_reward_scales(trial, baseline_scales, search_space, fixed_scales)
@@ -389,6 +413,12 @@ def main() -> None:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+    if args.worker:
+        # One trial, in this process, then exit so Genesis/Taichi GPU memory is fully reclaimed.
+        init_genesis(seed)
+        study.optimize(objective, n_trials=1)
+        return
+
     print(
         f"Optuna study '{args.study_name}': {args.n_trials} trials, "
         f"{max_iterations} iters, {num_envs} envs, wandb={wandb_project}, storage={args.storage}"
@@ -397,7 +427,33 @@ def main() -> None:
         print(f"AMP params in search space: {list(amp_search_space.keys())}")
     if curriculum_search_space:
         print(f"Curriculum params in search space: {list(curriculum_search_space.keys())}")
-    study.optimize(objective, n_trials=args.n_trials)
+
+    # Run each trial in its own subprocess: Genesis leaks GPU memory per scene build, so the only
+    # reliable reclaim is process exit. The shared SQLite study keeps TPE history across workers.
+    worker_cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--worker",
+        "--study_name", args.study_name,
+        "--storage", args.storage,
+        "--config", args.config,
+    ]
+    if args.wandb_project:
+        worker_cmd += ["--wandb_project", args.wandb_project]
+
+    completed = 0
+    for i in range(args.n_trials):
+        worker_seed = seed + i
+        print(f"\n[optuna] launching trial worker {i + 1}/{args.n_trials} (seed={worker_seed})")
+        result = subprocess.run(worker_cmd + ["--seed", str(worker_seed)])
+        if result.returncode != 0:
+            print(
+                f"[optuna] worker {i + 1} exited with code {result.returncode}; "
+                f"continuing to next trial"
+            )
+        else:
+            completed += 1
+    print(f"\n[optuna] {completed}/{args.n_trials} trial workers completed successfully")
 
     out_path = os.path.join("logs", "optuna", f"{args.study_name}_best.yaml")
     best = export_best_params(study, baseline_scales, amp_search_space, out_path, curriculum_search_space)

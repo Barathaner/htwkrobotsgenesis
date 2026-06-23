@@ -39,6 +39,15 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=300, help="Number of rollout steps")
     parser.add_argument("--fps", type=int, default=50, help="Video frames per second")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--sweep",
+        nargs="*",
+        type=float,
+        default=None,
+        help="Forward vx commands [m/s] to step through, held in equal segments over the "
+        "rollout (overrides random commands). Pass with no values to use a default "
+        "slow→jog sweep covering the command range.",
+    )
     args = parser.parse_args()
 
     pt_path = os.path.abspath(args.pt)
@@ -123,10 +132,25 @@ def main() -> None:
     )
     policy = runner.get_inference_policy(device=gs.device)
 
+    # Scripted command sweep: hold each vx for an equal segment of the rollout so the
+    # video clearly walks through slow → jog. command_target is re-set every step so it
+    # overrides the env's random resampling; env.commands smooths toward it (command_smooth_s).
+    sweep_speeds = None
+    if args.sweep is not None:
+        sweep_speeds = args.sweep if len(args.sweep) > 0 else [0.3, 0.6, 0.9, 1.2]
+        lo, hi = command_cfg["lin_vel_x_range"]
+        sweep_speeds = [max(lo, min(hi, s)) for s in sweep_speeds]
+        print(f"Command sweep (vx m/s): {sweep_speeds}")
+
     frames: list = []
     with torch.inference_mode():
         obs = env.reset()
         for step in range(args.steps):
+            if sweep_speeds is not None:
+                seg = min(step * len(sweep_speeds) // args.steps, len(sweep_speeds) - 1)
+                env.command_target[:, 0] = sweep_speeds[seg]
+                env.command_target[:, 1:] = 0.0
+
             actions = policy(obs)
             obs, _, _, _ = env.step(actions)
 
