@@ -101,6 +101,34 @@ DEFAULT_DOF_POS = torch.tensor(
     [DEFAULT_JOINT_ANGLES[n] for n in JOINT_NAMES], dtype=torch.float32
 )
 
+# Joint position limits [rad] from models/K1/K1_22dof.urdf, in JOINT_NAMES order.
+# WHY THIS MATTERS: the policy was trained with clip_actions=100 and action_scale=0.25, so a single
+# action can ask for a ±25 rad joint offset. In Genesis the URDF joint limits are HARD constraints,
+# so such a target just pins the joint at its limit and the sim survives. The real Booster SDK does
+# the opposite: an out-of-range mc.q is rejected / not tracked, so the motors freeze and the robot
+# never moves (observed 2026-06-23). We therefore clamp every commanded target to these limits,
+# reproducing the sim's pin-at-limit behaviour so the policy actually drives the hardware.
+JOINT_POS_LIMITS = {
+    "ALeft_Shoulder_Pitch":  (-3.316, 1.220),
+    "Left_Elbow_Yaw":        (-2.440, 0.000),
+    "ARight_Shoulder_Pitch": (-3.316, 1.220),
+    "Right_Elbow_Yaw":       ( 0.000, 2.440),
+    "Left_Hip_Pitch":        (-3.000, 2.210),
+    "Left_Hip_Roll":         (-0.400, 1.570),
+    "Left_Hip_Yaw":          (-1.000, 1.000),
+    "Left_Knee_Pitch":       ( 0.000, 2.230),
+    "Left_Ankle_Pitch":      (-0.870, 0.345),
+    "Left_Ankle_Roll":       (-0.345, 0.345),
+    "Right_Hip_Pitch":       (-3.000, 2.210),
+    "Right_Hip_Roll":        (-1.570, 0.400),
+    "Right_Hip_Yaw":         (-1.000, 1.000),
+    "Right_Knee_Pitch":      ( 0.000, 2.230),
+    "Right_Ankle_Pitch":     (-0.870, 0.345),
+    "Right_Ankle_Roll":      (-0.345, 0.345),
+}
+JOINT_POS_LOWER = [JOINT_POS_LIMITS[n][0] for n in JOINT_NAMES]
+JOINT_POS_UPPER = [JOINT_POS_LIMITS[n][1] for n in JOINT_NAMES]
+
 ACTION_SCALE = 0.25
 CLIP_ACTIONS = 100.0
 
@@ -821,6 +849,15 @@ def run(args: argparse.Namespace) -> None:
             0.8 * f + 0.2 * r for f, r in zip(filtered_dof_pos, raw_dof_pos)
         ]
 
+        # --- clamp to physical joint limits (see JOINT_POS_LIMITS) -------------------
+        # The real SDK rejects out-of-range targets, so we pin them at the limit like the sim does.
+        clamped = [
+            min(hi, max(lo, q))
+            for q, lo, hi in zip(filtered_dof_pos, JOINT_POS_LOWER, JOINT_POS_UPPER)
+        ]
+        n_at_limit = sum(1 for q, c in zip(filtered_dof_pos, clamped) if abs(q - c) > 1e-6)
+        filtered_dof_pos = clamped
+
         # --- send command ---
         update_low_cmd(low_cmd, filtered_dof_pos, state_buf.get_crank_pos())
         try:
@@ -867,7 +904,7 @@ def run(args: argparse.Namespace) -> None:
                 f"[{elapsed:6.2f}s] step={step:5d} wr={write_count:5d} "
                 f"roll={math.degrees(roll):+5.1f}° pitch={math.degrees(pitch):+5.1f}° "
                 f"phase={gait_phase:.2f} | "
-                f"act max={act_max:.3f} mean={act_mean:.3f}  dq_max={vel_max:.2f} | "
+                f"act max={act_max:.3f} mean={act_mean:.3f}  dq_max={vel_max:.2f}  clamp={n_at_limit:2d}/16 | "
                 f"Δhip_L={d[4]:+.3f} Δknee_L={d[7]:+.3f} "
                 f"Δhip_R={d[10]:+.3f} Δknee_R={d[13]:+.3f}"
             )
