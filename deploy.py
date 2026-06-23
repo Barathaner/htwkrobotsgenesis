@@ -53,6 +53,27 @@ def control_position(robot, values, dofs_idx, order):
     robot.control_dofs_position(values[order], dofs_idx)
 
 
+def prepare_to_default(robot, motor_dofs, motor_order, motor_default,
+                       fixed_dofs, fixed_order, fixed_target, n_steps=100):
+    """Smoothly PD-ramp the policy and fixed joints from their current angles to the default pose,
+    like the real robot's bring-up. Uses split motor/fixed control so each target lands on the right
+    joint (see control_position). The robot must already be standing — ramping from a non-standing
+    pose topples it, since only the policy can balance the marginally-stable bent-knee pose.
+
+    n_steps is intentionally short: with no policy active and no physical support, the default pose is
+    only marginally stable in sim and topples after ~15-20 open-loop steps (it survives much longer on
+    the real robot's flat feet). 10 steps is a smooth settle that hands off to the policy in time."""
+    q_motor = robot.get_dofs_position(motor_dofs).clone()
+    q_fixed = robot.get_dofs_position(fixed_dofs).clone()
+    for i in range(n_steps):
+        alpha = (i + 1) / n_steps
+        target = (1 - alpha) * q_motor + alpha * motor_default
+        targetfixed = (1 - alpha) * q_fixed + alpha * fixed_target
+        robot.control_dofs_position(target, motor_dofs)
+        robot.control_dofs_position(targetfixed, fixed_dofs)
+        scene.step()
+
+
 if __name__ == "__main__":
     gs.init(backend=gs.cpu, logging_level="warning")
 
@@ -84,18 +105,6 @@ if __name__ == "__main__":
     model = load_model(config["policy"]["model"])
     print(model)
 
-    # Spawn the robot directly in the default (bent-knee) pose, like the training env does at reset.
-    # The URDF rest pose has straight legs, so at base height 0.56 the feet penetrate the ground —
-    # PD-ramping out of that penetration makes the robot collapse. robot.joints[1:] are in ascending
-    # dof order, so no reorder is needed here (unlike control_dofs_position).
-    init_dofs = [d for j in robot.joints[1:] for d in j.dofs_idx_local]
-    init_pose = torch.tensor(
-        [config["policy"]["default_joint_angles"].get(j.name, 0.0) for j in robot.joints[1:]],
-        dtype=gs.tc_float, device=gs.device,
-    )
-    robot.set_dofs_position(init_pose, init_dofs)
-    robot.zero_all_dofs_velocity()
-
     joint_names = p["joint_names"]
     # 16-entry default for the policy joints (joint_names order), used to centre the obs.
     default_motor = torch.tensor(
@@ -117,9 +126,11 @@ if __name__ == "__main__":
     )
     clip_actions = p["clip_actions"]
 
-    # No passive settle: the bent-knee default pose is only marginally stable under PD, so holding it
-    # open-loop topples the robot. The robot is already placed at the default pose above (feet on the
-    # ground, zero velocity); hand control straight to the policy, which actively balances.
+
+    # Smoothly PD-ramp to the default pose (robot is already standing there), then hand to the policy.
+    prepare_to_default(robot, motor_dofs_robot, motor_order, default_motor,
+                       fixed_dofs_robot, fixed_order, fixed_target)
+
     step = 0
     last_actions = torch.zeros((16,), dtype=gs.tc_float, device=gs.device)
     while True:
