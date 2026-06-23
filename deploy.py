@@ -31,7 +31,9 @@ Joint-space note:
 from __future__ import annotations
 
 import argparse
+import glob
 import math
+import os
 import signal
 import sys
 import time
@@ -216,6 +218,31 @@ class ActorMLP(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.mlp(obs)
+
+
+DEFAULT_MODEL_DIR = "logs/k1-distill"  # distillation student checkpoints live here
+
+
+def resolve_model(path: str) -> str:
+    """Accept a .pt file or a log dir (auto-picks the highest-numbered model_*.pt).
+
+    Mirrors _resolve_teacher in walk/k1_distill.py so deploy keeps working as the
+    student trains and new checkpoints appear (the default points at the dir, not a
+    fixed model_N.pt that may not exist yet).
+    """
+    path = os.path.abspath(path)
+    if os.path.isdir(path):
+        cands = sorted(
+            glob.glob(os.path.join(path, "model_*.pt")),
+            key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[1]),
+        )
+        if not cands:
+            raise FileNotFoundError(f"No model_*.pt found in {path}")
+        print(f"Auto-selected latest student checkpoint: {cands[-1]}")
+        return cands[-1]
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    return path
 
 
 def load_actor(checkpoint_path: str) -> tuple[ActorMLP, int, bool]:
@@ -612,8 +639,9 @@ def build_obs(
 
 
 def run(args: argparse.Namespace) -> None:
-    print(f"Loading model: {args.model}")
-    actor, obs_dim, is_student = load_actor(args.model)
+    model_path = resolve_model(args.model)
+    print(f"Loading model: {model_path}")
+    actor, obs_dim, is_student = load_actor(model_path)
     kind = "STUDENT (onboard proprio obs)" if is_student else "TEACHER (privileged obs)"
     print(f"Model loaded: {kind}. OBS_DIM={obs_dim}, NUM_ACTIONS={NUM_ACTIONS}")
 
@@ -758,9 +786,10 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="K1 policy smoke test")
-    parser.add_argument("--model",     default="logs/k1-distill/model_2000.pt",
-                        help="Path to checkpoint (.pt). A distillation student "
-                             "(student_state_dict) or a teacher (actor_state_dict); auto-detected.")
+    parser.add_argument("--model",     default=DEFAULT_MODEL_DIR,
+                        help="Checkpoint .pt, or a log dir (auto-picks the latest model_*.pt). "
+                             "Defaults to the distillation student dir 'logs/k1-distill'. A student "
+                             "(student_state_dict) or teacher (actor_state_dict) is auto-detected.")
     parser.add_argument("--interface", default="127.0.0.1",
                         help="Network interface or IP for SDK (use 127.0.0.1 when running on the robot)")
     parser.add_argument("--duration",  type=float, default=10.0,
