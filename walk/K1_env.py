@@ -385,6 +385,17 @@ class K1Env:
         }
         self.obs_dim = sum(self._obs_slices.values())
 
+        # Onboard-only subset = STUDENT obs group ("proprio") for teacher→student distillation.
+        # Excludes the privileged base-velocity/height terms AND feet_contact (faked on hardware):
+        # only IMU (ang_vel + gravity), joint encoders (dof_pos/vel), last action, commands and the
+        # gait clock — i.e. exactly what the real K1 can measure. Order is fixed for deploy parity.
+        self._proprio_keys = [
+            "base_ang_vel", "projected_gravity", "commands",
+            "dof_pos", "dof_vel", "actions", "gait_phase",
+        ]
+        self.proprio_dim = sum(self._obs_slices[k] for k in self._proprio_keys)
+        self.proprio_buf: torch.Tensor | None = None
+
         self.obs_buf = torch.empty((num_envs, self.obs_dim), dtype=gs.tc_float, device=gs.device)
         self.rew_buf = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
         self.reset_buf = torch.ones((num_envs,), dtype=gs.tc_bool, device=gs.device)
@@ -1111,10 +1122,17 @@ class K1Env:
 
     def _update_observation(self):
         phase_2pi = self.gait_phase * (2.0 * math.pi)
+        # Shared sub-tensors (computed once, reused by both the full and the proprio obs).
+        ang_vel = self.base_ang_vel * self.obs_scales["ang_vel"]
+        grav = self.projected_gravity
+        cmd = self.commands * self.commands_scale
+        dof_pos = (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"]
+        dof_vel = self.dof_vel * self.obs_scales["dof_vel"]
+        gait_clock = torch.stack([torch.sin(phase_2pi), torch.cos(phase_2pi)], dim=1)
         obs_parts = [
-            self.base_ang_vel * self.obs_scales["ang_vel"],
-            self.projected_gravity,
-            self.commands * self.commands_scale,
+            ang_vel,
+            grav,
+            cmd,
             # privileged
             self.base_lin_vel_heading[:, :2] * self.obs_scales["lin_vel"],
             self.lin_vel_ema * self.obs_scales["lin_vel"],
@@ -1122,10 +1140,10 @@ class K1Env:
             self.base_pos[:, 2:3],
             self.base_lin_vel[:, 2:3] * self.obs_scales["lin_vel"],
             # deploy-fähig
-            (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
-            self.dof_vel * self.obs_scales["dof_vel"],
+            dof_pos,
+            dof_vel,
             self.actions,
-            torch.stack([torch.sin(phase_2pi), torch.cos(phase_2pi)], dim=1),
+            gait_clock,
             self.foot_in_contact.to(gs.tc_float) - 0.5,
         ]
         for i, part in enumerate(obs_parts):
@@ -1133,8 +1151,15 @@ class K1Env:
         self.obs_buf = torch.cat(obs_parts, dim=-1)
         assert self.obs_buf.shape[-1] == self.obs_dim
 
+        # Onboard-only obs for the distillation student (see self._proprio_keys). Must stay in the
+        # same order as _proprio_keys so a deployed student sees identical layout.
+        self.proprio_buf = torch.cat([ang_vel, grav, cmd, dof_pos, dof_vel, self.actions, gait_clock], dim=-1)
+        assert self.proprio_buf.shape[-1] == self.proprio_dim
+
     def get_observations(self):
         td = {"policy": self.obs_buf}
+        if self.proprio_buf is not None:
+            td["proprio"] = self.proprio_buf
         if self._amp_obs_curr is not None:
             td["amp"] = self._amp_obs_curr
         return TensorDict(td, batch_size=[self.num_envs])

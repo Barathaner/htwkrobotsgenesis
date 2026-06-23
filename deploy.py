@@ -1,12 +1,17 @@
 """Smoke test: run a trained K1 walking policy on the real Booster K1 robot.
 
+Loads a distillation STUDENT checkpoint (walk/k1_distill.py, key "student_state_dict",
+59-dim onboard proprio obs) by default, and also accepts a TEACHER checkpoint
+(walk/K1_train.py, key "actor_state_dict") — the kind is auto-detected and the observation
+is built to match. The student needs no privileged/faked inputs, so it is the deployable one.
+
 Requires:
   - booster_robotics_sdk_python  (build from ~/git/booster_robotics_sdk)
   - PyTorch CPU
 
 Usage (from repo root, running directly ON the robot):
-  python walk/deploy/smoke_test_k1.py \\
-      --model model_1250.pt \\
+  python deploy.py \\
+      --model logs/k1-distill/model_2000.pt \\
       --interface 127.0.0.1 \\
       --duration 10 \\
       --vx 0.0 --vy 0.0 --wz 0.0
@@ -179,22 +184,31 @@ OBS_SCALE_LIN_VEL = 2.0
 OBS_SCALE_DOF_POS = 1.0
 OBS_SCALE_DOF_VEL = 0.05
 
-# Gait clock (from k1_env.yaml)
-GAIT_PERIOD_S  = 1.1
-GAIT_PERIOD_STEPS = max(1, round(GAIT_PERIOD_S / DT))  # 55
+# Gait clock (from k1_env.yaml: reward_cfg.gait_period_s). MUST match the training config
+# the checkpoint was produced with, or the phase clock desyncs from the learned gait.
+GAIT_PERIOD_S  = 0.80
+GAIT_PERIOD_STEPS = max(1, round(GAIT_PERIOD_S / DT))  # 40
 
 # ---------------------------------------------------------------------------
 # Policy network (mirrors rsl-rl MLPModel with ELU + GaussianDistribution)
 # ---------------------------------------------------------------------------
+#
+# Two checkpoint kinds are supported (auto-detected in load_actor):
+#   - STUDENT (distillation, walk/k1_distill.py): key "student_state_dict",
+#     onboard-only obs (proprio group, 59-dim) — no privileged/faked inputs.
+#   - TEACHER (PPO/AMP, walk/K1_train.py):        key "actor_state_dict",
+#     legacy privileged obs (63-dim here) with placeholder lin_vel_heading/foot_contact.
+# Both share the same MLP (512→256→128, ELU); only the input width differs.
 
-OBS_DIM = 63  # see k1_env.yaml header comment
+STUDENT_OBS_DIM = 59  # proprio group: ang_vel(3)+grav(3)+cmd(3)+dof_pos(16)+dof_vel(16)+act(16)+clock(2)
+TEACHER_OBS_DIM = 63  # legacy: STUDENT layout + lin_vel_heading(2) + foot_contact(2)
 
 
 class ActorMLP(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, obs_dim: int) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(OBS_DIM, 512), nn.ELU(),
+            nn.Linear(obs_dim, 512), nn.ELU(),
             nn.Linear(512, 256),     nn.ELU(),
             nn.Linear(256, 128),     nn.ELU(),
             nn.Linear(128, NUM_ACTIONS),
@@ -204,13 +218,30 @@ class ActorMLP(nn.Module):
         return self.mlp(obs)
 
 
-def load_actor(checkpoint_path: str) -> ActorMLP:
+def load_actor(checkpoint_path: str) -> tuple[ActorMLP, int, bool]:
+    """Load a student (preferred) or teacher actor for inference.
+
+    Returns (actor, obs_dim, is_student). obs_dim is inferred from the checkpoint's first
+    layer so the network width always matches the weights, regardless of obs layout changes.
+    """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    actor = ActorMLP()
-    # strict=False: rsl-rl also stores distribution.std_param which we don't need for inference
-    actor.load_state_dict(ckpt["actor_state_dict"], strict=False)
+
+    if "student_state_dict" in ckpt:
+        state_dict, is_student = ckpt["student_state_dict"], True
+    elif "actor_state_dict" in ckpt:
+        state_dict, is_student = ckpt["actor_state_dict"], False
+    else:
+        raise KeyError(
+            f"{checkpoint_path}: no 'student_state_dict' or 'actor_state_dict' found "
+            f"(keys: {list(ckpt.keys())})"
+        )
+
+    obs_dim = int(state_dict["mlp.0.weight"].shape[1])  # first Linear: (512, obs_dim)
+    actor = ActorMLP(obs_dim)
+    # strict=False: rsl-rl also stores distribution.std_param which inference does not need.
+    actor.load_state_dict(state_dict, strict=False)
     actor.eval()
-    return actor
+    return actor, obs_dim, is_student
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +575,10 @@ def build_obs(
     dof_vel: list[float],
     last_actions: list[float],
     gait_phase: float,              # ∈ [0, 1)
-    foot_contact: list[float],      # [L, R] ∈ {0, 1}
+    *,
+    privileged: bool,               # True = teacher (adds faked heading + contact); False = student
+    foot_contact: list[float] | None = None,   # [L, R] ∈ {0, 1}; only used when privileged
+    expected_dim: int | None = None,
 ) -> torch.Tensor:
     proj_g = rpy_to_projected_gravity(roll, pitch)
 
@@ -554,8 +588,6 @@ def build_obs(
         commands[1] * OBS_SCALE_LIN_VEL,
         commands[2] * OBS_SCALE_ANG_VEL,
     ]
-    # base_lin_vel_heading: not directly observable without odometry → set to 0
-    lin_vel_heading = [0.0, 0.0]
 
     pos_rel = [(p - d) * OBS_SCALE_DOF_POS for p, d in zip(dof_pos, DEFAULT_DOF_POS.tolist())]
     vel_obs  = [v * OBS_SCALE_DOF_VEL for v in dof_vel]
@@ -563,27 +595,27 @@ def build_obs(
     phase_2pi = gait_phase * 2.0 * math.pi
     clock = [math.sin(phase_2pi), math.cos(phase_2pi)]
 
-    contact_obs = [c - 0.5 for c in foot_contact]
+    # Student (proprio) layout: ang_vel, grav, cmd, dof_pos, dof_vel, last_action, clock.
+    # The student is trained WITHOUT base_lin_vel_heading and foot_contact (privileged /
+    # un-deployable), so they are simply omitted here — no fake values fed to the network.
+    flat = ang_vel_obs + proj_g + cmd_scaled
+    if privileged:
+        flat += [0.0, 0.0]  # base_lin_vel_heading: not observable without odometry → 0
+    flat += pos_rel + vel_obs + last_actions + clock
+    if privileged:
+        fc = foot_contact if foot_contact is not None else [1.0, 1.0]
+        flat += [c - 0.5 for c in fc]
 
-    flat = (
-        ang_vel_obs         # 3
-        + proj_g            # 3
-        + cmd_scaled        # 3
-        + lin_vel_heading   # 2
-        + pos_rel           # 16
-        + vel_obs           # 16
-        + last_actions      # 16
-        + clock             # 2
-        + contact_obs       # 2
-    )
-    assert len(flat) == OBS_DIM, f"obs dim mismatch: {len(flat)} != {OBS_DIM}"
+    if expected_dim is not None:
+        assert len(flat) == expected_dim, f"obs dim mismatch: {len(flat)} != {expected_dim}"
     return torch.tensor(flat, dtype=torch.float32).unsqueeze(0)
 
 
 def run(args: argparse.Namespace) -> None:
     print(f"Loading model: {args.model}")
-    actor = load_actor(args.model)
-    print("Model loaded. OBS_DIM=63, NUM_ACTIONS=16")
+    actor, obs_dim, is_student = load_actor(args.model)
+    kind = "STUDENT (onboard proprio obs)" if is_student else "TEACHER (privileged obs)"
+    print(f"Model loaded: {kind}. OBS_DIM={obs_dim}, NUM_ACTIONS={NUM_ACTIONS}")
 
     state_buf = RobotStateBuffer()
     ChannelFactory.Instance().Init(0, args.interface)
@@ -650,10 +682,8 @@ def run(args: argparse.Namespace) -> None:
             fall_detected = True
             break
 
-        # simple foot contact estimate: both feet always in contact during stand test
-        foot_contact = [1.0, 1.0]
-
         # --- build observation ---
+        # Student: foot_contact is omitted entirely. Teacher: faked as both-in-contact.
         obs = build_obs(
             gyro=gyro,
             roll=roll,
@@ -663,7 +693,9 @@ def run(args: argparse.Namespace) -> None:
             dof_vel=dof_vel,
             last_actions=last_actions,
             gait_phase=gait_phase,
-            foot_contact=foot_contact,
+            privileged=not is_student,
+            foot_contact=[1.0, 1.0],
+            expected_dim=obs_dim,
         )
 
         # --- policy inference ---
@@ -726,8 +758,9 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="K1 policy smoke test")
-    parser.add_argument("--model",     default="logs/foot-rool-penaly/model_1250.pt",
-                        help="Path to model checkpoint (.pt)")
+    parser.add_argument("--model",     default="logs/k1-distill/model_2000.pt",
+                        help="Path to checkpoint (.pt). A distillation student "
+                             "(student_state_dict) or a teacher (actor_state_dict); auto-detected.")
     parser.add_argument("--interface", default="127.0.0.1",
                         help="Network interface or IP for SDK (use 127.0.0.1 when running on the robot)")
     parser.add_argument("--duration",  type=float, default=10.0,

@@ -332,3 +332,54 @@ train_cfg:
 
   logger:
     class_name: WandbLogWriter
+
+# ── Teacher → Student distillation (rsl-rl Distillation / DistillationRunner) ──────────
+# The student sees only onboard signals (env "proprio" group: IMU + joint encoders + last
+# action + commands + gait clock) and is trained via DAgger BC to copy the privileged teacher
+# (env "policy" group, 68-dim). Launch with walk/k1_distill.py --teacher <model.pt>.
+distill_cfg:
+  algorithm:
+    class_name: k1_distill_algo:K1Distillation   # rsl-rl Distillation + DAgger beta-mix + target clip
+    num_learning_epochs: 3
+    gradient_length: 1        # feedforward student → step optimizer every minibatch (no BPTT)
+    learning_rate: 0.0003
+    max_grad_norm: 1.0
+    loss_type: mse
+    optimizer: adam
+    beta_decay_iters: 400     # anneal teacher-action mixing 1.0→0.0 over this many iterations
+    action_clip: 100.0        # clip teacher target to env clip_actions (teacher raw |a| up to ~360)
+
+  # Feedforward MLP student (SAME architecture as the teacher). No LSTM: last_action in the
+  # proprio obs provides the one-step memory walking needs, and per-step BC is far more stable
+  # than BPTT over the student's short early episodes. It must infer base velocity/height from
+  # proprioception alone (RMA/DreamWaQ-style, but without an explicit history encoder).
+  student:
+    class_name: MLPModel
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    distribution_cfg:
+      class_name: GaussianDistribution
+      init_std: 1.0
+      std_type: scalar
+
+  # Teacher MUST match the trained actor exactly so actor_state_dict loads strictly.
+  teacher:
+    class_name: MLPModel
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    distribution_cfg:
+      class_name: GaussianDistribution
+      init_std: 1.0
+      std_type: scalar
+
+  obs_groups:
+    student: [proprio]   # onboard-only
+    teacher: [policy]    # privileged full obs
+
+  num_steps_per_env: 24
+  save_interval: 100
+  run_name: k1-distill
+  wandb_project: k1-locomotion
+
+  logger:
+    class_name: WandbLogWriter
