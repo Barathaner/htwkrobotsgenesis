@@ -606,13 +606,13 @@ def update_low_cmd(
     # Physical L/R swap: send policy "left" outputs to SDK right motors and vice versa.
     mc[K1Ji.kHeadYaw].q           = fx["AAHead_yaw"]
     mc[K1Ji.kHeadPitch].q         = fx["Head_pitch"]
-    mc[K1Ji.kRightShoulderPitch].q = l_sh_pitch                              # policy left → SDK right (physical left)
-    mc[K1Ji.kRightShoulderRoll].q  = fx["Left_Shoulder_Roll"]
-    mc[K1Ji.kRightElbowPitch].q    = fx["Left_Elbow_Pitch"]
+    mc[K1Ji.kRightShoulderPitch].q = r_sh_pitch                              # policy left → SDK right (physical left)
+    mc[K1Ji.kRightShoulderRoll].q  = l_sh_roll
+    mc[K1Ji.kRightElbowPitch].q    = r_el_pitch
     mc[K1Ji.kRightElbowYaw].q      = l_el_yaw
-    mc[K1Ji.kLeftShoulderPitch].q  = r_sh_pitch                              # policy right → SDK left (physical right)
-    mc[K1Ji.kLeftShoulderRoll].q   = fx["Right_Shoulder_Roll"]
-    mc[K1Ji.kLeftElbowPitch].q     = fx["Right_Elbow_Pitch"]
+    mc[K1Ji.kLeftShoulderPitch].q  = l_sh_pitch                               # policy right → SDK left (physical right)
+    mc[K1Ji.kLeftShoulderRoll].q   = l_sh_roll
+    mc[K1Ji.kLeftElbowPitch].q     = r_el_pitch
     mc[K1Ji.kLeftElbowYaw].q       = r_el_yaw
     mc[K1Ji.kRightHipPitch].q      = l_hip_p                                 # policy left leg → SDK right (physical left)
     mc[K1Ji.kRightHipRoll].q       = l_hip_r
@@ -779,17 +779,6 @@ def run(args: argparse.Namespace) -> None:
     # Stream a valid frame that HOLDS THE CURRENT MEASURED POSE (no jump) before the mode switch.
     # NEVER command the training default here: the high-stiffness fixed shoulder-roll joints (±1.5)
     # would snap and throw the arms up. The policy then runs straight from the measured pose.
-    prepare_cmd = alloc_low_cmd()
-    print("Streaming prepare frames (HOLDING current pose) at 500 Hz before mode switch…")
-    t_p = time.monotonic()
-    for _ in range(150):                          # ~0.3 s of frames at 500 Hz
-        update_low_cmd(prepare_cmd, state_buf.get_dof_pos_vel()[0],
-                       state_buf.get_crank_pos(), fixed=state_buf.get_fixed_pos())
-        publisher.Write(prepare_cmd)
-        t_p += PUBLISH_DT
-        sl = t_p - time.monotonic()
-        if sl > 0:
-            time.sleep(sl)
 
     print("Switching to Custom mode…")
     mode_ret = client.ChangeMode(RobotMode.kCustom)
