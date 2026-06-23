@@ -305,11 +305,13 @@ def _tui(stdscr, args: argparse.Namespace, state_buf: RobotStateBuffer,
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selected
     curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # crank
 
-    targets  = list(DEFAULT_POS)
+    # Start from the CURRENT measured pose, NOT DEFAULT_POS — snapping every joint to the default
+    # (shoulder roll ±1.5) on the first publish throws the arms up. Press 'r' to go to defaults.
+    targets  = [state_buf.q(i) for i in range(K1_JOINT_CNT)]
     selected = 0
     scroll   = 0
     step     = 0.05
-    status   = "Ready — robot in Custom mode"
+    status   = "Ready — holding current pose. '+/-' nudge, 'r' = defaults (CAUTION: moves arms)"
     low_cmd  = alloc_low_cmd()
     t_next   = time.monotonic()
     pub_tick = 0
