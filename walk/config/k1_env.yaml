@@ -92,6 +92,10 @@ env_cfg:
   action_scale: 0.25
   simulate_action_latency: true
   clip_actions: 100.0
+  # Onboard proprio obs = stack of the last N frames. With the recurrent (LSTM) actor the hidden
+  # state provides the memory, so a single frame per step is enough → keep this at 1. (Set >1 only
+  # if you switch the actor back to a feedforward MLPModel that needs an explicit history stack.)
+  proprio_history_len: 1
 
   # Kamera für Rollout-Videos (K1_train_runner + gleiche Defaults wie K1_hero_test).
   video:
@@ -271,22 +275,35 @@ train_cfg:
     use_clipped_value_loss: true
     value_loss_coef: 1.0
 
+  # Recurrent onboard actor (SPRINT-style): an LSTM carries memory across timesteps so the policy
+  # can infer base linear velocity (unobservable in a single onboard frame) from temporal structure.
+  # The LSTM replaces the proprio frame-stack — proprio_history_len is set to 1 below (one frame/step;
+  # the hidden state is the memory). RNNModel = RNN(obs -> rnn_hidden_dim) then the MLP head below.
   actor:
-    class_name: MLPModel
-    hidden_dims: [512, 256, 128]
+    class_name: RNNModel
+    rnn_type: lstm
+    rnn_hidden_dim: 256
+    rnn_num_layers: 1
+    hidden_dims: [256, 128]
     activation: elu
     distribution_cfg:
       class_name: GaussianDistribution
       init_std: 1.0
       std_type: scalar
 
+  # Critic stays a feedforward MLP on the privileged group (training-only, discarded at deploy).
   critic:
     class_name: MLPModel
     hidden_dims: [512, 256, 128]
     activation: elu
 
+  # Asymmetric actor-critic: the actor (deployed policy) sees ONLY onboard-readable signals
+  # (proprio = IMU + joint encoders + last action + commands + gait clock, stacked over
+  # proprio_history_len frames so it can estimate base velocity it can't directly measure).
+  # The critic keeps the privileged group (true base velocity/height) — it's training-only,
+  # discarded at deploy, so it gives the robot no unfair advantage while sharpening value estimates.
   obs_groups:
-    actor: [policy]
+    actor: [proprio]
     critic: [policy]
 
   # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
@@ -342,11 +359,11 @@ distill_cfg:
     class_name: k1_distill_algo:K1Distillation   # rsl-rl Distillation + DAgger beta-mix + target clip
     num_learning_epochs: 3
     gradient_length: 1        # feedforward student → step optimizer every minibatch (no BPTT)
-    learning_rate: 0.0003
+    learning_rate: 0.001
     max_grad_norm: 1.0
     loss_type: mse
     optimizer: adam
-    beta_decay_iters: 400     # anneal teacher-action mixing 1.0→0.0 over this many iterations
+    beta_decay_iters: 3000    # anneal teacher-action mixing 1.0→0.0 over this many iterations
     action_clip: 100.0        # clip teacher target to env clip_actions (teacher raw |a| up to ~360)
 
   # Feedforward MLP student (SAME architecture as the teacher). No LSTM: last_action in the
@@ -376,7 +393,7 @@ distill_cfg:
     student: [proprio]   # onboard-only
     teacher: [policy]    # privileged full obs
 
-  num_steps_per_env: 24
+  num_steps_per_env: 48
   save_interval: 100
   run_name: k1-distill
   wandb_project: k1-locomotion

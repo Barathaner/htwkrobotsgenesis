@@ -24,7 +24,7 @@ class K1Distillation(Distillation):
     def __init__(
         self,
         *args,
-        beta_decay_iters: int = 300,
+        beta_decay_iters: int = 1500,
         action_clip: float | None = 100.0,
         **kwargs,
     ) -> None:
@@ -43,16 +43,7 @@ class K1Distillation(Distillation):
         return max(0.0, 1.0 - self.num_updates / self.beta_decay_iters)
 
     def act(self, obs):
-        # Roll out the student DETERMINISTICALLY (execute the mean). The BC MSE loss only trains
-        # the mean, so the Gaussian std stays pinned at init_std (1.0 raw = 0.25 rad after
-        # action_scale ≈ 14°/step of white noise); sampling that during rollout topples the robot
-        # as DAgger's beta hands control from teacher to student, collapsing episode length with no
-        # recovery. We still do a STOCHASTIC forward so the distribution's internal Normal is built
-        # (the runner logs get_policy().output_std → distribution.std, which is None until update()
-        # runs) — then take output_mean as the executed action. State coverage comes from the
-        # teacher beta-mix below.
-        self.student(obs, stochastic_output=True)
-        student_a = self.student.output_mean.detach()
+        student_a = self.student(obs, stochastic_output=True).detach()
         teacher_a = self.teacher(obs).detach()
 
         # BC target = the action the env actually executes (clipped), not the raw teacher output.

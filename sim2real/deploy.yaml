@@ -1,5 +1,6 @@
 policy:
-  model: "logs/k1-distill/model_1999.pt"
+  model: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/logs/lstm/model_3000.pt"
+  urdf_path: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/models/K1/K1_22dof.urdf"
   obs_dim: 59
   action_dim: 16
   action_scale: 0.25

@@ -63,6 +63,26 @@ class K1TrainRunner(OnPolicyRunner):
         from amp_rsl_rl.networks import Discriminator
         from k1_amp_loader import K1AMPLoader
 
+        class K1AMP_PPO(AMP_PPO):
+            """AMP_PPO with a fix for recurrent (LSTM) actors.
+
+            The shipped amp_rsl_rl stores only the ACTOR's hidden state in the transition
+            (`transition.hidden_states = self.actor.get_hidden_state()`), but the rollout storage
+            expects the 2-tuple `(actor_hidden, critic_hidden)` that stock rsl-rl PPO produces — so
+            a recurrent actor crashes in `_save_hidden_states` (None on step 1, mis-paired after).
+            We capture the correct pre-forward 2-tuple here (same timing as super().act() reads it,
+            no forward in between) and overwrite the buggy value super().act() left behind.
+            """
+
+            def act(self, obs):
+                pending = None
+                if self.actor.is_recurrent:
+                    pending = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
+                actions = super().act(obs)
+                if pending is not None:
+                    self.transition.hidden_states = pending
+                return actions
+
         obs = self.env.get_observations()
         if "amp" not in obs.keys():
             raise RuntimeError("K1Env must include 'amp' key in get_observations() for AMP training.")
@@ -117,7 +137,8 @@ class K1TrainRunner(OnPolicyRunner):
         warp_factors = [_warps_for(p) for p in motion_paths]
         amp_data = K1AMPLoader(motion_paths, joint_names, device=self.device,
                                cmd_ranges=cmd_ranges, ema_window_s=ema_window_s,
-                               warp_factors=warp_factors)
+                               warp_factors=warp_factors,
+                               mirror_augment=amp_cfg.get("mirror_augment", True))
 
         # Push combined motion normalization stats to the env so _build_amp_obs() uses the
         # same feature space as the expert data (commands are appended raw in both).
@@ -133,7 +154,7 @@ class K1TrainRunner(OnPolicyRunner):
         if "amp_replay_buffer_size" in self.cfg:
             alg_kwargs["amp_replay_buffer_size"] = self.cfg["amp_replay_buffer_size"]
 
-        self.alg = AMP_PPO(
+        self.alg = K1AMP_PPO(
             actor=ppo.actor,
             critic=ppo.critic,
             discriminator=discriminator,
@@ -243,6 +264,14 @@ class K1TrainRunner(OnPolicyRunner):
         policy = self.get_inference_policy(device=self.device)
         frames: list = []
 
+        # Recurrent (LSTM) actor: its internal hidden state carries the TRAINING batch size and the
+        # in-progress episode memory. The video env has a different (smaller) batch, so we must run
+        # the rollout on a fresh hidden state and then restore the training one for continuity.
+        actor_recurrent = getattr(self.alg.actor, "is_recurrent", False)
+        saved_hidden = self.alg.actor.get_hidden_state() if actor_recurrent else None
+        if actor_recurrent:
+            self.alg.actor.reset()  # -> None; recreated at the video batch on the first forward
+
         _TERM_REASONS = ("timeout", "pitch", "roll", "height", "sim_error")
         video_term: dict[str, int] = {r: 0 for r in _TERM_REASONS}
         video_term_total = 0
@@ -254,6 +283,8 @@ class K1TrainRunner(OnPolicyRunner):
                 obs, _, dones, _ = video_env.step(actions)
 
                 done_mask = dones.bool()
+                if actor_recurrent:
+                    self.alg.actor.reset(done_mask)  # zero hidden state for envs that just reset
                 if done_mask.any():
                     video_term_total += int(done_mask.sum().item())
                     for reason in _TERM_REASONS:
@@ -269,6 +300,13 @@ class K1TrainRunner(OnPolicyRunner):
                     video_env.cam.update_following()
                 update_camera_centroid(video_env)
                 frames.append(render_annotated_frame(video_env))
+
+        # Restore the training hidden state so the next rollout continues uninterrupted.
+        if actor_recurrent:
+            self.alg.actor.reset(hidden_state=saved_hidden)
+        # get_inference_policy() put the nets in eval mode; restore train mode or the next update's
+        # cudnn RNN backward raises "can only be called in training mode" (MLPs tolerated eval).
+        self.alg.train_mode()
 
         imageio.mimsave(
             path,
@@ -453,6 +491,23 @@ class K1TrainRunner(OnPolicyRunner):
                     loss_dict[f"termination/{reason}_pct"] = 100.0 * _term_counts[reason] / _term_total
             _term_counts = {r: 0 for r in _TERM_REASONS}
             _term_total = 0
+
+            # ── Velocity-curriculum metrics → same log channel as losses (wandb + tensorboard) ──
+            # vc_level (0→1) is the headline; cmd_*_max show the command range widening; track_mean
+            # vs track_threshold show the performance gate that advances the level.
+            if getattr(self.env, "_vc_enabled", False):
+                loss_dict["curriculum/vc_level"] = float(self.env._vc_level)
+                lo, hi = self.env.commands_limits
+                loss_dict["curriculum/cmd_x_min"] = float(lo[0])
+                loss_dict["curriculum/cmd_x_max"] = float(hi[0])
+                loss_dict["curriculum/cmd_y_max"] = float(hi[1])
+                loss_dict["curriculum/cmd_yaw_max"] = float(hi[2])
+                dq = self.env._vc_track_deque
+                if len(dq) > 0:
+                    loss_dict["curriculum/track_mean"] = sum(dq) / len(dq)
+                    loss_dict["curriculum/track_threshold"] = (
+                        self.env._vc_frac * self.env._vc_track_max
+                    )
 
             record_video = (
                 self.enable_video

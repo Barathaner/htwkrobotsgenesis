@@ -393,8 +393,28 @@ class K1Env:
             "base_ang_vel", "projected_gravity", "commands",
             "dof_pos", "dof_vel", "actions", "gait_phase",
         ]
-        self.proprio_dim = sum(self._obs_slices[k] for k in self._proprio_keys)
+        # Per-frame onboard dim. The student obs is a STACK of the last proprio_history_len frames
+        # (RMA/DreamWaQ-style): a single frame can't express base linear velocity (a temporal
+        # quantity the privileged teacher leans on), so a feedforward student distilled from a
+        # well-trained teacher topples once it takes over. A short history of measured states lets
+        # the student RECONSTRUCT velocity from the frame-to-frame pattern → it can mimic even a
+        # late-iteration teacher. last_action only carries the previous *command*, not motion.
+        self.proprio_frame_dim = sum(self._obs_slices[k] for k in self._proprio_keys)
+        self.proprio_history_len = int(env_cfg.get("proprio_history_len", 5))
+        self.proprio_dim = self.proprio_frame_dim * self.proprio_history_len
+        # Ring buffer of the last N frames, newest LAST. Deploy must mirror this layout.
+        self.proprio_hist = torch.zeros(
+            (num_envs, self.proprio_history_len, self.proprio_frame_dim),
+            dtype=gs.tc_float, device=gs.device,
+        )
+        # Mask of envs reset this step; their history is re-filled with the current frame so no
+        # stale cross-episode frames leak in. Set by _reset_idx, consumed by _update_observation.
+        self._proprio_reset_mask = torch.ones(num_envs, dtype=torch.bool, device=gs.device)
         self.proprio_buf: torch.Tensor | None = None
+        print(
+            f"[K1Env] student proprio obs: {self.proprio_history_len} frames x "
+            f"{self.proprio_frame_dim} = {self.proprio_dim} dims"
+        )
 
         self.obs_buf = torch.empty((num_envs, self.obs_dim), dtype=gs.tc_float, device=gs.device)
         self.rew_buf = torch.zeros((num_envs,), dtype=gs.tc_float, device=gs.device)
@@ -882,6 +902,12 @@ class K1Env:
         else:
             saved_ep_lengths = self.episode_length_buf[envs_idx].clone()
 
+        # Flag reset envs so _update_observation re-fills their proprio history (no stale frames).
+        if envs_idx is None:
+            self._proprio_reset_mask.fill_(True)
+        else:
+            self._proprio_reset_mask[envs_idx] = True
+
         # reset state with init-state noise + random yaw
         noisy_qpos, init_quats_batch = self._build_noisy_init_qpos(envs_idx)
 
@@ -1151,9 +1177,19 @@ class K1Env:
         self.obs_buf = torch.cat(obs_parts, dim=-1)
         assert self.obs_buf.shape[-1] == self.obs_dim
 
-        # Onboard-only obs for the distillation student (see self._proprio_keys). Must stay in the
+        # Onboard-only frame for the distillation student (see self._proprio_keys). Must stay in the
         # same order as _proprio_keys so a deployed student sees identical layout.
-        self.proprio_buf = torch.cat([ang_vel, grav, cmd, dof_pos, dof_vel, self.actions, gait_clock], dim=-1)
+        frame = torch.cat([ang_vel, grav, cmd, dof_pos, dof_vel, self.actions, gait_clock], dim=-1)
+        assert frame.shape[-1] == self.proprio_frame_dim
+        # Roll the history (drop oldest, append newest at the end), then re-fill just-reset envs with
+        # the current frame so their history holds no frames from the previous episode.
+        self.proprio_hist = torch.roll(self.proprio_hist, shifts=-1, dims=1)
+        self.proprio_hist[:, -1] = frame
+        if self._proprio_reset_mask.any():
+            self.proprio_hist[self._proprio_reset_mask] = frame[self._proprio_reset_mask].unsqueeze(1)
+            self._proprio_reset_mask.zero_()
+        # Student obs = flattened stack, oldest→newest. Layout: [frame_{t-N+1} ... frame_t].
+        self.proprio_buf = self.proprio_hist.reshape(self.num_envs, self.proprio_dim)
         assert self.proprio_buf.shape[-1] == self.proprio_dim
 
     def get_observations(self):

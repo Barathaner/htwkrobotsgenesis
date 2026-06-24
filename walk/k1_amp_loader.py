@@ -37,6 +37,40 @@ def _heading_frame_vel_xy(quat_wxyz: np.ndarray, vel_world: np.ndarray) -> np.nd
     return np.stack([vx, vy], axis=-1).astype(np.float32)
 
 
+def _build_joint_mirror(joint_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """L<->R permutation + sign flip for a sagittal (left/right) mirror of the policy joints.
+
+    Partner = the joint name with Left<->Right swapped; sign = -1 for Roll/Yaw joints (lateral
+    DOFs flip across the sagittal plane), +1 for Pitch joints. Matches K1Env._symm_mirror."""
+    perm, sgn = [], []
+    for name in joint_names:
+        if "Left" in name:
+            partner = name.replace("Left", "Right")
+        elif "Right" in name:
+            partner = name.replace("Right", "Left")
+        else:
+            partner = name
+        perm.append(joint_names.index(partner))
+        sgn.append(-1.0 if ("Roll" in name or "Yaw" in name) else 1.0)
+    return np.asarray(perm, dtype=np.int64), np.asarray(sgn, dtype=np.float32)
+
+
+def _mirror_motion(ref: np.ndarray, n: int, perm: np.ndarray, sgn: np.ndarray) -> np.ndarray:
+    """Sagittal mirror of a motion-feature array. Layout (cols):
+       [root_height(1) | projected_gravity(3) | vel_heading(2) | yaw_rate(1) |
+        dof_pos(n) | dof_vel(n) | foot_clear(2)].
+    Negates the lateral/antisymmetric channels and swaps left/right legs+feet, so adding the
+    mirrored clip makes the expert set L/R-symmetric (zero net lateral velocity and yaw)."""
+    m = ref.copy()
+    m[:, 2] *= -1.0   # projected_gravity y (lateral lean)
+    m[:, 5] *= -1.0   # heading lateral velocity vy
+    m[:, 6] *= -1.0   # yaw rate
+    m[:, 7:7 + n]         = ref[:, 7:7 + n][:, perm] * sgn          # dof_pos: swap L/R + sign flip
+    m[:, 7 + n:7 + 2 * n] = ref[:, 7 + n:7 + 2 * n][:, perm] * sgn  # dof_vel: same map
+    m[:, 7 + 2 * n:7 + 2 * n + 2] = ref[:, 7 + 2 * n:7 + 2 * n + 2][:, [1, 0]]  # foot_clear L<->R
+    return m
+
+
 def _ema(x: np.ndarray, alpha: float) -> np.ndarray:
     """Causal EMA along axis 0: y[t] = alpha·y[t-1] + (1-alpha)·x[t], y[0] = x[0]."""
     y = np.empty_like(x)
@@ -114,6 +148,7 @@ class K1AMPLoader:
         cmd_ranges: list[tuple[np.ndarray, np.ndarray]] | None = None,
         ema_window_s: float = 0.5,
         warp_factors: list[list[float]] | None = None,
+        mirror_augment: bool = True,
     ) -> None:
         self.device = device
         n = len(joint_names)
@@ -171,23 +206,41 @@ class K1AMPLoader:
             file_dt.append(1.0 / fps)
             file_alpha.append(float(np.exp(-(1.0 / fps) / max(ema_window_s, 1e-6))))
 
-        # ── expansion: synthesize time-warped copies of each clip ──────────────
-        # Each (file, warp factor) produces one virtual clip with its own velocity band and a
+        # ── mirror augmentation: add a sagittally-mirrored copy of each clip ───
+        # A single mocap clip can carry a net lateral/yaw drift (e.g. slow.npz turns slightly);
+        # the discriminator then rewards that bias and the policy drifts. Adding the L/R-mirrored
+        # clip makes the expert distribution symmetric (zero mean lateral velocity / yaw), so no
+        # turn direction is preferred. Each base clip keeps its file index (src) for cmd_ranges +
+        # warp_factors. See K1Env._symm_mirror for the same joint mirror map.
+        perm, sgn = _build_joint_mirror(joint_names)
+        base_refs: list[np.ndarray] = []
+        base_src: list[int] = []
+        base_dt: list[float] = []
+        base_alpha: list[float] = []
+        for i, ref in enumerate(file_refs):
+            base_refs.append(ref); base_src.append(i)
+            base_dt.append(file_dt[i]); base_alpha.append(file_alpha[i])
+            if mirror_augment:
+                base_refs.append(_mirror_motion(ref, n, perm, sgn)); base_src.append(i)
+                base_dt.append(file_dt[i]); base_alpha.append(file_alpha[i])
+
+        # ── expansion: synthesize time-warped copies of each (base) clip ───────
+        # Each (clip, warp factor) produces one virtual clip with its own velocity band and a
         # matching EMA command label.  The command label is the conditioning signal the
         # discriminator binds the (warped) motion to; mean/std below cover the whole band.
         warped_refs: list[np.ndarray] = []
         warped_cmds: list[np.ndarray] = []
         warped_src: list[int] = []          # originating file index (for cmd_ranges clamp)
         warp_log: list[tuple[int, float, float]] = []  # (file_idx, k, mean |vx|) for logging
-        for i, ref in enumerate(file_refs):
-            wf = (warp_factors[i] if warp_factors is not None and i < len(warp_factors) and warp_factors[i]
-                  else [1.0])
+        for ref, src, dt_i, alpha_i in zip(base_refs, base_src, base_dt, base_alpha):
+            wf = (warp_factors[src] if warp_factors is not None and src < len(warp_factors)
+                  and warp_factors[src] else [1.0])
             for k in wf:
-                ref_w, cmd_w = _time_warp_ref(ref, vel_cols, file_dt[i], float(k), file_alpha[i])
+                ref_w, cmd_w = _time_warp_ref(ref, vel_cols, dt_i, float(k), alpha_i)
                 warped_refs.append(ref_w)
                 warped_cmds.append(cmd_w)
-                warped_src.append(i)
-                warp_log.append((i, float(k), float(np.abs(cmd_w[:, 0]).mean())))
+                warped_src.append(src)
+                warp_log.append((src, float(k), float(np.abs(cmd_w[:, 0]).mean())))
 
         # ── combined motion stats from ALL (warped) clips ──────────────────────
         combined = np.concatenate(warped_refs, axis=0)
