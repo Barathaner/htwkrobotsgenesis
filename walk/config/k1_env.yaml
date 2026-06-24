@@ -84,11 +84,23 @@ env_cfg:
 
   termination_if_roll_greater_than: 30
   termination_if_pitch_greater_than: 30
+  # Terminate if any policy joint reaches its URDF limit minus this safety offset, so the policy
+  # never learns to exploit / lean on a hard joint limit (keeps motions inside a safe envelope).
+  termination_if_joint_limit: true
+  joint_limit_safety_offset: 0.05   # [rad] margin kept away from each hard limit (joints with headroom)
+  joint_limit_ref_margin: 0.1       # [rad] never terminate inside the reference gait range + this margin
+                                    # (so joints that naturally reach their limit, e.g. knee, aren't cut off)
+  joint_limit_start_iter: 1000      # enable joint-limit termination only after this iter (warmup): a
+                                    # random policy hits the tight ankle limits in ~2 steps, so enabling
+                                    # it from iter 0 prevents walking from bootstrapping. 0 = immediate.
   base_init_pos: [0.0, 0.0, 0.56]
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
   episode_length_s: 20.0
   resampling_time_s: 4.0
   command_smooth_s: 1.5      # [s] time constant for smoothing command toward target (prevents OOD obs at speed transitions)
+  command_smooth_s_range: [0.3, 1.5]   # randomize the smoothing time per episode in [min,max] s →
+                                       # policy handles both sharp direction switches (0.3) and gentle
+                                       # ramps (1.5). Remove this line to use the fixed command_smooth_s.
   action_scale: 0.25
   simulate_action_latency: true
   clip_actions: 100.0
@@ -143,6 +155,23 @@ env_cfg:
 
     randomize_motor_strength: true
     motor_strength_range: [0.8, 1.2]  # multiplicative scale on kp & kd
+
+    # ── Sensor noise + IMU bias (ACTOR proprio obs only; privileged critic stays clean) ──────
+    # Per-step Gaussian noise = encoder/IMU noise (sim2real robustness). Per-episode constant IMU
+    # bias makes the policy robust to a steady gyro/gravity offset — the very thing an LSTM would
+    # otherwise integrate into a growing drift. All values in physical units (pre obs_scales).
+    obs_noise_enabled: true
+    noise_ang_vel: 0.2        # [rad/s] gyro per-step noise std
+    noise_gravity: 0.05       # projected-gravity per-step noise std
+    noise_dof_pos: 0.01       # [rad] joint-encoder position noise std
+    noise_dof_vel: 1.5        # [rad/s] joint-velocity noise std
+    imu_gyro_bias_max: 0.15   # [rad/s] per-episode uniform gyro bias, per axis
+    imu_grav_bias_max: 0.05   # per-episode uniform projected-gravity bias, per axis
+
+    # ── Randomized action latency (control steps; policy robust to a range of delays) ─────────
+    randomize_action_latency: true
+    action_latency_min: 0
+    action_latency_max: 2     # motor executes action delayed by d ∈ [min,max] steps (legacy = fixed 1)
 
   curriculum:
     enabled: false
@@ -228,8 +257,8 @@ reward_cfg:
     # ── Task ──────────────────────────────────────────────────────────────────────
     # All functions output [0,1] per step. rew_rate/NAME = fn_avg × scale (the /s metric).
     # With amp.reward_scale=0.1: AMP per step ≈ 0.026, task per step ≈ 0.04–0.08 → balanced.
-    tracking_lin_vel: 2.6
-    tracking_ang_vel: 1
+    tracking_lin_vel: 3
+    tracking_ang_vel: 2
     survival: 1.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
@@ -241,7 +270,7 @@ reward_cfg:
     pose_symmetry: -1.5
 
     # ── Regularizer ──────────────────────────────────────────────────────────────
-    action_rate: -0.5568653606502595
+    action_rate: -1.5
     #dof_vel: -0.05
     ang_vel_xy: -0.2503673498346508
     orientation: -1.5
@@ -309,7 +338,7 @@ train_cfg:
   # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
   # style_weight: fraction of the total reward that comes from the discriminator.
   # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
-  style_weight: 2.5              # target weight after warmup
+  style_weight: 2.0              # target weight after warmup
   style_warmup_start: 0        # iterations before style weight begins ramping
   style_warmup_duration: 300     # iterations to ramp from 0 → style_weight
 

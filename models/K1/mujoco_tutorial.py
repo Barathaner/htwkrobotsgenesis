@@ -26,10 +26,13 @@ import numpy as np
 # This file lives next to K1_22dof.xml, and the XML references meshes via meshdir="meshes/",
 # so loading by this path makes the mesh paths resolve correctly.
 import os
-XML_PATH = os.path.join(os.path.dirname(__file__), "K1_22dof.xml")
+HERE = os.path.dirname(__file__)
+ROBOT_PATH = os.path.join(HERE, "K1_22dof.xml")  # robot only
+SCENE_PATH = os.path.join(HERE, "scene.xml")     # robot + camera + visuals (includes the robot)
 
 
-def main(use_gravity: bool) -> None:
+def main(use_gravity: bool, use_scene: bool) -> None:
+    XML_PATH = SCENE_PATH if use_scene else ROBOT_PATH
     # ----------------------------------------------------------------------------------
     # 1. LOAD THE MODEL
     # ----------------------------------------------------------------------------------
@@ -128,5 +131,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--gravity", action="store_true",
                    help="enable gravity (robot will fall over without a balance controller)")
+    p.add_argument("--scene", action="store_true",
+                   help="load models/K1/scene.xml (adds tracking cameras + visuals)")
     args = p.parse_args()
-    main(use_gravity=args.gravity)
+    main(use_gravity=args.gravity, use_scene=args.scene)

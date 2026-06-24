@@ -101,9 +101,11 @@ def load_model(checkpoint_path: str) -> ActorLSTM:
 
 model = mj.MjModel.from_xml_path(config["policy"]["urdf_path"])
 data = mj.MjData(model)
-
+model.opt.gravity[:] = 0.0
 with mujoco.viewer.launch_passive(model, data) as viewer:
     viewer.opt.geomgroup[0] = 0  # hide collision geoms (group 0), show visual meshes (group 1)
     while viewer.is_running():
+        print(f"model: {model.njnt} joints, {model.nu} actuators, "
+        f"nq={model.nq} (qpos size), nv={model.nv} (qvel size)\n")
         mj.mj_step(model, data)
         viewer.sync()

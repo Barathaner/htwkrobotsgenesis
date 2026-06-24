@@ -194,6 +194,35 @@ class K1Env:
         self.nom_kp = torch.tensor(kp, dtype=gs.tc_float, device=gs.device)
         self.nom_kd = torch.tensor(kd, dtype=gs.tc_float, device=gs.device)
 
+        # Joint-limit termination bounds: terminate when any policy joint reaches its URDF limit
+        # minus a safety offset, so the policy never learns to lean on / exploit a hard limit.
+        # Limits returned in motors_dof_idx order → aligned with self.dof_pos.
+        # GOTCHA: some joints naturally reach their hard limit during normal gait (e.g. the knee
+        # fully extends to its 0-rad limit at stance). A uniform inward offset would terminate every
+        # stride. So we widen the soft bound to never cut inside the demonstrated reference-motion
+        # envelope (+ a margin), clamped to the hard limits — the offset only bites on joints with
+        # headroom, while natural full-range joints keep their range.
+        self._term_on_joint_limit = bool(env_cfg.get("termination_if_joint_limit", False))
+        # Warmup gate: a random untrained policy (init_std 1.0) blows past the tight ankle limits
+        # within ~2 steps, so terminating on joint limits from iter 0 makes walking impossible to
+        # bootstrap. Enable it only after joint_limit_start_iter (set 0 to enable immediately, e.g.
+        # when fine-tuning an existing walker). Driven by update_joint_limit_curriculum(it).
+        self._jl_term_start_iter = int(env_cfg.get("joint_limit_start_iter", 0))
+        self._jl_term_active = self._jl_term_start_iter <= 0
+        _jl_lo, _jl_hi = self.robot.get_dofs_limit(self.motors_dof_idx)
+        _jl_lo = _jl_lo.to(gs.tc_float); _jl_hi = _jl_hi.to(gs.tc_float)
+        _jl_off = float(env_cfg.get("joint_limit_safety_offset", 0.05))
+        soft_lo = _jl_lo + _jl_off
+        soft_hi = _jl_hi - _jl_off
+        ref_lo, ref_hi = self._reference_dof_range(env_cfg, reward_cfg)
+        if ref_lo is not None:
+            margin = float(env_cfg.get("joint_limit_ref_margin", 0.1))
+            soft_lo = torch.minimum(soft_lo, ref_lo - margin)
+            soft_hi = torch.maximum(soft_hi, ref_hi + margin)
+        # never exceed the physical hard limits
+        self._dof_pos_lower = torch.maximum(soft_lo, _jl_lo)
+        self._dof_pos_upper = torch.minimum(soft_hi, _jl_hi)
+
         # Fixierte Gelenke (Kopf + fürs Laufen unnötige Arm-/Bein-DOFs): nicht policy-gesteuert, aber
         # per PD auf fester Default-Pose gehalten (sonst schlackern sie lose). Eigene kp/kd setzen
         # (Default wäre 0 → kraftlos) und konstantes Ziel fixed_target jeden Step kommandieren.
@@ -253,8 +282,15 @@ class K1Env:
         # self.commands smooths toward this each step so velocity jumps don't produce
         # OOD observations that cause instant falls when the jog curriculum fires.
         self.command_target = torch.zeros((num_envs, self.num_commands), dtype=gs.tc_float, device=gs.device)
+        # Command smoothing time constant → EMA alpha. Per-env tensor so it can be randomized per
+        # episode (command_smooth_s_range): the policy then handles a range of command transition
+        # speeds, from sharp direction switches (small s) to gentle ramps (large s). Falls back to
+        # the fixed command_smooth_s when no range is given.
         _cmd_smooth_s = float(env_cfg.get("command_smooth_s", 1.5))
-        self._cmd_smooth_alpha = math.exp(-self.dt / _cmd_smooth_s)
+        self._cmd_smooth_s_range = env_cfg.get("command_smooth_s_range")  # [min, max] or None
+        self._cmd_smooth_alpha = torch.full(
+            (num_envs, 1), math.exp(-self.dt / _cmd_smooth_s), dtype=gs.tc_float, device=gs.device
+        )
         self.commands_scale = torch.tensor(
             [
                 obs_cfg["obs_scales"]["lin_vel"],
@@ -352,6 +388,35 @@ class K1Env:
             self.orig_link_masses = torch.tensor(
                 [link.inertial_mass for link in self.robot.links], dtype=gs.tc_float, device=gs.device
             )
+
+        # ── Sensor noise + IMU bias (applied to the ACTOR's onboard proprio obs only; the
+        # privileged critic obs stays clean). Per-step Gaussian noise models encoder/IMU noise;
+        # the per-episode constant IMU bias makes the policy robust to a steady gyro/gravity offset
+        # — the exact thing an LSTM would otherwise integrate into a growing drift. ──────────────
+        self._obs_noise_enabled = bool(self.rand_cfg.get("obs_noise_enabled", False))
+        self._noise_ang_vel = float(self.rand_cfg.get("noise_ang_vel", 0.0))
+        self._noise_grav    = float(self.rand_cfg.get("noise_gravity", 0.0))
+        self._noise_dof_pos = float(self.rand_cfg.get("noise_dof_pos", 0.0))
+        self._noise_dof_vel = float(self.rand_cfg.get("noise_dof_vel", 0.0))
+        self._imu_gyro_bias_max = float(self.rand_cfg.get("imu_gyro_bias_max", 0.0))
+        self._imu_grav_bias_max = float(self.rand_cfg.get("imu_grav_bias_max", 0.0))
+        # per-episode constant biases (sampled in _reset_idx); zero when disabled
+        self._gyro_bias = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
+        self._grav_bias = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
+
+        # ── Randomized action latency (per-episode delay d ∈ [min,max] control steps). The motor
+        # executes action_buf[t-d]; makes the policy robust to a range of control delays instead of
+        # a single fixed one. Falls back to the legacy fixed 1-step latency when disabled. ────────
+        self._rand_latency = bool(self.rand_cfg.get("randomize_action_latency", False))
+        self._latency_min = int(self.rand_cfg.get("action_latency_min", 0))
+        self._latency_max = int(self.rand_cfg.get("action_latency_max", 2))
+        # ring buffer of the last (_latency_max+1) actions, newest LAST
+        self.action_buf = torch.zeros(
+            (num_envs, self._latency_max + 1, self.num_actions), dtype=gs.tc_float, device=gs.device
+        )
+        # per-env delay (steps); default 1 = matches the legacy simulate_action_latency behaviour
+        self.action_latency = torch.ones((num_envs,), dtype=torch.long, device=gs.device)
+        self._env_arange = torch.arange(num_envs, device=gs.device)  # cached for per-env gather
 
         # style (feature-matching Style-Reward): belohnt Nähe der Live-Bewegung zur NPZ-Referenz im
         # Feature-Raum (nicht-adversariell, timing-/speed-agnostisch). Setup nur wenn aktiviert.
@@ -775,6 +840,13 @@ class K1Env:
                   f"{self._vc_frac * self._vc_track_max:.4f} → level={self._vc_level:.2f} "
                   f"x=[{self.commands_limits[0][0]:.2f}, {self.commands_limits[1][0]:.2f}]")
 
+    def update_joint_limit_curriculum(self, it: int) -> None:
+        """Enable joint-limit termination once past the warmup iteration (call once per iter)."""
+        if self._term_on_joint_limit and not self._jl_term_active and it >= self._jl_term_start_iter:
+            self._jl_term_active = True
+            print(f"[joint-limit] iter {it}: joint-limit termination ENABLED "
+                  f"(safety offset {self.env_cfg.get('joint_limit_safety_offset', 0.05)} rad)")
+
     def set_velocity_level(self, level: float) -> None:
         """Force the curriculum level (used to sync the video env and to restore on resume)."""
         if not getattr(self, "_vc_enabled", False):
@@ -784,7 +856,15 @@ class K1Env:
 
     def step(self, actions):
         self.actions.copy_(torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"]))
-        exec_actions = self.last_actions if self.simulate_action_latency else self.actions
+        if self._rand_latency:
+            # Push the freshly clipped action (newest at the end), then per-env execute the action
+            # delayed by action_latency steps: action_buf[:, _latency_max - latency].
+            self.action_buf = torch.roll(self.action_buf, shifts=-1, dims=1)
+            self.action_buf[:, -1] = self.actions
+            idx = self._latency_max - self.action_latency  # (num_envs,)
+            exec_actions = self.action_buf[self._env_arange, idx]
+        else:
+            exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
         self.robot.control_dofs_position(
             target_dof_pos[:, self.actions_dof_idx],
@@ -820,10 +900,10 @@ class K1Env:
         self._symm_buf_R[:, self._symm_ptr] = self.dof_pos[:, self._symm_right_idx]
         self._symm_ptr = (self._symm_ptr + 1) % self._symm_half
         self._update_foot_contact()
-        # Smooth commands toward target — prevents OOD obs spikes when jog commands fire.
-        self.commands.mul_(self._cmd_smooth_alpha).add_(
-            self.command_target, alpha=1.0 - self._cmd_smooth_alpha
-        )
+        # Smooth commands toward target — prevents OOD obs spikes when jog commands fire. Per-env
+        # alpha (possibly randomized) broadcasts over the command channels.
+        a = self._cmd_smooth_alpha  # (num_envs, 1)
+        self.commands.mul_(a).add_((1.0 - a) * self.command_target)
         self._update_command_tracking_ema()
 
         if self._amp_obs_curr is not None:
@@ -907,6 +987,41 @@ class K1Env:
             self._proprio_reset_mask.fill_(True)
         else:
             self._proprio_reset_mask[envs_idx] = True
+
+        # Re-sample per-episode IMU bias, action latency, and clear the action buffer for reset envs.
+        n_reset = self.num_envs if envs_idx is None else int(envs_idx.sum().item())
+        if n_reset > 0:
+            if self._obs_noise_enabled:
+                gyro_b = (torch.rand(n_reset, 3, device=gs.device) * 2 - 1) * self._imu_gyro_bias_max
+                grav_b = (torch.rand(n_reset, 3, device=gs.device) * 2 - 1) * self._imu_grav_bias_max
+                lat = torch.randint(self._latency_min, self._latency_max + 1, (n_reset,), device=gs.device)
+                if envs_idx is None:
+                    self._gyro_bias.copy_(gyro_b); self._grav_bias.copy_(grav_b)
+                    if self._rand_latency:
+                        self.action_latency.copy_(lat)
+                    self.action_buf.zero_()
+                else:
+                    self._gyro_bias[envs_idx] = gyro_b; self._grav_bias[envs_idx] = grav_b
+                    if self._rand_latency:
+                        self.action_latency[envs_idx] = lat
+                    self.action_buf[envs_idx] = 0.0
+            elif self._rand_latency:
+                lat = torch.randint(self._latency_min, self._latency_max + 1, (n_reset,), device=gs.device)
+                if envs_idx is None:
+                    self.action_latency.copy_(lat); self.action_buf.zero_()
+                else:
+                    self.action_latency[envs_idx] = lat; self.action_buf[envs_idx] = 0.0
+
+            # Randomize the command-smoothing time constant per episode → alpha = exp(-dt/s), so the
+            # policy learns to handle both sharp direction switches (small s) and gentle ramps.
+            if self._cmd_smooth_s_range is not None:
+                s_lo, s_hi = float(self._cmd_smooth_s_range[0]), float(self._cmd_smooth_s_range[1])
+                s = s_lo + (s_hi - s_lo) * torch.rand(n_reset, 1, device=gs.device)
+                alpha = torch.exp(-self.dt / s)
+                if envs_idx is None:
+                    self._cmd_smooth_alpha.copy_(alpha)
+                else:
+                    self._cmd_smooth_alpha[envs_idx] = alpha
 
         # reset state with init-state noise + random yaw
         noisy_qpos, init_quats_batch = self._build_noisy_init_qpos(envs_idx)
@@ -1177,9 +1292,23 @@ class K1Env:
         self.obs_buf = torch.cat(obs_parts, dim=-1)
         assert self.obs_buf.shape[-1] == self.obs_dim
 
-        # Onboard-only frame for the distillation student (see self._proprio_keys). Must stay in the
-        # same order as _proprio_keys so a deployed student sees identical layout.
-        frame = torch.cat([ang_vel, grav, cmd, dof_pos, dof_vel, self.actions, gait_clock], dim=-1)
+        # Onboard-only frame for the actor (and distillation student). Must stay in the same order as
+        # _proprio_keys so a deployed policy sees identical layout. The onboard sensors get a
+        # per-episode IMU bias + per-step Gaussian noise here (actor only; the privileged critic obs
+        # built above stays clean). Bias/noise are in physical units, applied before obs_scales.
+        if self._obs_noise_enabled:
+            ang_vel_o = (self.base_ang_vel + self._gyro_bias
+                         + torch.randn_like(self.base_ang_vel) * self._noise_ang_vel
+                         ) * self.obs_scales["ang_vel"]
+            grav_o = (self.projected_gravity + self._grav_bias
+                      + torch.randn_like(self.projected_gravity) * self._noise_grav)
+            dof_pos_o = ((self.dof_pos - self.default_dof_pos)
+                         + torch.randn_like(self.dof_pos) * self._noise_dof_pos) * self.obs_scales["dof_pos"]
+            dof_vel_o = (self.dof_vel
+                         + torch.randn_like(self.dof_vel) * self._noise_dof_vel) * self.obs_scales["dof_vel"]
+        else:
+            ang_vel_o, grav_o, dof_pos_o, dof_vel_o = ang_vel, grav, dof_pos, dof_vel
+        frame = torch.cat([ang_vel_o, grav_o, cmd, dof_pos_o, dof_vel_o, self.actions, gait_clock], dim=-1)
         assert frame.shape[-1] == self.proprio_frame_dim
         # Roll the history (drop oldest, append newest at the end), then re-fill just-reset envs with
         # the current frame so their history holds no frames from the previous episode.
@@ -1200,6 +1329,36 @@ class K1Env:
             td["amp"] = self._amp_obs_curr
         return TensorDict(td, batch_size=[self.num_envs])
 
+    def _reference_dof_range(self, env_cfg, reward_cfg):
+        """Per-policy-joint (min, max) over the reference motion clips (slow + jog), in joint_names
+        order. Used to widen joint-limit termination bounds so normal gait (e.g. full knee
+        extension to the hard limit) is never terminated. Returns (None, None) if no clips found."""
+        paths = []
+        if reward_cfg.get("style_motion_file"):
+            paths.append(reward_cfg["style_motion_file"])
+        jp = env_cfg.get("velocity_curriculum", {}).get("jog_style_motion_file")
+        if jp:
+            paths.append(jp)
+        if not paths:
+            return None, None
+        jn = env_cfg["joint_names"]
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        lo = hi = None
+        for p in paths:
+            if not os.path.isabs(p):
+                p = os.path.join(repo_root, p)
+            if not os.path.exists(p):
+                continue
+            d = np.load(p, allow_pickle=True)
+            ref_jn = [str(x) for x in d["joint_names"]]
+            col = [ref_jn.index(n) for n in jn]
+            dp = d["dof_pos"][:, col]
+            cmn = torch.tensor(dp.min(0), dtype=gs.tc_float, device=gs.device)
+            cmx = torch.tensor(dp.max(0), dtype=gs.tc_float, device=gs.device)
+            lo = cmn if lo is None else torch.minimum(lo, cmn)
+            hi = cmx if hi is None else torch.maximum(hi, cmx)
+        return lo, hi
+
     def _termination_mask(self):
         """True je Env, wenn Episode endet (Fall, zu tief, Timeout, Sim-Fehler).
 
@@ -1211,7 +1370,16 @@ class K1Env:
         self._term_roll      = torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
         self._term_height    = self.base_pos[:, 2] < 0.42
         self._term_sim_error = self.scene.rigid_solver.get_error_envs_mask()
-        return self._term_timeout | self._term_pitch | self._term_roll | self._term_height | self._term_sim_error
+        # Joint-limit termination: any policy joint at/beyond (limit ∓ safety offset).
+        # Gated by the warmup (self._jl_term_active) so early random exploration can bootstrap.
+        if self._term_on_joint_limit and self._jl_term_active:
+            self._term_joint_limit = (
+                (self.dof_pos < self._dof_pos_lower) | (self.dof_pos > self._dof_pos_upper)
+            ).any(dim=1)
+        else:
+            self._term_joint_limit = torch.zeros_like(self._term_height)
+        return (self._term_timeout | self._term_pitch | self._term_roll | self._term_height
+                | self._term_sim_error | self._term_joint_limit)
 
     # ------------ reward functions ----------------
     # Jede Funktion gibt einen Wert pro Env zurück (0..N).
