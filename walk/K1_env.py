@@ -194,35 +194,6 @@ class K1Env:
         self.nom_kp = torch.tensor(kp, dtype=gs.tc_float, device=gs.device)
         self.nom_kd = torch.tensor(kd, dtype=gs.tc_float, device=gs.device)
 
-        # Joint-limit termination bounds: terminate when any policy joint reaches its URDF limit
-        # minus a safety offset, so the policy never learns to lean on / exploit a hard limit.
-        # Limits returned in motors_dof_idx order → aligned with self.dof_pos.
-        # GOTCHA: some joints naturally reach their hard limit during normal gait (e.g. the knee
-        # fully extends to its 0-rad limit at stance). A uniform inward offset would terminate every
-        # stride. So we widen the soft bound to never cut inside the demonstrated reference-motion
-        # envelope (+ a margin), clamped to the hard limits — the offset only bites on joints with
-        # headroom, while natural full-range joints keep their range.
-        self._term_on_joint_limit = bool(env_cfg.get("termination_if_joint_limit", False))
-        # Warmup gate: a random untrained policy (init_std 1.0) blows past the tight ankle limits
-        # within ~2 steps, so terminating on joint limits from iter 0 makes walking impossible to
-        # bootstrap. Enable it only after joint_limit_start_iter (set 0 to enable immediately, e.g.
-        # when fine-tuning an existing walker). Driven by update_joint_limit_curriculum(it).
-        self._jl_term_start_iter = int(env_cfg.get("joint_limit_start_iter", 0))
-        self._jl_term_active = self._jl_term_start_iter <= 0
-        _jl_lo, _jl_hi = self.robot.get_dofs_limit(self.motors_dof_idx)
-        _jl_lo = _jl_lo.to(gs.tc_float); _jl_hi = _jl_hi.to(gs.tc_float)
-        _jl_off = float(env_cfg.get("joint_limit_safety_offset", 0.05))
-        soft_lo = _jl_lo + _jl_off
-        soft_hi = _jl_hi - _jl_off
-        ref_lo, ref_hi = self._reference_dof_range(env_cfg, reward_cfg)
-        if ref_lo is not None:
-            margin = float(env_cfg.get("joint_limit_ref_margin", 0.1))
-            soft_lo = torch.minimum(soft_lo, ref_lo - margin)
-            soft_hi = torch.maximum(soft_hi, ref_hi + margin)
-        # never exceed the physical hard limits
-        self._dof_pos_lower = torch.maximum(soft_lo, _jl_lo)
-        self._dof_pos_upper = torch.minimum(soft_hi, _jl_hi)
-
         # Fixierte Gelenke (Kopf + fürs Laufen unnötige Arm-/Bein-DOFs): nicht policy-gesteuert, aber
         # per PD auf fester Default-Pose gehalten (sonst schlackern sie lose). Eigene kp/kd setzen
         # (Default wäre 0 → kraftlos) und konstantes Ziel fixed_target jeden Step kommandieren.
@@ -375,6 +346,8 @@ class K1Env:
 
         # Random push state (always allocated; only used when push_enabled=True)
         self.push_force_buf = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
+        # Held external torque per push: tipping (x,y) from height-varied impact + yaw (z) "spin".
+        self.push_torque_buf = torch.zeros((num_envs, 3), dtype=gs.tc_float, device=gs.device)
         self.push_steps_remaining = torch.zeros((num_envs,), dtype=gs.tc_int, device=gs.device)
 
         # Domain randomization state buffers (per-env; updated each episode reset)
@@ -840,13 +813,6 @@ class K1Env:
                   f"{self._vc_frac * self._vc_track_max:.4f} → level={self._vc_level:.2f} "
                   f"x=[{self.commands_limits[0][0]:.2f}, {self.commands_limits[1][0]:.2f}]")
 
-    def update_joint_limit_curriculum(self, it: int) -> None:
-        """Enable joint-limit termination once past the warmup iteration (call once per iter)."""
-        if self._term_on_joint_limit and not self._jl_term_active and it >= self._jl_term_start_iter:
-            self._jl_term_active = True
-            print(f"[joint-limit] iter {it}: joint-limit termination ENABLED "
-                  f"(safety offset {self.env_cfg.get('joint_limit_safety_offset', 0.05)} rad)")
-
     def set_velocity_level(self, level: float) -> None:
         """Force the curriculum level (used to sync the video env and to restore on resume)."""
         if not getattr(self, "_vc_enabled", False):
@@ -1095,6 +1061,7 @@ class K1Env:
             self.leg_symmetry_penalty.zero_()
             self.gait_phase.uniform_(0.0, 1.0)
             self.push_force_buf.zero_()
+            self.push_torque_buf.zero_()
             self.push_steps_remaining.zero_()
             self._symm_buf_L.zero_()
             self._symm_buf_R.zero_()
@@ -1129,6 +1096,7 @@ class K1Env:
             self.leg_symmetry_penalty.masked_fill_(envs_idx, 0.0)
             torch.where(envs_idx, torch.rand_like(self.gait_phase), self.gait_phase, out=self.gait_phase)
             self.push_force_buf.masked_fill_(envs_idx[:, None], 0.0)
+            self.push_torque_buf.masked_fill_(envs_idx[:, None], 0.0)
             self.push_steps_remaining.masked_fill_(envs_idx, 0)
             self._symm_buf_L.masked_fill_(envs_idx[:, None, None], 0.0)
             self._symm_buf_R.masked_fill_(envs_idx[:, None, None], 0.0)
@@ -1329,36 +1297,6 @@ class K1Env:
             td["amp"] = self._amp_obs_curr
         return TensorDict(td, batch_size=[self.num_envs])
 
-    def _reference_dof_range(self, env_cfg, reward_cfg):
-        """Per-policy-joint (min, max) over the reference motion clips (slow + jog), in joint_names
-        order. Used to widen joint-limit termination bounds so normal gait (e.g. full knee
-        extension to the hard limit) is never terminated. Returns (None, None) if no clips found."""
-        paths = []
-        if reward_cfg.get("style_motion_file"):
-            paths.append(reward_cfg["style_motion_file"])
-        jp = env_cfg.get("velocity_curriculum", {}).get("jog_style_motion_file")
-        if jp:
-            paths.append(jp)
-        if not paths:
-            return None, None
-        jn = env_cfg["joint_names"]
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        lo = hi = None
-        for p in paths:
-            if not os.path.isabs(p):
-                p = os.path.join(repo_root, p)
-            if not os.path.exists(p):
-                continue
-            d = np.load(p, allow_pickle=True)
-            ref_jn = [str(x) for x in d["joint_names"]]
-            col = [ref_jn.index(n) for n in jn]
-            dp = d["dof_pos"][:, col]
-            cmn = torch.tensor(dp.min(0), dtype=gs.tc_float, device=gs.device)
-            cmx = torch.tensor(dp.max(0), dtype=gs.tc_float, device=gs.device)
-            lo = cmn if lo is None else torch.minimum(lo, cmn)
-            hi = cmx if hi is None else torch.maximum(hi, cmx)
-        return lo, hi
-
     def _termination_mask(self):
         """True je Env, wenn Episode endet (Fall, zu tief, Timeout, Sim-Fehler).
 
@@ -1370,16 +1308,8 @@ class K1Env:
         self._term_roll      = torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
         self._term_height    = self.base_pos[:, 2] < 0.42
         self._term_sim_error = self.scene.rigid_solver.get_error_envs_mask()
-        # Joint-limit termination: any policy joint at/beyond (limit ∓ safety offset).
-        # Gated by the warmup (self._jl_term_active) so early random exploration can bootstrap.
-        if self._term_on_joint_limit and self._jl_term_active:
-            self._term_joint_limit = (
-                (self.dof_pos < self._dof_pos_lower) | (self.dof_pos > self._dof_pos_upper)
-            ).any(dim=1)
-        else:
-            self._term_joint_limit = torch.zeros_like(self._term_height)
         return (self._term_timeout | self._term_pitch | self._term_roll | self._term_height
-                | self._term_sim_error | self._term_joint_limit)
+                | self._term_sim_error)
 
     # ------------ reward functions ----------------
     # Jede Funktion gibt einen Wert pro Env zurück (0..N).
@@ -1683,11 +1613,30 @@ class K1Env:
             self.robot.set_dofs_kv(kd, self.motors_dof_idx)
 
     def _maybe_apply_push(self):
-        """Stochastically apply random horizontal impulse forces to the robot base link."""
+        """Stochastically apply collision-like disturbances to the robot base link.
+
+        Models another robot bumping into it. Each push event (Poisson-triggered) samples and then
+        HOLDS for a random duration:
+          • a horizontal force (random direction/magnitude) — the shove itself;
+          • a height-varied impact: the force "lands" at a random height h above/below the base COM,
+            which is equivalent to the same force at the COM plus a tipping torque τ = h × F (a high
+            chest/head hit tips a lot, a low shin hit tips little or the other way). Genesis has no
+            force-application-point arg, so we add the equivalent torque instead;
+          • a yaw "spin" torque — the collision sometimes turns the robot around.
+        Holding force+torque coherently over the duration (instead of re-rolling per step) makes the
+        disturbance read as one sustained contact rather than noise, and the random duration spans
+        brief taps → sustained shoves.
+        """
         interval_s = float(self.rand_cfg.get("push_interval_s", 5.0))
         fmax = float(self.rand_cfg.get("push_force_xy_max", 150.0))
         tmax = float(self.rand_cfg.get("push_torque_z_max", 30.0))
-        dur = int(self.rand_cfg.get("push_duration_steps", 5))
+        # Duration sampled per push in [min, max] (brief → sustained). Falls back to the legacy
+        # fixed push_duration_steps when the min/max keys aren't set.
+        dur_default = int(self.rand_cfg.get("push_duration_steps", 5))
+        dur_min = int(self.rand_cfg.get("push_duration_min_steps", dur_default))
+        dur_max = int(self.rand_cfg.get("push_duration_max_steps", dur_default))
+        # Vertical lever arm [m] of the impact relative to the base COM (height-varied impact).
+        h_lo, h_hi = self.rand_cfg.get("push_height_range", [0.0, 0.0])
 
         # Poisson trigger: probability p = dt / interval per step
         trigger = torch.rand(self.num_envs, device=gs.device) < (self.dt / interval_s)
@@ -1696,20 +1645,30 @@ class K1Env:
         new_force = torch.zeros(self.num_envs, 3, dtype=gs.tc_float, device=gs.device)
         new_force[:, :2] = (2 * torch.rand(self.num_envs, 2, device=gs.device) - 1) * fmax
 
+        # New external torque held for this push: tipping from the height-varied impact +
+        # yaw spin. Tipping torque = h × F = [-h*Fy, h*Fx, 0] (world frame; robot ~upright).
+        h = (h_lo + (h_hi - h_lo) * torch.rand(self.num_envs, device=gs.device))  # (n,)
+        new_torque = torch.zeros(self.num_envs, 3, dtype=gs.tc_float, device=gs.device)
+        new_torque[:, 0] = -h * new_force[:, 1]
+        new_torque[:, 1] = h * new_force[:, 0]
+        new_torque[:, 2] = (2 * torch.rand(self.num_envs, device=gs.device) - 1) * tmax
+
         # Start new push (overwrite) on triggered envs; decrement counter on ongoing ones
         self.push_force_buf = torch.where(trigger[:, None], new_force, self.push_force_buf)
-        new_remaining = torch.full((self.num_envs,), dur, dtype=gs.tc_int, device=gs.device)
+        self.push_torque_buf = torch.where(trigger[:, None], new_torque, self.push_torque_buf)
+        new_remaining = torch.randint(
+            dur_min, dur_max + 1, (self.num_envs,), dtype=gs.tc_int, device=gs.device
+        )
         decremented = torch.clamp(self.push_steps_remaining - 1, min=0)
         self.push_steps_remaining = torch.where(trigger, new_remaining, decremented)
 
-        # Apply force and torque to base link only where steps_remaining > 0
+        # Apply held force and torque to base link only where steps_remaining > 0
         active = (self.push_steps_remaining > 0).to(gs.tc_float)
         force_3d = (self.push_force_buf * active[:, None]).unsqueeze(1)  # (n_envs, 1, 3)
         self.scene.sim.rigid_solver.apply_links_external_force(
             force=force_3d, links_idx=[self.base_link_idx_local]
         )
-        torque_3d = torch.zeros_like(force_3d)
-        torque_3d[:, 0, 2] = (2 * torch.rand(self.num_envs, device=gs.device) - 1) * tmax * active
+        torque_3d = (self.push_torque_buf * active[:, None]).unsqueeze(1)  # (n_envs, 1, 3)
         self.scene.sim.rigid_solver.apply_links_external_torque(
             torque=torque_3d, links_idx=[self.base_link_idx_local]
         )

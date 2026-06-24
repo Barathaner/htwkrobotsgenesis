@@ -18,7 +18,7 @@ import torch.nn as nn
 import os
 import yaml
 
-with open("deploy.yaml", "r") as f:
+with open("/home/luna/Dokumente/git/htwkrobotsgenesis-1/sim2real/deploy.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 class _RNN(nn.Module):
@@ -98,14 +98,21 @@ def load_model(checkpoint_path: str) -> ActorLSTM:
     return actor
 
 
+policy = load_model(config["policy"]["checkpoint_path"])
+policy.reset()
 
-model = mj.MjModel.from_xml_path(config["policy"]["urdf_path"])
+model = mj.MjModel.from_xml_path(config["policy"]["mujoco_path"])
 data = mj.MjData(model)
 model.opt.gravity[:] = 0.0
+print(f"model: {model.njnt} joints, {model.nu} actuators, "
+f"nq={model.nq} (qpos size), nv={model.nv} (qvel size)\n")
 with mujoco.viewer.launch_passive(model, data) as viewer:
     viewer.opt.geomgroup[0] = 0  # hide collision geoms (group 0), show visual meshes (group 1)
     while viewer.is_running():
-        print(f"model: {model.njnt} joints, {model.nu} actuators, "
-        f"nq={model.nq} (qpos size), nv={model.nv} (qvel size)\n")
+        act_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_ACTUATOR, "Left_Knee_Pitch")
+        jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, "Left_Knee_Pitch")
+        qpos_adr = model.jnt_qposadr[jnt_id]
+        data.qpos[qpos_adr] = 1.0
+        mj.mj_forward(model, data)
         mj.mj_step(model, data)
         viewer.sync()

@@ -1,6 +1,7 @@
 policy:
-  model: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/logs/lstm/model_3000.pt"
+  checkpoint_path: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/logs/randomsensor/model_750.pt"
   urdf_path: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/models/K1/K1_22dof.urdf"
+  mujoco_path: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/models/K1/scene.xml"
   obs_dim: 59
   action_dim: 16
   action_scale: 0.25

@@ -84,15 +84,6 @@ env_cfg:
 
   termination_if_roll_greater_than: 30
   termination_if_pitch_greater_than: 30
-  # Terminate if any policy joint reaches its URDF limit minus this safety offset, so the policy
-  # never learns to exploit / lean on a hard joint limit (keeps motions inside a safe envelope).
-  termination_if_joint_limit: true
-  joint_limit_safety_offset: 0.05   # [rad] margin kept away from each hard limit (joints with headroom)
-  joint_limit_ref_margin: 0.1       # [rad] never terminate inside the reference gait range + this margin
-                                    # (so joints that naturally reach their limit, e.g. knee, aren't cut off)
-  joint_limit_start_iter: 1000      # enable joint-limit termination only after this iter (warmup): a
-                                    # random policy hits the tight ankle limits in ~2 steps, so enabling
-                                    # it from iter 0 prevents walking from bootstrapping. 0 = immediate.
   base_init_pos: [0.0, 0.0, 0.56]
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
   episode_length_s: 20.0
@@ -136,12 +127,19 @@ env_cfg:
     init_base_height_noise: 0.02    # [m]   uniform noise on base z at spawn
     init_yaw_range: [-3.14159, 3.14159]  # [rad] random heading; set [0,0] to disable
 
-    # ── Random pushes ────────────────────────────────────────────────────────
+    # ── Random pushes (collision-like disturbances; another robot bumping in) ──
     push_enabled: true
     push_interval_s: 5.0            # [s] avg interval (Poisson: p = dt/interval per step)
-    push_duration_steps: 5          # consecutive steps to sustain the push force
     push_force_xy_max: 100.0        # [N] max horizontal force magnitude (per axis)
-    push_torque_z_max: 30.0         # [N·m] max yaw torque
+    push_torque_z_max: 30.0         # [N·m] max yaw "spin" torque (turning the robot around)
+    # Duration sampled per push in [min, max] steps: brief taps → sustained shoves (a robot that
+    # keeps walking into you). Legacy push_duration_steps still works as a fallback if set instead.
+    push_duration_min_steps: 3
+    push_duration_max_steps: 25
+    # Height-varied impact: the horizontal force "lands" at a random height [m] above/below the base
+    # COM, adding a tipping torque h × F. Positive ≈ chest/head hit (big tip), ~0 ≈ COM, negative ≈
+    # shin/leg hit. Trunk top is ~+0.4 m above the base, feet ~−0.8 m.
+    push_height_range: [-0.25, 0.45]
 
     # ── Domain randomization (re-sampled every episode reset) ────────────────
     randomize_friction: true

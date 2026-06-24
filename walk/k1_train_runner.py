@@ -272,7 +272,7 @@ class K1TrainRunner(OnPolicyRunner):
         if actor_recurrent:
             self.alg.actor.reset()  # -> None; recreated at the video batch on the first forward
 
-        _TERM_REASONS = ("timeout", "pitch", "roll", "height", "sim_error", "joint_limit")
+        _TERM_REASONS = ("timeout", "pitch", "roll", "height", "sim_error")
         video_term: dict[str, int] = {r: 0 for r in _TERM_REASONS}
         video_term_total = 0
 
@@ -362,7 +362,7 @@ class K1TrainRunner(OnPolicyRunner):
         _style_ep_deque: collections.deque[float] = collections.deque(maxlen=200)
 
         # Per-reason termination counters (reset each iteration)
-        _TERM_REASONS = ("timeout", "pitch", "roll", "height", "sim_error", "joint_limit")
+        _TERM_REASONS = ("timeout", "pitch", "roll", "height", "sim_error")
         _term_counts: dict[str, int] = {r: 0 for r in _TERM_REASONS}
         _term_total = 0
 
@@ -393,8 +393,6 @@ class K1TrainRunner(OnPolicyRunner):
             # Widen the commanded velocity range when recent episodes track well (performance-gated,
             # Rudin-style). The discriminator already covers all speeds, so no style curriculum.
             self.env.update_velocity_curriculum(it)
-            # Enable joint-limit termination after its warmup (lets walking bootstrap first).
-            self.env.update_joint_limit_curriculum(it)
             if self._video_env is not None:
                 self._video_env.set_velocity_level(getattr(self.env, "_vc_level", 1.0))
 
