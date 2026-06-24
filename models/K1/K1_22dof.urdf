@@ -5,16 +5,16 @@
 <robot
   name="K1">
 
-  <!-- <mujoco>
-    <compiler meshdir="meshes/" balanceinertia="true" discardvisual="false"/>
-  </mujoco> -->
+  <mujoco>
+    <compiler balanceinertia="true" discardvisual="false"/>
+  </mujoco>
   <!-- for convert to mujoco -->
-  <!-- <link name="world"/>
+  <link name="world"/>
   <joint name="world_joint" type="floating">
     <origin xyz="0 0 0"/>
     <parent link="world"/>
     <child link="Trunk"/>
-  </joint> -->
+  </joint>
 
   <link
     name="Trunk">

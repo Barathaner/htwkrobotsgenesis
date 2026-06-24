@@ -225,7 +225,7 @@ reward_cfg:
     # All functions output [0,1] per step. rew_rate/NAME = fn_avg × scale (the /s metric).
     # With amp.reward_scale=0.1: AMP per step ≈ 0.026, task per step ≈ 0.04–0.08 → balanced.
     tracking_lin_vel: 2.6
-    tracking_ang_vel: 0.4
+    tracking_ang_vel: 1
     survival: 1.0           # alive anchor: +2.0/s while upright; competing with AMP magnitude
 
     # ── Kontakt / Schritt ────────────────────────────────────────────────────────
@@ -233,8 +233,8 @@ reward_cfg:
     feet_air_time: 30.848510755474946
     feet_slip: -3.8641653415948873
     leg_symmetry: -10.0
-    gait_phase: -2.249538053359951
-    pose_symmetry: -1.0
+    gait_phase: -2.549538053359951
+    pose_symmetry: -1.5
 
     # ── Regularizer ──────────────────────────────────────────────────────────────
     action_rate: -0.5568653606502595
