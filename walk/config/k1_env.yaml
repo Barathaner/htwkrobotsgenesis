@@ -94,7 +94,12 @@ env_cfg:
                                        # ramps (1.5). Remove this line to use the fixed command_smooth_s.
   action_scale: 0.25
   simulate_action_latency: true
-  clip_actions: 100.0
+  # Diagnostic cap: dropped 100 → 30 (still ±7.5 rad of target authority, plenty for walking).
+  # Kept loose enough that you can SEE whether the new action/torque penalties actually pull |a|
+  # down — if they work, mean |a| should settle well under 30; if it pins at 30 they aren't biting.
+  # Lower toward ~2–3 once the penalties are confirmed working. NOTE: deploy.yaml clip_actions must
+  # match the value the deployed policy was trained with.
+  clip_actions: 30.0
   # Onboard proprio obs = stack of the last N frames. With the recurrent (LSTM) actor the hidden
   # state provides the memory, so a single frame per step is enough → keep this at 1. (Set >1 only
   # if you switch the actor back to a feedforward MLPModel that needs an explicit history stack.)
@@ -128,7 +133,7 @@ env_cfg:
     init_yaw_range: [-3.14159, 3.14159]  # [rad] random heading; set [0,0] to disable
 
     # ── Random pushes (collision-like disturbances; another robot bumping in) ──
-    push_enabled: true
+    push_enabled: false
     push_interval_s: 5.0            # [s] avg interval (Poisson: p = dt/interval per step)
     push_force_xy_max: 100.0        # [N] max horizontal force magnitude (per axis)
     push_torque_z_max: 30.0         # [N·m] max yaw "spin" torque (turning the robot around)
@@ -186,7 +191,7 @@ env_cfg:
     start_lin_vel_x_range: [-0.1, 0.5]
     start_lin_vel_y_range: [-0.2, 0.25]
     start_ang_vel_range: [-0.25, 0.25]
-    advance_tracking_frac: 0.8   # advance a level when mean episodic tracking_lin_vel ≥ frac × its max
+    advance_tracking_frac: 0.6   # advance a level when mean episodic tracking_lin_vel ≥ frac × its max
     level_step: 0.05             # command-range level increment per passing check
     check_interval: 25           # iters between advance checks
     min_episodes: 20             # min terminated episodes in the window before a check can pass
@@ -250,6 +255,7 @@ reward_cfg:
   base_height_target: 0.56   # [m] Ziel-Rumpfhöhe = Spawn-Höhe; hält den Roboter aufrecht
   base_height_sigma: 0.06    # tanh(Δz²/σ): bei 10cm Abweichung → ~0.17; bei 5cm → ~0.04 (mild)
   lin_vel_z_sigma: 0.5       # tanh(vz²/σ): bei 0.5 m/s → ~0.46; bei 1.0 m/s → ~0.96
+  soft_dof_pos_limit: 0.9    # dof_pos_limits penalty kicks in past this fraction of each joint's full URDF range
 
   reward_scales:
     # ── Task ──────────────────────────────────────────────────────────────────────
@@ -268,7 +274,15 @@ reward_cfg:
     pose_symmetry: -1.5
 
     # ── Regularizer ──────────────────────────────────────────────────────────────
-    action_rate: -1.5
+    # action_rate / action_magnitude / torques are now UNBOUNDED quadratics (no tanh): their
+    # gradient keeps growing with the violation, so they can actually pull a runaway action back
+    # — a tanh-saturated penalty gives ~0 gradient once |a| is large and never reins it in.
+    # Starting scales below are rough; tune on wandb. Watch rew_rate/action_magnitude & /torques.
+    action_rate: -0.1        # -Σ(Δaction)²  (was -1.5 on a tanh; -0.1 matches it at the jog ref ΣΔa²≈1.4)
+    action_magnitude: -0.02  # -Σaction²     penalizes the absolute target offset (the term that was missing)
+    torques: -1.0e-5         # -Στ²          penalizes PD torque, discourages bang-bang saturation
+    dof_acc: -2.5e-7         # -Σ(Δq̇/dt)²   joint-acceleration penalty (legged-gym value) → smoother motion
+    dof_pos_limits: -10.0    # Σ out-of-soft-limit overshoot [rad] → keeps joints off the hard URDF stops
     #dof_vel: -0.05
     ang_vel_xy: -0.2503673498346508
     orientation: -1.5
@@ -336,7 +350,7 @@ train_cfg:
   # ── AMP (amp-rsl-rl) ─────────────────────────────────────────────────────
   # style_weight: fraction of the total reward that comes from the discriminator.
   # The env task reward is scaled by (1 - style_weight); discriminator reward by style_weight.
-  style_weight: 2.0              # target weight after warmup
+  style_weight: 1.7             # target weight after warmup
   style_warmup_start: 0        # iterations before style weight begins ramping
   style_warmup_duration: 300     # iterations to ramp from 0 → style_weight
 

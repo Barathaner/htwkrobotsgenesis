@@ -98,21 +98,251 @@ def load_model(checkpoint_path: str) -> ActorLSTM:
     return actor
 
 
-policy = load_model(config["policy"]["checkpoint_path"])
-policy.reset()
+# --- quaternion helpers (wxyz convention, identical math to genesis.utils.geom) --------------------
+# MuJoCo and Genesis both store quaternions as [w, x, y, z], so the obs transforms match exactly.
+def inv_quat(q: torch.Tensor) -> torch.Tensor:
+    """Inverse (conjugate, for a unit quat) of a wxyz quaternion."""
+    w, x, y, z = q
+    return torch.tensor([w, -x, -y, -z], dtype=q.dtype)
+
+
+def transform_by_quat(v: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Rotate vector v by wxyz quaternion q: v' = q * (0,v) * q^-1."""
+    w, x, y, z = q
+    vx, vy, vz = v
+    # t = 2 * cross(q_xyz, v)
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    # v' = v + w*t + cross(q_xyz, t)
+    rx = vx + w * tx + (y * tz - z * ty)
+    ry = vy + w * ty + (z * tx - x * tz)
+    rz = vz + w * tz + (x * ty - y * tx)
+    return torch.tensor([rx, ry, rz], dtype=v.dtype)
+
+
+policy = load_model(config["policy"]["model"])
+print(policy)
 
 model = mj.MjModel.from_xml_path(config["policy"]["mujoco_path"])
 data = mj.MjData(model)
-model.opt.gravity[:] = 0.0
 print(f"model: {model.njnt} joints, {model.nu} actuators, "
-f"nq={model.nq} (qpos size), nv={model.nv} (qvel size)\n")
-with mujoco.viewer.launch_passive(model, data) as viewer:
-    viewer.opt.geomgroup[0] = 0  # hide collision geoms (group 0), show visual meshes (group 1)
-    while viewer.is_running():
-        act_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_ACTUATOR, "Left_Knee_Pitch")
-        jnt_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, "Left_Knee_Pitch")
-        qpos_adr = model.jnt_qposadr[jnt_id]
-        data.qpos[qpos_adr] = 1.0
-        mj.mj_forward(model, data)
+      f"nq={model.nq} (qpos size), nv={model.nv} (qvel size)\n")
+
+p = config["policy"]
+joint_names = p["joint_names"]          # 16 policy joints, action order
+fixed_names = p["fixed_joint_names"]    # PD-held joints (head, shoulders, elbows)
+all_names = joint_names + fixed_names
+
+# Per-joint MuJoCo addressing. Unlike Genesis (where control_dofs_position re-sorts the targets), in
+# MuJoCo every joint is addressed by its own qpos/dof/actuator id, so no argsort reorder is needed —
+# we read and write each joint directly by name.
+def joint_info(name):
+    jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, name)
+    aid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_ACTUATOR, name)
+    return {
+        "qadr": int(model.jnt_qposadr[jid]),   # index into data.qpos
+        "vadr": int(model.jnt_dofadr[jid]),     # index into data.qvel / data.ctrl-joint
+        "aid": int(aid),                         # index into data.ctrl (motor actuator)
+        "kp": float(p["joint_gains"][name]["kp"]),
+        "kd": float(p["joint_gains"][name]["kd"]),
+        "effort": float(p["joint_gains"][name]["effort"]),
+        "default": float(p["default_joint_angles"][name]),
+    }
+
+motor_info = [joint_info(n) for n in joint_names]   # policy-controlled
+fixed_info = [joint_info(n) for n in fixed_names]    # PD-held at default
+
+default_motor = torch.tensor([m["default"] for m in motor_info], dtype=torch.float32)
+fixed_target = torch.tensor([f["default"] for f in fixed_info], dtype=torch.float32)
+
+action_scale = p["action_scale"]
+clip_actions = p["clip_actions"]
+obs_scales = p["obs_scales"]
+commands_scale = torch.tensor(
+    [p["commands_scales"]["lin_vel_x"],
+     p["commands_scales"]["lin_vel_y"],
+     p["commands_scales"]["ang_vel_yaw"]],
+    dtype=torch.float32,
+)
+
+# Control runs at dt=0.02 like training; physics at the XML timestep (0.001) → step it `decimation`
+# times per control tick, recomputing the PD torque each substep (what Genesis does internally).
+control_dt = p["dt"]
+decimation = max(1, round(control_dt / model.opt.timestep))
+g_world = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
+
+
+def pd_torque(info, target_pos):
+    """tau = kp*(target - q) - kd*dq, clipped to ±effort. Mirrors Genesis control_dofs_position PD."""
+    q = data.qpos[info["qadr"]]
+    dq = data.qvel[info["vadr"]]
+    tau = info["kp"] * (target_pos - q) - info["kd"] * dq
+    return max(-info["effort"], min(info["effort"], tau))
+
+
+def apply_pd(motor_targets, fixed_targets):
+    """Write PD torques into data.ctrl for one physics substep (called every substep)."""
+    for info, tgt in zip(motor_info, motor_targets):
+        data.ctrl[info["aid"]] = pd_torque(info, float(tgt))
+    for info, tgt in zip(fixed_info, fixed_targets):
+        data.ctrl[info["aid"]] = pd_torque(info, float(tgt))
+
+
+def physics_substeps(motor_targets, fixed_targets, n=None):
+    """Advance physics `decimation` (or n) substeps holding the given position targets."""
+    for _ in range(decimation if n is None else n):
+        apply_pd(motor_targets, fixed_targets)
         mj.mj_step(model, data)
+
+
+# --- spawn & bring-up -----------------------------------------------------------------------------
+# Spawn upright with straight legs (URDF rest = 0) slightly above the ground, then PD-ramp every joint
+# to the default pose over n_steps (like the real robot's bring-up and deploy_genesis.prepare_to_default).
+mj.mj_resetData(model, data)
+data.qpos[0:3] = [0.0, 0.0, 0.80]      # base position (x, y, z)
+data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]  # base orientation (wxyz, upright)
+mj.mj_forward(model, data)
+
+
+def prepare_to_default(n_steps=100):
+    """Smoothly PD-ramp the policy and fixed joints from their current angles to the default pose."""
+    q_motor = torch.tensor([data.qpos[m["qadr"]] for m in motor_info], dtype=torch.float32)
+    q_fixed = torch.tensor([data.qpos[f["qadr"]] for f in fixed_info], dtype=torch.float32)
+    for i in range(n_steps):
+        alpha = (i + 1) / n_steps
+        motor_targets = (1 - alpha) * q_motor + alpha * default_motor
+        fixed_targets = (1 - alpha) * q_fixed + alpha * fixed_target
+        physics_substeps(motor_targets, fixed_targets)
+        if viewer is not None:
+            viewer.sync()
+
+
+# --- kill switch ----------------------------------------------------------------------------------
+# Cut all actuation so the robot collapses limp instead of twitching. Triggered by a detected fall or
+# by pressing 'q' in the viewer; once limp the loop just steps physics so it settles on the ground.
+FALL_HEIGHT = 0.30   # base height [m] below which it counts as fallen (standing ~0.56)
+FALL_TILT = -0.4     # projected-gravity z above this ⇒ tilted >~65° (upright ≈ -1.0)
+killed = {"pending": False, "on": False}
+
+
+def go_limp():
+    """Zero every actuator command so the robot goes fully passive (motors off)."""
+    data.ctrl[:] = 0.0
+
+
+# --- keyboard velocity commands -------------------------------------------------------------------
+# Live [lin_vel_x, lin_vel_y, ang_vel_yaw] command, nudged by key presses and fed to the policy each
+# step. Starts at zero so the robot stands still until you drive it.
+#   Up / Down    : forward / backward  (lin_vel_x)
+#   Left / Right : turn left / right    (ang_vel_yaw)
+#   J / L        : strafe left / right  (lin_vel_y)
+#   X            : zero all commands (stop)
+#   Q            : kill switch (go limp)
+cmd = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+CMD_STEP = {"vx": 0.1, "vy": 0.1, "wz": 0.1}
+CMD_RANGE = {"vx": (-0.5, 1.3), "vy": (-0.5, 0.5), "wz": (-1.0, 1.0)}
+
+
+def nudge(axis, sign):
+    lo, hi = CMD_RANGE[axis]
+    cmd[axis] = max(lo, min(hi, cmd[axis] + sign * CMD_STEP[axis]))
+    print(f"[cmd] vx={cmd['vx']:+.2f} vy={cmd['vy']:+.2f} wz={cmd['wz']:+.2f}")
+
+
+def stop_cmd():
+    cmd["vx"] = cmd["vy"] = cmd["wz"] = 0.0
+    print("[cmd] stop (all zero)")
+
+
+# GLFW key codes delivered to the MuJoCo passive-viewer key_callback.
+KEY_Q, KEY_X, KEY_J, KEY_L = 81, 88, 74, 76
+KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT = 265, 264, 263, 262
+
+
+def key_callback(keycode):
+    if keycode == KEY_Q:
+        killed["pending"] = True
+    elif keycode == KEY_UP:
+        nudge("vx", +1)
+    elif keycode == KEY_DOWN:
+        nudge("vx", -1)
+    elif keycode == KEY_LEFT:
+        nudge("wz", +1)
+    elif keycode == KEY_RIGHT:
+        nudge("wz", -1)
+    elif keycode == KEY_J:
+        nudge("vy", +1)
+    elif keycode == KEY_L:
+        nudge("vy", -1)
+    elif keycode == KEY_X:
+        stop_cmd()
+
+
+# --- main loop ------------------------------------------------------------------------------------
+with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
+    viewer.opt.geomgroup[0] = 0  # hide collision geoms (group 0), show visual meshes (group 1)
+
+    prepare_to_default()
+    policy.reset()  # start the policy with empty LSTM memory
+
+    step = 0
+    last_actions = torch.zeros(len(joint_names), dtype=torch.float32)
+    while viewer.is_running():
+        # Kill switch ('q' pressed): cut actuation once, then just let the robot settle limp.
+        if killed["pending"] and not killed["on"]:
+            killed["on"] = True
+            go_limp()
+            print("[kill] q pressed → motors off, robot limp")
+        if killed["on"]:
+            data.ctrl[:] = 0.0
+            mj.mj_step(model, data)
+            viewer.sync()
+            continue
+
+        # --- read robot state -> observation ------------------------------------------------------
+        base_quat = torch.tensor(data.qpos[3:7].copy(), dtype=torch.float32)   # wxyz
+        # MuJoCo free-joint qvel[3:6] is already the body-frame angular velocity (= genesis ang_body_vel).
+        ang_body_vel = torch.tensor(data.qvel[3:6].copy(), dtype=torch.float32)
+        obs_ang_vel = ang_body_vel * obs_scales["ang_vel"]
+        proj_grav = transform_by_quat(g_world, inv_quat(base_quat))
+
+        # Fall detection: if the base drops or tilts too far, kill and go limp.
+        if data.qpos[2] < FALL_HEIGHT or proj_grav[2].item() > FALL_TILT:
+            killed["on"] = True
+            go_limp()
+            print("[kill] fall detected → motors off, robot limp")
+            mj.mj_step(model, data)
+            viewer.sync()
+            continue
+
+        q = torch.tensor([data.qpos[m["qadr"]] for m in motor_info], dtype=torch.float32)
+        dq = torch.tensor([data.qvel[m["vadr"]] for m in motor_info], dtype=torch.float32)
+        obs_dof_pos = (q - default_motor) * obs_scales["dof_pos"]
+        dof_vel = dq * obs_scales["dof_vel"]
+
+        commands = torch.tensor([cmd["vx"], cmd["vy"], cmd["wz"]], dtype=torch.float32) * commands_scale
+
+        phase = (step % p["gait_period_steps"]) / p["gait_period_steps"]
+        clock = torch.tensor(
+            [math.sin(phase * 2.0 * math.pi), math.cos(phase * 2.0 * math.pi)], dtype=torch.float32
+        )
+
+        # Single proprio frame, layout matching the training proprio group (K1_env._update_observation):
+        # ang_vel, projected_gravity, commands, dof_pos, dof_vel, last_actions, gait_clock.
+        obs = torch.cat(
+            [obs_ang_vel, proj_grav, commands, obs_dof_pos, dof_vel, last_actions, clock], dim=0
+        )
+        step += 1
+
+        with torch.no_grad():
+            actions = torch.clip(policy(obs), -clip_actions, clip_actions)
+
+        # One-step action latency, matching training's simulate_action_latency=True: the motors execute
+        # the PREVIOUS action (last_actions, the same value carried in the observation) this step, while
+        # the freshly computed action is applied next step.
+        motor_targets = default_motor + last_actions * action_scale
+        physics_substeps(motor_targets, fixed_target)
+
+        last_actions = actions
         viewer.sync()

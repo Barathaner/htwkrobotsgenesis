@@ -195,10 +195,38 @@ if __name__ == "__main__":
     def request_kill():
         killed["pending"] = True   # set from the viewer key-callback thread; applied in the loop
 
+    # --- keyboard velocity commands -------------------------------------------------------------
+    # Live [lin_vel_x, lin_vel_y, ang_vel_yaw] command, nudged by key presses and fed to the policy
+    # each step. Starts at zero so the robot stands still until you drive it.
+    #   Up / Down    : forward / backward  (lin_vel_x)
+    #   Left / Right : turn left / right    (ang_vel_yaw)
+    #   + / #        : strafe left / right  (lin_vel_y)
+    #   X            : zero all commands (stop)
+    # (WASD is reserved by the Genesis viewer for camera movement.)
+    cmd = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+    CMD_STEP = {"vx": 0.1, "vy": 0.1, "wz": 0.1}      # increment per key press
+    CMD_RANGE = {"vx": (-0.5, 1.3), "vy": (-0.5, 0.5), "wz": (-1.0, 1.0)}  # clamp limits
+
+    def nudge(axis, sign):
+        lo, hi = CMD_RANGE[axis]
+        cmd[axis] = max(lo, min(hi, cmd[axis] + sign * CMD_STEP[axis]))
+        print(f"[cmd] vx={cmd['vx']:+.2f} vy={cmd['vy']:+.2f} wz={cmd['wz']:+.2f}")
+
+    def stop_cmd():
+        cmd["vx"] = cmd["vy"] = cmd["wz"] = 0.0
+        print("[cmd] stop (all zero)")
+
     # 'q' in the Genesis viewer triggers the kill switch (overwrite=False keeps the camera controls).
     if scene.viewer is not None:
         scene.viewer.register_keybinds(
             Keybind("kill_switch", Key.Q, KeyAction.PRESS, callback=request_kill),
+            Keybind("cmd_vx_up",   Key.UP,    KeyAction.PRESS, callback=nudge, args=("vx", +1)),
+            Keybind("cmd_vx_down", Key.DOWN,  KeyAction.PRESS, callback=nudge, args=("vx", -1)),
+            Keybind("cmd_wz_up",   Key.LEFT,  KeyAction.PRESS, callback=nudge, args=("wz", +1)),
+            Keybind("cmd_wz_down", Key.RIGHT, KeyAction.PRESS, callback=nudge, args=("wz", -1)),
+            Keybind("cmd_vy_up",   Key.PLUS,  KeyAction.PRESS, callback=nudge, args=("vy", +1)),
+            Keybind("cmd_vy_down", Key.HASH,  KeyAction.PRESS, callback=nudge, args=("vy", -1)),
+            Keybind("cmd_stop",    Key.X,     KeyAction.PRESS, callback=stop_cmd),
         )
 
     step = 0
@@ -232,7 +260,9 @@ if __name__ == "__main__":
             continue
 
 
-        commands = torch.tensor([0.5, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
+        commands = torch.tensor(
+            [cmd["vx"], cmd["vy"], cmd["wz"]], dtype=gs.tc_float, device=gs.device
+        )
         commands_scale = torch.tensor(
             [
                 config["policy"]["commands_scales"]["lin_vel_x"],

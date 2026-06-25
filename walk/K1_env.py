@@ -193,6 +193,19 @@ class K1Env:
         self.robot.set_dofs_force_range([-e for e in effort], effort, self.motors_dof_idx)
         self.nom_kp = torch.tensor(kp, dtype=gs.tc_float, device=gs.device)
         self.nom_kd = torch.tensor(kd, dtype=gs.tc_float, device=gs.device)
+        self.nom_effort = torch.tensor(effort, dtype=gs.tc_float, device=gs.device)
+        # Analytic PD torque from the last control command (filled in step()), used by _reward_torques.
+        self.applied_torque = torch.zeros((num_envs, self.num_actions), dtype=gs.tc_float, device=gs.device)
+
+        # Joint position limits (from the URDF) for the dof_pos_limits penalty. Penalize only past a
+        # SOFT band = soft_dof_pos_limit × full range, centred on the mid-range, so the policy is
+        # pushed off the hard stops (where the PD slams and sim2real diverges) but free in the middle.
+        dof_lower, dof_upper = self.robot.get_dofs_limit(self.motors_dof_idx)  # joint_names order
+        soft = float(reward_cfg.get("soft_dof_pos_limit", 0.9))
+        mid = 0.5 * (dof_lower + dof_upper)
+        half = 0.5 * (dof_upper - dof_lower) * soft
+        self.dof_pos_soft_lower = mid - half
+        self.dof_pos_soft_upper = mid + half
 
         # Fixierte Gelenke (Kopf + fürs Laufen unnötige Arm-/Bein-DOFs): nicht policy-gesteuert, aber
         # per PD auf fester Default-Pose gehalten (sonst schlackern sie lose). Eigene kp/kd setzen
@@ -832,6 +845,14 @@ class K1Env:
         else:
             exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
+        # Analytic PD torque for the torque penalty: kp·(target−q) − kd·dq, clamped to the effort
+        # limit (same formula the actuator applies). self.dof_pos/dof_vel still hold the pre-step
+        # joint state here — the state the PD sees when this command is issued. Same joint_names
+        # order as target_dof_pos / nom_kp / nom_kd.
+        self.applied_torque = torch.clamp(
+            self.nom_kp * (target_dof_pos - self.dof_pos) - self.nom_kd * self.dof_vel,
+            -self.nom_effort, self.nom_effort,
+        )
         self.robot.control_dofs_position(
             target_dof_pos[:, self.actions_dof_idx],
             self.motors_dof_idx,
@@ -1360,13 +1381,47 @@ class K1Env:
         return (~self._termination_mask()).to(gs.tc_float)
 
     def _reward_action_rate(self):
-        """Strafe (gebunden ∈[0,1)): ruckartige Aktionsänderungen (glatte Bewegung).
+        """UNBOUNDED quadratic penalty Σ(Δaction)² (negative scale): smooth motion.
 
-        tanh(Σ(Δaction)² / action_rate_sigma): 0 bei glatter Bewegung, →1 bei großen Sprüngen.
-        Vorzeichen via negative Scale. Kleineres σ = strenger.
+        Dropped the old tanh bound on purpose: a saturating penalty gives ~0 gradient once the
+        action is large, so it can never pull a runaway action back. The raw quadratic keeps biting
+        harder the larger the step-to-step jump. Calibrate the scale on wandb (rew_rate/action_rate).
         """
-        sq = torch.sum(torch.square(self.last_actions - self.actions), dim=1)
-        return torch.tanh(sq / self.reward_cfg["action_rate_sigma"])
+        return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+
+    def _reward_action_magnitude(self):
+        """UNBOUNDED quadratic penalty Σaction² (negative scale): keep the commanded target near
+        the default pose.
+
+        The regularizer that was missing: action_rate only sees Δaction, so a LARGE but slowly
+        varying action evades it entirely. This penalizes the absolute action (= target offset /
+        action_scale) directly, so the policy can't ride a giant smooth offset for free.
+        """
+        return torch.sum(torch.square(self.actions), dim=1)
+
+    def _reward_torques(self):
+        """UNBOUNDED quadratic penalty Στ² (negative scale): discourage PD torque saturation /
+        bang-bang control. self.applied_torque = clamp(kp·(target−q) − kd·dq, ±effort) from step().
+        """
+        return torch.sum(torch.square(self.applied_torque), dim=1)
+
+    def _reward_dof_acc(self):
+        """UNBOUNDED quadratic penalty Σ((q̇ₜ−q̇ₜ₋₁)/dt)² (negative scale): penalizes joint
+        ACCELERATION → smoother, lower-jerk motion. legged-gym standard; complements action_rate
+        (which sees commanded actions) by acting on the measured joint response.
+        """
+        acc = (self.dof_vel - self.last_dof_vel) / self.dt
+        return torch.sum(torch.square(acc), dim=1)
+
+    def _reward_dof_pos_limits(self):
+        """Penalize joint positions outside the soft band [dof_pos_soft_lower, dof_pos_soft_upper]
+        (= soft_dof_pos_limit × full URDF range). Linear, unbounded sum of the per-joint overshoot
+        (legged-gym _reward_dof_pos_limits): keeps the policy off the hard joint stops, where the PD
+        slams into the limit and the behaviour stops transferring to a real robot.
+        """
+        below = (self.dof_pos_soft_lower - self.dof_pos).clip(min=0.0)
+        above = (self.dof_pos - self.dof_pos_soft_upper).clip(min=0.0)
+        return torch.sum(below + above, dim=1)
 
 
 
