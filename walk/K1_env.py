@@ -95,7 +95,7 @@ class K1Env:
         # With env_spacing << plane size they overlap coplanar → z-fighting / ground flicker.
         # gs.morphs.Plane renders one shared floor (is_floor + env_shared) for all envs.
         if record_camera:
-            self.scene.add_entity(
+            self.plane = self.scene.add_entity(
                 gs.morphs.Plane(fixed=True),
                 surface=gs.surfaces.Default(
                     color=tuple(float(c) for c in vcfg_vis.get("plane_color", [1.0, 1.0, 1.0])),
@@ -103,7 +103,7 @@ class K1Env:
                 ),
             )
         else:
-            self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+            self.plane = self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
         use_color_shadow = record_camera and env_cfg.get("video", {}).get("color_shadow", True)
         robot_opacity = 0.0 if use_color_shadow else 1.0
         self.robot = self.scene.add_entity(
@@ -159,6 +159,16 @@ class K1Env:
             build_kwargs["n_envs_per_row"] = 2
         self.scene.build(**build_kwargs)
         self.base_link_idx_local = self.robot.links[0].idx_local
+
+        # Contact-stiffness randomization setup: collect the geoms whose foot-ground contact compliance
+        # we resample (the plane + both feet), and a template sol_params to clone (only the time-const
+        # entry [0] is varied). set_sol_params is GLOBAL in Genesis, so this is a shared per-reset value.
+        self._contact_rand = bool(self.rand_cfg.get("randomize_contact_stiffness", False))
+        if self._contact_rand:
+            self._contact_geoms = list(self.plane.geoms)
+            for n in ("left_foot_link", "right_foot_link"):
+                self._contact_geoms += list(self.robot.get_link(n).geoms)
+            self._nom_sol_params = self._contact_geoms[0].sol_params.clone()
 
         # Verfolgungskamera: hält den anfänglichen Versatz Kamera→Rumpf und schwenkt mit dem
         # Roboter mit (lookat folgt dem Rumpf), statt starr zu stehen. update_following() muss
@@ -1666,6 +1676,16 @@ class K1Env:
             kd = self.nom_kd.unsqueeze(0) * self.curr_motor_strength
             self.robot.set_dofs_kp(kp, self.motors_dof_idx)
             self.robot.set_dofs_kv(kd, self.motors_dof_idx)
+
+        if getattr(self, "_contact_rand", False):
+            # Resample the foot/ground contact time-constant (larger = softer). GLOBAL (one shared
+            # value), so it gives temporal — not per-env — diversity across the contact-stiffness axis.
+            lo, hi = self.rand_cfg["contact_solref_range"]
+            t = float(lo + (hi - lo) * torch.rand(1).item())
+            sp = self._nom_sol_params.clone()
+            sp[0] = t
+            for geom in self._contact_geoms:
+                geom.set_sol_params(sp)
 
     def _maybe_apply_push(self):
         """Stochastically apply collision-like disturbances to the robot base link.

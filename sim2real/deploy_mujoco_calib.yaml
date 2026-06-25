@@ -1,0 +1,134 @@
+calibrated_joint_gains:
+  AAHead_yaw:
+    kp: 2.0
+    kv: 0.487
+  Head_pitch:
+    kp: 1.867
+    kv: 0.487
+  ALeft_Shoulder_Pitch:
+    kp: 28.133
+    kv: 7.0
+  Left_Shoulder_Roll:
+    kp: 28.133
+    kv: 6.333
+  Left_Elbow_Pitch:
+    kp: 13.058
+    kv: 2.436
+  Left_Elbow_Yaw:
+    kp: 13.058
+    kv: 2.436
+  ARight_Shoulder_Pitch:
+    kp: 28.133
+    kv: 7.0
+  Right_Shoulder_Roll:
+    kp: 28.133
+    kv: 6.333
+  Right_Elbow_Pitch:
+    kp: 13.058
+    kv: 2.436
+  Right_Elbow_Yaw:
+    kp: 13.058
+    kv: 2.436
+  Left_Hip_Pitch:
+    kp: 289.422
+    kv: 26.0
+  Left_Hip_Roll:
+    kp: 271.333
+    kv: 25.667
+  Left_Hip_Yaw:
+    kp: 277.0
+    kv: 20.0
+  Left_Knee_Pitch:
+    kp: 584.167
+    kv: 31.0
+  Left_Ankle_Pitch:
+    kp: 360.0
+    kv: 7.923
+  Left_Ankle_Roll:
+    kp: 340.0
+    kv: 16.0
+  Right_Hip_Pitch:
+    kp: 289.422
+    kv: 26.0
+  Right_Hip_Roll:
+    kp: 271.333
+    kv: 26.0
+  Right_Hip_Yaw:
+    kp: 295.467
+    kv: 21.0
+  Right_Knee_Pitch:
+    kp: 584.167
+    kv: 31.0
+  Right_Ankle_Pitch:
+    kp: 360.0
+    kv: 7.923
+  Right_Ankle_Roll:
+    kp: 360.0
+    kv: 5.615
+joint_limits:
+  AAHead_yaw:
+    lower: -1.0
+    upper: 1.0
+  Head_pitch:
+    lower: -0.349
+    upper: 0.855
+  ALeft_Shoulder_Pitch:
+    lower: -3.316
+    upper: 1.22
+  Left_Shoulder_Roll:
+    lower: -1.74
+    upper: 1.57
+  Left_Elbow_Pitch:
+    lower: -2.27
+    upper: 2.27
+  Left_Elbow_Yaw:
+    lower: -2.44
+    upper: 0.0
+  ARight_Shoulder_Pitch:
+    lower: -3.316
+    upper: 1.22
+  Right_Shoulder_Roll:
+    lower: -1.57
+    upper: 1.74
+  Right_Elbow_Pitch:
+    lower: -2.27
+    upper: 2.27
+  Right_Elbow_Yaw:
+    lower: 0.0
+    upper: 2.44
+  Left_Hip_Pitch:
+    lower: -3.0
+    upper: 2.21
+  Left_Hip_Roll:
+    lower: -0.4
+    upper: 1.57
+  Left_Hip_Yaw:
+    lower: -1.0
+    upper: 1.0
+  Left_Knee_Pitch:
+    lower: 0.0
+    upper: 2.23
+  Left_Ankle_Pitch:
+    lower: -0.87
+    upper: 0.345
+  Left_Ankle_Roll:
+    lower: -0.345
+    upper: 0.345
+  Right_Hip_Pitch:
+    lower: -3.0
+    upper: 2.21
+  Right_Hip_Roll:
+    lower: -1.57
+    upper: 0.4
+  Right_Hip_Yaw:
+    lower: -1.0
+    upper: 1.0
+  Right_Knee_Pitch:
+    lower: 0.0
+    upper: 2.23
+  Right_Ankle_Pitch:
+    lower: -0.87
+    upper: 0.345
+  Right_Ankle_Roll:
+    lower: -0.345
+    upper: 0.345

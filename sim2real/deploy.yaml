@@ -1,11 +1,13 @@
 policy:
-  model: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/logs/actionsmoothing/model_1000.pt"
+  model: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/logs/actionsmoothing/model_3750.pt"
   urdf_path: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/models/K1/K1_22dof.urdf"
   mujoco_path: "/home/luna/Dokumente/git/htwkrobotsgenesis-1/models/K1/scene.xml"
+  # PD gains + joint limits fitted by sim2real/calibrate_pd.py → deploy_mujoco_calib.yaml
+  mujoco_calib: "deploy_mujoco_calib.yaml"
   obs_dim: 59
   action_dim: 16
   action_scale: 0.25
-  clip_actions: 100.0
+  clip_actions: 30.0
   dt: 0.02
   gait_period_s: 0.80
   gait_period_steps: 40

@@ -9,16 +9,22 @@
 # send to robot
 # kill switches
 # add joint limit termination
+import argparse
+import math
 import os
+import time
+
 import mujoco as mj
 import mujoco.viewer
-import math
+import numpy as np
 import torch
 import torch.nn as nn
-import os
 import yaml
 
-with open("/home/luna/Dokumente/git/htwkrobotsgenesis-1/sim2real/deploy.yaml", "r") as f:
+from mujoco_calibration import DEFAULT_DEPLOY, apply_mujoco_calibration, enable_self_collision
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+with open(DEFAULT_DEPLOY, "r") as f:
     config = yaml.safe_load(f)
 
 class _RNN(nn.Module):
@@ -124,29 +130,38 @@ def transform_by_quat(v: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
 policy = load_model(config["policy"]["model"])
 print(policy)
 
-model = mj.MjModel.from_xml_path(config["policy"]["mujoco_path"])
+model = mj.MjModel.from_xml_path(os.path.abspath(config["policy"]["mujoco_path"]))
 data = mj.MjData(model)
 print(f"model: {model.njnt} joints, {model.nu} actuators, "
-      f"nq={model.nq} (qpos size), nv={model.nv} (qvel size)\n")
+      f"nq={model.nq} (qpos size), nv={model.nv} (qvel size)")
+
+# --- sim2sim parity tuning (Genesis-trained policy → MuJoCo) ---------------------------------------
+# Training kp/kv in the MJCF do NOT match Genesis step response. calibrate_pd.py fits per-joint
+# MuJoCo gains; apply_mujoco_calibration() loads deploy_mujoco_calib.yaml (path in deploy.yaml).
+CONTACT_SOLREF = 0.02   # match MJCF default + Genesis contact_solref_range
+_calib_path = config["policy"].get("mujoco_calib", "deploy_mujoco_calib.yaml")
+if not os.path.isabs(_calib_path):
+    _calib_path = os.path.join(_SCRIPT_DIR, _calib_path)
+apply_mujoco_calibration(model, _calib_path)
+enable_self_collision(model, solref=(CONTACT_SOLREF, 1.0))
+
+_trunk_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "Trunk")
+_vel_buf = np.zeros(6, dtype=np.float64)
 
 p = config["policy"]
 joint_names = p["joint_names"]          # 16 policy joints, action order
 fixed_names = p["fixed_joint_names"]    # PD-held joints (head, shoulders, elbows)
 all_names = joint_names + fixed_names
 
-# Per-joint MuJoCo addressing. Unlike Genesis (where control_dofs_position re-sorts the targets), in
-# MuJoCo every joint is addressed by its own qpos/dof/actuator id, so no argsort reorder is needed —
-# we read and write each joint directly by name.
+# Per-joint MuJoCo addressing. Unlike Genesis (control_dofs_position re-sorts targets), MuJoCo
+# <position> actuators take a joint target in data.ctrl — one actuator per joint, no argsort needed.
 def joint_info(name):
     jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, name)
     aid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_ACTUATOR, name)
     return {
-        "qadr": int(model.jnt_qposadr[jid]),   # index into data.qpos
-        "vadr": int(model.jnt_dofadr[jid]),     # index into data.qvel / data.ctrl-joint
-        "aid": int(aid),                         # index into data.ctrl (motor actuator)
-        "kp": float(p["joint_gains"][name]["kp"]),
-        "kd": float(p["joint_gains"][name]["kd"]),
-        "effort": float(p["joint_gains"][name]["effort"]),
+        "qadr": int(model.jnt_qposadr[jid]),
+        "vadr": int(model.jnt_dofadr[jid]),
+        "aid": int(aid),
         "default": float(p["default_joint_angles"][name]),
     }
 
@@ -166,63 +181,223 @@ commands_scale = torch.tensor(
     dtype=torch.float32,
 )
 
-# Control runs at dt=0.02 like training; physics at the XML timestep (0.001) → step it `decimation`
-# times per control tick, recomputing the PD torque each substep (what Genesis does internally).
+# --- control / physics timing (match joint_test.py) -----------------------------------------------
+# Same MuJoCo plant as joint_test: MJCF timestep (0.001 s), default Euler integrator, and
+# decimation = control_dt / timestep (~20 mj_step per 50 Hz tick). Targets are written once per
+# tick; ctrl is held across all substeps. (joint_test additionally pins the floating base.)
 control_dt = p["dt"]
 decimation = max(1, round(control_dt / model.opt.timestep))
 g_world = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32)
+viewer = None  # passive viewer handle; set in main, used for sync during bring-up
 
 
-def pd_torque(info, target_pos):
-    """tau = kp*(target - q) - kd*dq, clipped to ±effort. Mirrors Genesis control_dofs_position PD."""
-    q = data.qpos[info["qadr"]]
-    dq = data.qvel[info["vadr"]]
-    tau = info["kp"] * (target_pos - q) - info["kd"] * dq
-    return max(-info["effort"], min(info["effort"], tau))
+def verify_actuator_mapping() -> None:
+    """Confirm each policy joint name maps to the actuator with the same name (no Genesis argsort)."""
+    mismatches = []
+    for i, name in enumerate(joint_names):
+        info = motor_info[i]
+        act_name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_ACTUATOR, info["aid"])
+        jnt_name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT,
+                                 mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, name))
+        if act_name != name or jnt_name != name:
+            mismatches.append((i, name, act_name, jnt_name))
+    if mismatches:
+        raise RuntimeError(f"actuator/joint mapping mismatches: {mismatches}")
+    print(f"[mapping] verified {len(joint_names)} policy joints: 1:1 name→actuator (no argsort)")
 
 
-def apply_pd(motor_targets, fixed_targets):
-    """Write PD torques into data.ctrl for one physics substep (called every substep)."""
+verify_actuator_mapping()
+_integrator = ("Euler", "RK4", "implicit", "implicitfast")[int(model.opt.integrator)]
+print(f"control: {1/control_dt:.0f} Hz  physics: timestep={model.opt.timestep*1000:.3f}ms "
+      f"×{decimation} substeps/control  integrator={_integrator} (joint_test parity)\n")
+
+
+def apply_position_targets(motor_targets, fixed_targets):
+    """Write joint position targets to <position> actuators (kp/kv live in MJCF)."""
     for info, tgt in zip(motor_info, motor_targets):
-        data.ctrl[info["aid"]] = pd_torque(info, float(tgt))
+        data.ctrl[info["aid"]] = float(tgt)
     for info, tgt in zip(fixed_info, fixed_targets):
-        data.ctrl[info["aid"]] = pd_torque(info, float(tgt))
+        data.ctrl[info["aid"]] = float(tgt)
 
 
-def physics_substeps(motor_targets, fixed_targets, n=None):
-    """Advance physics `decimation` (or n) substeps holding the given position targets."""
-    for _ in range(decimation if n is None else n):
-        apply_pd(motor_targets, fixed_targets)
+def control_step(motor_targets, fixed_targets):
+    """Advance one 50 Hz control tick: set targets once, then physics for control_dt."""
+    apply_position_targets(motor_targets, fixed_targets)
+    for _ in range(decimation):
         mj.mj_step(model, data)
 
 
+def physics_substeps(motor_targets, fixed_targets, n=None):
+    """Run n control ticks (default 1). Each tick = one policy/PD update at 50 Hz."""
+    for _ in range(1 if n is None else n):
+        control_step(motor_targets, fixed_targets)
+
+
+def read_ang_body_vel() -> torch.Tensor:
+    """Body-frame angular velocity [rad/s], matching K1_env / deploy_genesis.
+
+    mj_objectVelocity fills [angular(0:3), linear(3:6)] in world frame — so the ANGULAR part is
+    [0:3]. (Reading [3:6] here fed the base LINEAR velocity in as fake angular velocity, which let the
+    robot stand at rest but diverge and fall as soon as it started moving.)"""
+    mj.mj_objectVelocity(model, data, mj.mjtObj.mjOBJ_BODY, _trunk_bid, _vel_buf, 0)
+    world_ang = torch.tensor(_vel_buf[0:3].copy(), dtype=torch.float32)
+    base_quat = torch.tensor(data.qpos[3:7].copy(), dtype=torch.float32)
+    return transform_by_quat(world_ang, inv_quat(base_quat))
+
+
+def build_obs(step: int, last_actions: torch.Tensor) -> torch.Tensor:
+    """Single proprio frame (59-dim), layout = K1_env._update_observation proprio group."""
+    base_quat = torch.tensor(data.qpos[3:7].copy(), dtype=torch.float32)
+    obs_ang_vel = read_ang_body_vel() * obs_scales["ang_vel"]
+    proj_grav = transform_by_quat(g_world, inv_quat(base_quat))
+
+    q = torch.tensor([data.qpos[m["qadr"]] for m in motor_info], dtype=torch.float32)
+    dq = torch.tensor([data.qvel[m["vadr"]] for m in motor_info], dtype=torch.float32)
+    obs_dof_pos = (q - default_motor) * obs_scales["dof_pos"]
+    dof_vel = dq * obs_scales["dof_vel"]
+
+    commands = (
+        torch.tensor([cmd["vx"], cmd["vy"], cmd["wz"]], dtype=torch.float32) * commands_scale
+    )
+    phase = (step % p["gait_period_steps"]) / p["gait_period_steps"]
+    clock = torch.tensor(
+        [math.sin(phase * 2.0 * math.pi), math.cos(phase * 2.0 * math.pi)], dtype=torch.float32
+    )
+    return torch.cat(
+        [obs_ang_vel, proj_grav, commands, obs_dof_pos, dof_vel, last_actions, clock], dim=0
+    )
+
+
 # --- spawn & bring-up -----------------------------------------------------------------------------
-# Spawn upright with straight legs (URDF rest = 0) slightly above the ground, then PD-ramp every joint
-# to the default pose over n_steps (like the real robot's bring-up and deploy_genesis.prepare_to_default).
-mj.mj_resetData(model, data)
-data.qpos[0:3] = [0.0, 0.0, 0.80]      # base position (x, y, z)
-data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]  # base orientation (wxyz, upright)
-mj.mj_forward(model, data)
+# Bring-up mirrors deploy_genesis.prepare_to_default: spawn standing at the URDF rest pose (all joints
+# zero, legs straight, feet on the ground), then smoothly PD-ramp every joint to the training default
+# pose so the robot squats into its bent-knee stance — crucially ramping the arms to their non-zero
+# defaults too — and finally hold the default pose. Ramping from a planted stand (instead of popping
+# into a bent pose and dropping) keeps it balanced through bring-up.
+PREPARE_RAMP_STEPS = 150
+PREPARE_HOLD_STEPS = 50
+
+_all_info = motor_info + fixed_info       # every joint, for spawning qpos
+_ground_for_height = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "ground")
 
 
-def prepare_to_default(n_steps=100):
-    """Smoothly PD-ramp the policy and fixed joints from their current angles to the default pose."""
+def _spawn_height(joint_angles, clearance=0.01):
+    """Base z that puts the lowest geom ~clearance above the ground for the given joint pose."""
+    mj.mj_resetData(model, data)
+    for info, a in zip(_all_info, joint_angles):
+        data.qpos[info["qadr"]] = a
+    data.qpos[0:3] = [0.0, 0.0, 1.0]
+    data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+    mj.mj_forward(model, data)
+    lowest = min(float(data.geom_xpos[g, 2]) for g in range(model.ngeom) if g != _ground_for_height)
+    return 1.0 - lowest + clearance
+
+
+def prepare_to_default(ramp_steps=PREPARE_RAMP_STEPS, hold_steps=PREPARE_HOLD_STEPS):
+    """Spawn like deploy_genesis (base z=0.56, URDF rest joints), ramp to default, then hold."""
+    mj.mj_resetData(model, data)
+    data.qpos[0:3] = [0.0, 0.0, 0.56]
+    data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+    data.qvel[:] = 0.0
+    mj.mj_forward(model, data)
+    print(f"[prepare] spawn at base_z=0.560 (genesis parity), ramping to default over {ramp_steps} steps")
+
     q_motor = torch.tensor([data.qpos[m["qadr"]] for m in motor_info], dtype=torch.float32)
     q_fixed = torch.tensor([data.qpos[f["qadr"]] for f in fixed_info], dtype=torch.float32)
-    for i in range(n_steps):
-        alpha = (i + 1) / n_steps
-        motor_targets = (1 - alpha) * q_motor + alpha * default_motor
-        fixed_targets = (1 - alpha) * q_fixed + alpha * fixed_target
-        physics_substeps(motor_targets, fixed_targets)
+
+    for i in range(ramp_steps):
+        alpha = (i + 1) / ramp_steps
+        physics_substeps((1 - alpha) * q_motor + alpha * default_motor,
+                         (1 - alpha) * q_fixed + alpha * fixed_target)
         if viewer is not None:
             viewer.sync()
+    for _ in range(hold_steps):
+        physics_substeps(default_motor, fixed_target)
+        if viewer is not None:
+            viewer.sync()
+    print(f"[prepare] at default pose: base_z={float(data.qpos[2]):.3f}  contacts={data.ncon}")
+
+
+# --- RSI spawn (poses from training motion reference, K1_env._setup_rsi_data) ----------------------
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_urdf_joint_names = p["urdf_joint_names"]
+_rsi_frames: list[dict] | None = None
+
+
+def _load_rsi_frames() -> list[dict]:
+    """Load reference frames from the same NPZ files training uses for RSI (rsi_prob=0.5)."""
+    global _rsi_frames
+    if _rsi_frames is not None:
+        return _rsi_frames
+    paths = [
+        os.path.join(_repo_root, "walk/data/motions/slow.npz"),
+        os.path.join(_repo_root, "walk/data/motions/k1_jogging_motion.npz"),
+    ]
+    frames: list[dict] = []
+    for path in paths:
+        d = np.load(path, allow_pickle=True)
+        ref_jn = [str(n) for n in d["joint_names"]]
+        col = [ref_jn.index(name) for name in _urdf_joint_names]
+        n = int(d["root_pos"].shape[0])
+        for i in range(n):
+            frames.append({
+                "source": os.path.basename(path),
+                "index": i,
+                "root_pos": d["root_pos"][i].astype(np.float64),
+                "root_quat": d["root_quat"][i].astype(np.float64),
+                "dof_pos": d["dof_pos"][i, col].astype(np.float64),
+                "dof_vel": d["dof_vel"][i, col].astype(np.float64),
+            })
+    _rsi_frames = frames
+    print(f"[rsi] loaded {len(frames)} reference frames from {len(paths)} motion files")
+    return frames
+
+
+def _write_joint_state(dof_pos, dof_vel):
+    """Set all 22 URDF joints in MuJoCo qpos/qvel (by name, any list order)."""
+    for name, angle, vel in zip(_urdf_joint_names, dof_pos, dof_vel):
+        jid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, name)
+        qadr = int(model.jnt_qposadr[jid])
+        vadr = int(model.jnt_dofadr[jid])
+        data.qpos[qadr] = float(angle)
+        data.qvel[vadr] = float(vel)
+
+
+def prepare_rsi(frame_idx=0, hold_steps=PREPARE_HOLD_STEPS):
+    """Teleport to a training RSI frame (joint pose + velocity), then PD-hold that pose briefly."""
+    frames = _load_rsi_frames()
+    frame = frames[frame_idx % len(frames)]
+    mj.mj_resetData(model, data)
+    data.qpos[0:3] = frame["root_pos"]
+    data.qpos[3:7] = frame["root_quat"]
+    data.qvel[:] = 0.0
+    _write_joint_state(frame["dof_pos"], frame["dof_vel"])
+    mj.mj_forward(model, data)
+    print(f"[prepare/rsi] frame {frame_idx % len(frames)} from {frame['source']}[{frame['index']}]  "
+          f"base_z={float(data.qpos[2]):.3f}")
+
+    # Hold current pose (not default) so PD does not snap joints on the first tick.
+    hold_motor = torch.tensor([data.qpos[m["qadr"]] for m in motor_info], dtype=torch.float32)
+    hold_fixed = torch.tensor([data.qpos[f["qadr"]] for f in fixed_info], dtype=torch.float32)
+    for _ in range(hold_steps):
+        physics_substeps(hold_motor, hold_fixed)
+        if viewer is not None:
+            viewer.sync()
+    print(f"[prepare/rsi] after hold: base_z={float(data.qpos[2]):.3f}  contacts={data.ncon}")
+
+
+def prepare_spawn(mode="default", rsi_frame=0):
+    if mode == "rsi":
+        prepare_rsi(rsi_frame)
+    else:
+        prepare_to_default()
 
 
 # --- kill switch ----------------------------------------------------------------------------------
 # Cut all actuation so the robot collapses limp instead of twitching. Triggered by a detected fall or
 # by pressing 'q' in the viewer; once limp the loop just steps physics so it settles on the ground.
-FALL_HEIGHT = 0.30   # base height [m] below which it counts as fallen (standing ~0.56)
-FALL_TILT = -0.4     # projected-gravity z above this ⇒ tilted >~65° (upright ≈ -1.0)
+FALL_HEIGHT = 0.20   # base height [m] below which it counts as fallen (standing ~0.56)
+FALL_TILT = -0.1     # projected-gravity z above this ⇒ tilted >~65° (upright ≈ -1.0)
 killed = {"pending": False, "on": False}
 
 
@@ -279,17 +454,29 @@ def key_callback(keycode):
         stop_cmd()
 
 
-# --- main loop ------------------------------------------------------------------------------------
-with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
-    viewer.opt.geomgroup[0] = 0  # hide collision geoms (group 0), show visual meshes (group 1)
+_ground = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "ground")
 
-    prepare_to_default()
-    policy.reset()  # start the policy with empty LSTM memory
 
-    step = 0
+# Action logging: print the policy's raw output each control step. Set LOG_EVERY > 1 to thin it out.
+LOG_ACTIONS = True
+LOG_EVERY = 1
+
+
+# --- bring-up + closed-loop inference (identical loop to deploy_genesis) ---------------------------
+def run_inference(max_steps=None, spawn_mode="default", rsi_frame=0):
+    """Ramp/teleport to start pose, then run closed-loop policy inference like deploy_genesis.
+    spawn_mode: 'default' (PD-ramp to default_joint_angles) or 'rsi' (training motion frame).
+    Returns (steps_run, fell, final_base_z)."""
+    prepare_spawn(spawn_mode, rsi_frame)
+    # No warmup burn-in: priming the hidden state with standing frames puts it in a regime the policy
+    # never sees at the start of a training rollout, which destabilises the handoff. Genesis just
+    # resets and goes — so do we.
+    policy.reset()
     last_actions = torch.zeros(len(joint_names), dtype=torch.float32)
-    while viewer.is_running():
-        # Kill switch ('q' pressed): cut actuation once, then just let the robot settle limp.
+    step = 0
+
+    t_next = time.perf_counter()
+    while (viewer is None or viewer.is_running()) and (max_steps is None or step < max_steps):
         if killed["pending"] and not killed["on"]:
             killed["on"] = True
             go_limp()
@@ -297,52 +484,75 @@ with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as vie
         if killed["on"]:
             data.ctrl[:] = 0.0
             mj.mj_step(model, data)
-            viewer.sync()
+            if viewer is not None:
+                viewer.sync()
+            elif max_steps is not None:
+                break
             continue
 
-        # --- read robot state -> observation ------------------------------------------------------
-        base_quat = torch.tensor(data.qpos[3:7].copy(), dtype=torch.float32)   # wxyz
-        # MuJoCo free-joint qvel[3:6] is already the body-frame angular velocity (= genesis ang_body_vel).
-        ang_body_vel = torch.tensor(data.qvel[3:6].copy(), dtype=torch.float32)
-        obs_ang_vel = ang_body_vel * obs_scales["ang_vel"]
-        proj_grav = transform_by_quat(g_world, inv_quat(base_quat))
+        proj_grav = transform_by_quat(
+            g_world, inv_quat(torch.tensor(data.qpos[3:7].copy(), dtype=torch.float32))
+        )
 
         # Fall detection: if the base drops or tilts too far, kill and go limp.
         if data.qpos[2] < FALL_HEIGHT or proj_grav[2].item() > FALL_TILT:
             killed["on"] = True
             go_limp()
-            print("[kill] fall detected → motors off, robot limp")
+            print(f"[kill] fall detected at step {step} → motors off, robot limp")
             mj.mj_step(model, data)
-            viewer.sync()
+            if viewer is not None:
+                viewer.sync()
+            elif max_steps is not None:
+                break
             continue
 
-        q = torch.tensor([data.qpos[m["qadr"]] for m in motor_info], dtype=torch.float32)
-        dq = torch.tensor([data.qvel[m["vadr"]] for m in motor_info], dtype=torch.float32)
-        obs_dof_pos = (q - default_motor) * obs_scales["dof_pos"]
-        dof_vel = dq * obs_scales["dof_vel"]
-
-        commands = torch.tensor([cmd["vx"], cmd["vy"], cmd["wz"]], dtype=torch.float32) * commands_scale
-
-        phase = (step % p["gait_period_steps"]) / p["gait_period_steps"]
-        clock = torch.tensor(
-            [math.sin(phase * 2.0 * math.pi), math.cos(phase * 2.0 * math.pi)], dtype=torch.float32
-        )
-
-        # Single proprio frame, layout matching the training proprio group (K1_env._update_observation):
-        # ang_vel, projected_gravity, commands, dof_pos, dof_vel, last_actions, gait_clock.
-        obs = torch.cat(
-            [obs_ang_vel, proj_grav, commands, obs_dof_pos, dof_vel, last_actions, clock], dim=0
-        )
+        obs = build_obs(step, last_actions)
         step += 1
 
         with torch.no_grad():
             actions = torch.clip(policy(obs), -clip_actions, clip_actions)
+
+        if LOG_ACTIONS and step % LOG_EVERY == 0:
+            a = actions.numpy()
+            vec = " ".join(f"{v:+.2f}" for v in a)
+            print(f"[act] step {step:4d} | z={data.qpos[2]:.3f} | "
+                  f"|a| mean={np.abs(a).mean():.3f} max={np.abs(a).max():.3f} | a=[{vec}]")
 
         # One-step action latency, matching training's simulate_action_latency=True: the motors execute
         # the PREVIOUS action (last_actions, the same value carried in the observation) this step, while
         # the freshly computed action is applied next step.
         motor_targets = default_motor + last_actions * action_scale
         physics_substeps(motor_targets, fixed_target)
-
         last_actions = actions
-        viewer.sync()
+
+        if viewer is not None:
+            viewer.sync()
+            t_next += control_dt
+            sleep_s = t_next - time.perf_counter()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+    return step, killed["on"], float(data.qpos[2])
+
+
+def main():
+    global viewer
+    parser = argparse.ArgumentParser(description="Deploy Genesis-trained policy in MuJoCo")
+    parser.add_argument("--spawn", choices=("default", "rsi"), default="default",
+                        help="default: PD-ramp to default_joint_angles; rsi: training motion frame")
+    parser.add_argument("--rsi-frame", type=int, default=0,
+                        help="RSI frame index (slow.npz frames first, then jogging)")
+    parser.add_argument("--steps", type=int, default=None, help="headless step limit (no viewer)")
+    args = parser.parse_args()
+
+    if _ground >= 0:
+        model.geom_group[_ground] = 1
+    if args.steps is not None:
+        run_inference(max_steps=args.steps, spawn_mode=args.spawn, rsi_frame=args.rsi_frame)
+        return
+    with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
+        viewer.opt.geomgroup[0] = 0
+        run_inference(spawn_mode=args.spawn, rsi_frame=args.rsi_frame)
+
+
+if __name__ == "__main__":
+    main()

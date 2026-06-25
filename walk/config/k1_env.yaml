@@ -157,7 +157,18 @@ env_cfg:
     com_shift_range: [-0.03, 0.03]  # [m] COM shift per axis per link
 
     randomize_motor_strength: true
-    motor_strength_range: [0.8, 1.2]  # multiplicative scale on kp & kd
+    # Widened 0.8–1.2 → 0.5–1.5: the effective PD stiffness differs ~2× between Genesis and MuJoCo
+    # (sim2sim sweep), so ±20% was too narrow — MuJoCo/real fell OUTSIDE the trained distribution.
+    # ±50% spans the stiffness regimes both engines (and the real robot) present. This is the single
+    # highest-impact DR knob for sim2real PD-stiffness robustness.
+    motor_strength_range: [0.5, 1.5]  # multiplicative scale on kp & kd
+
+    # Contact-stiffness randomization: vary the foot/ground contact compliance (solref time-constant;
+    # larger = softer contact). The axis no scalar covered before — Genesis ships ~0.02, MuJoCo's MJCF
+    # 0.001, and the policy needed ~0.04 to survive in MuJoCo. NOTE: Genesis set_sol_params is GLOBAL
+    # (no per-env), so this resamples one shared value each reset → temporal, not per-env, diversity.
+    randomize_contact_stiffness: true
+    contact_solref_range: [0.02, 0.05]   # [s] contact solver time-constant, sampled per reset; lower bound = 2*substep_dt floor (dt 0.02 / substeps 2), below which Genesis clamps & warns
 
     # ── Sensor noise + IMU bias (ACTOR proprio obs only; privileged critic stays clean) ──────
     # Per-step Gaussian noise = encoder/IMU noise (sim2real robustness). Per-episode constant IMU
@@ -192,7 +203,7 @@ env_cfg:
     start_lin_vel_y_range: [-0.2, 0.25]
     start_ang_vel_range: [-0.25, 0.25]
     advance_tracking_frac: 0.6   # advance a level when mean episodic tracking_lin_vel ≥ frac × its max
-    level_step: 0.05             # command-range level increment per passing check
+    level_step: 0.2            # command-range level increment per passing check
     check_interval: 25           # iters between advance checks
     min_episodes: 20             # min terminated episodes in the window before a check can pass
     track_window: 200            # rolling episodes used for the tracking estimate
@@ -295,8 +306,8 @@ command_cfg:
   # Forward axis spans walk∪jog: slow clip + warps cover ~0.09–0.8, jog clip + warps cover ~0.8–1.27,
   # so expert evidence is continuous to 1.3. Backward [-0.2, 0) has no clip (forward-only mocap) →
   # task-reward-driven, AMP-unconstrained.
-  lin_vel_x_range: [-0.2, 1.3]
-  lin_vel_y_range: [-0.4, 0.5]
+  lin_vel_x_range: [-0.5, 1.3]
+  lin_vel_y_range: [-0.5, 0.5]
   ang_vel_range: [-0.5, 0.5]
 
 # PPO / rsl-rl — obs_dim & num_actions kommen automatisch aus K1Env
